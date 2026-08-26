@@ -8,6 +8,8 @@
 
 #include "msm8994.dtsi"
 #include "msm8994-msft-lumia-octagon.dtsi"
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/gpio/gpio.h>
 
 / {
 	model = "Microsoft Lumia 950 XL";
@@ -15,41 +17,206 @@
 	chassis-type = "handset";
 };
 
+/*
+ * Octagon ramoops@d9d00000 has //no-map commented. Proven on this
+ * WP BootMgr path (Talkman ramtop): the window only survives
+ * sysrq-b with no-map. Same octagon 3 GiB map on Cityman.
+ */
+&{/reserved-memory/ramoops@d9d00000} {
+	no-map;
+};
+
 &gpu {
 	status = "okay";
+};
+
+/*
+ * 3.10 msm8994-iommu.dtsi MDP BFB (0x2000 impl-def bias removed).
+ * Stock msm8994.dtsi is qcom,msm8974-mdp-iommu (8974 BFB). Keep
+ * 8994 addresses 0xfd9cc000 / 0xfd9d4000. Do not paste Talkman
+ * 0xfd9b4000.
+ */
+&mdp_iommu {
+	compatible = "qcom,msm8994-mdp-iommu";
+};
+
+/*
+ * CAF msm8994-mdss.dtsi (mmo + OnePlus 8994): mdp_phys 0xfd900000,
+ * qcom,mdss-mdp-reg-offset = <0x1000> → HW_VERSION at 0xfd901000.
+ * msm8994.dtsi maps MDP at 0xfd900100 / 0x98000, which overlaps CAF
+ * DSI0 0xfd998000. Talkman #46: 0xfd900100 reads 0; 0xfd901000 is
+ * 0x100a0000. Same offset on 8994 CAF. Size 0x8f000 = 0x90000-0x1000,
+ * ending 0xfd990000, before DSI0. Do not paste Talkman DSI1
+ * (8992 map) or Talkman MDP SMMU (8994 VBIF/SMMU stay
+ * 0xfd9c8000 / 0xfd9cc000).
+ */
+&mdp {
+	reg = <0xfd901000 0x8f000>;
+};
+
+/*
+ * PMI8994 LAB @ 0xde00 / IBB @ 0xdc00 (SID 3). 3.10 msm8994-chi.dtsi
+ * enables &labibb (mode string "oled" is not a value 3.10
+ * qpnp-labibb-regulator.c accepts). Mainline msm8994_dsi_cfg bulk_gets
+ * lab_reg / ibb_reg. Same bases as pmi8998_labibb_data. Probe reads
+ * PERPH_TYPE (0x24 / 0x20); do not stub. Interrupts match pmi8950.dtsi.
+ * regulator-min/max from 3.10 msm-pmi8994.dtsi. Not regulator-fixed.
+ */
+&spmi_bus {
+	pmic@3 {
+		labibb {
+			compatible = "qcom,pmi8994-lab-ibb", "qcom,pmi8998-lab-ibb";
+
+			ibb: ibb {
+				interrupts = <0x3 0xdc 0x2 IRQ_TYPE_EDGE_RISING>,
+					     <0x3 0xdc 0x0 IRQ_TYPE_LEVEL_LOW>;
+				interrupt-names = "sc-err", "ocp";
+				regulator-min-microvolt = <4600000>;
+				regulator-max-microvolt = <6000000>;
+			};
+
+			lab: lab {
+				interrupts = <0x3 0xde 0x1 IRQ_TYPE_EDGE_RISING>,
+					     <0x3 0xde 0x0 IRQ_TYPE_LEVEL_LOW>;
+				interrupt-names = "sc-err", "ocp";
+				regulator-min-microvolt = <4600000>;
+				regulator-max-microvolt = <6000000>;
+				qcom,soft-start-us = <800>;
+			};
+		};
+	};
 };
 
 &mdss {
 	status = "okay";
 };
 
-&gpu {
-	status = "okay";
-};
-
-&mdss {
-	status = "okay";
-};
-
+/*
+ * CAF 8994 DSI0 0xfd998000 / DSI1 0xfd9a0000. Keep qcom,dsi-phy-20nm
+ * (dsi_phy_20nm_cfgs io_start 0xfd998500 / 0xfd9a0500 + pll_init).
+ * Do not stamp the 8992 20nm PHY compatible (that table's
+ * io_start is the 8992 PHY map, not these 8994 addresses).
+ *
+ * Supplies: CAF msm8994-mdss + Snaccy cityman RPM L14/L12/L28/L2.
+ * 3.10 mmo-common mdss.dtsi points host vddio at pm8994_s4; do not
+ * copy Talkman SPMI s4 without a Cityman RPM timeout fact.
+ * msm8994_dsi_cfg still bulk_gets vdda/vddio/vcca/vdd/lab_reg/ibb_reg.
+ *
+ * Dual-DSI: 3.10 sergej DSI0 cmd-sync-wait-broadcast; DSI1 broadcast +
+ * cmd-sync-wait-trigger. Mainline: dual-dsi-mode + sync-dual-dsi on
+ * both, master-dsi on DSI0.
+ *
+ * CAF clock_mmss parents byte1/pclk1 from PLL0. 20nm pll_init skips
+ * the byte tree on phy->id != DSI_0. Override BYTE1/PCLK1 parents here,
+ * not in msm8994.dtsi.
+ *
+ * Reset gpio78 (octagon DISPLAY_RESET_N, 3.10 platform-reset-gpio).
+ * Panel timings from 3.10 dsi-panel-sergej-wqhd-dualdsi-cmd.dtsi.
+ */
 &dsi0 {
 	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
 
-	vdd-supply = <&vreg_l14a_1p8>;
+	vdda-supply = <&vreg_l2a_1p25>;
 	vddio-supply = <&vreg_l12a_1p8>;
+	vcca-supply = <&vreg_l28a_1p0>;
+	vdd-supply = <&vreg_l14a_1p8>;
+	lab_reg-supply = <&lab>;
+	ibb_reg-supply = <&ibb>;
 
 	pinctrl-names = "default", "sleep";
 	pinctrl-0 = <&mdss_dsi_default &mdss_te_default>;
-	pinctrl-1 = <&mdss_dsi_sleep &mdss_te_default>;
+	pinctrl-1 = <&mdss_dsi_sleep &mdss_te_sleep>;
+
+	qcom,dual-dsi-mode;
+	qcom,sync-dual-dsi;
+	qcom,master-dsi;
+
+	panel@0 {
+		compatible = "microsoft,sergej-wqhd-cmd";
+		reg = <0>;
+
+		reset-gpios = <&tlmm 78 GPIO_ACTIVE_LOW>;
+
+		/* 3.10 dsi-panel-sergej-wqhd-dualdsi-cmd.dtsi */
+		qcom,mdss-dsi-panel-timings = [97 5A 3E 00 9A 9A 48 5E 4B 03 04 00];
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				sergej_in0: endpoint {
+					remote-endpoint = <&dsi0_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				sergej_in1: endpoint {
+					remote-endpoint = <&dsi1_out>;
+				};
+			};
+		};
+	};
 };
 
 &dsi0_out {
-	status = "okay";
-
 	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&sergej_in0>;
 };
 
 &dsi0_phy {
 	status = "okay";
 
+	vddio-supply = <&vreg_l12a_1p8>;
 	vcca-supply = <&vreg_l28a_1p0>;
+	/* 3.10 mmo-common &mdss_dsi0 qcom,regulator-ldo-mode */
+	qcom,dsi-phy-regulator-ldo-mode;
+};
+
+&dsi1 {
+	status = "okay";
+
+	vdda-supply = <&vreg_l2a_1p25>;
+	vddio-supply = <&vreg_l12a_1p8>;
+	vcca-supply = <&vreg_l28a_1p0>;
+	vdd-supply = <&vreg_l14a_1p8>;
+	lab_reg-supply = <&lab>;
+	ibb_reg-supply = <&ibb>;
+
+	qcom,dual-dsi-mode;
+	qcom,sync-dual-dsi;
+
+	/*
+	 * CAF 8994 clock_mmss and 3.10 mdss_dsi@fd9a0000 parent
+	 * byte1_src/pclk1_src to mdss_dsi0_pll muxes. msm8994.dtsi
+	 * parents BYTE1_CLK_SRC/PCLK1_CLK_SRC to dsi1_phy 0/1. PLL1
+	 * skips the byte tree. Parent both to dsi0_phy (CAF PLL0).
+	 */
+	assigned-clock-parents = <&dsi0_phy 0>, <&dsi0_phy 1>;
+};
+
+&dsi1_out {
+	data-lanes = <0 1 2 3>;
+	remote-endpoint = <&sergej_in1>;
+};
+
+&dsi1_phy {
+	status = "okay";
+
+	/*
+	 * CAF msm8994-mdss.dtsi maps DSI1 phy_regulator at the DSI0
+	 * window 0xfd998780 (shared), not mainline 0xfd9a0780.
+	 */
+	reg = <0xfd9a0300 0x200>,
+	      <0xfd9a0500 0x280>,
+	      <0xfd998780 0x30>;
+	reg-names = "dsi_pll", "dsi_phy", "dsi_phy_regulator";
+
+	vddio-supply = <&vreg_l12a_1p8>;
+	vcca-supply = <&vreg_l28a_1p0>;
+	qcom,dsi-phy-regulator-ldo-mode;
 };
