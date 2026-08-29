@@ -37,6 +37,13 @@
  #define LAB_VOLTAGE_SET_MASK		GENMASK(3, 0)
  #define IBB_VOLTAGE_SET_MASK		GENMASK(5, 0)
 
+#define REG_LABIBB_LCD_AMOLED_SEL	0x44
+ #define LABIBB_AMOLED_MODE		BIT(7)
+
+/* 3.10 qcom,qpnp-*-init-amoled-voltage (msm-pmi8994.dtsi). */
+#define LAB_AMOLED_UV			4600000
+#define IBB_AMOLED_UV			4000000
+
 #define REG_LABIBB_ENABLE_CTL		0x46
  #define LABIBB_CONTROL_ENABLE		BIT(7)
 
@@ -758,6 +765,66 @@ static const struct of_device_id qcom_labibb_match[] = {
 };
 MODULE_DEVICE_TABLE(of, qcom_labibb_match);
 
+static int qcom_labibb_sec_write(struct regmap *map, u16 base, u16 off, u32 val)
+{
+	int ret;
+
+	ret = regmap_write(map, base + REG_LABIBB_SEC_ACCESS,
+			   LABIBB_SEC_UNLOCK_CODE);
+	if (ret)
+		return ret;
+	return regmap_write(map, base + off, val);
+}
+
+/*
+ * PMI8994 LAB/IBB LCD_AMOLED_SEL (0x44): 0 = LCD, BIT(7) = AMOLED.
+ * 3.10 qpnp_lab_dt_init / qpnp_ibb_dt_init. Mainline never programmed
+ * this; LCD mode + 4.6 V IBB on OLED (Duke/Sergej) is a green tint
+ * and blacks that still emit. Cityman 3.10 qpnp,qpnp-labibb-mode =
+ * "oled" means AMOLED (CAF string is "amoled").
+ */
+static int qcom_labibb_configure_amoled(struct device *dev, struct regmap *map)
+{
+	u32 lab_sel, ibb_sel, lab_v, ibb_v;
+	int ret, ibb_sel_v;
+
+	ret = qcom_labibb_sec_write(map, PMI8998_LAB_REG_BASE,
+				    REG_LABIBB_LCD_AMOLED_SEL,
+				    LABIBB_AMOLED_MODE);
+	if (ret)
+		return ret;
+	ret = qcom_labibb_sec_write(map, PMI8998_IBB_REG_BASE,
+				    REG_LABIBB_LCD_AMOLED_SEL,
+				    LABIBB_AMOLED_MODE);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(map, PMI8998_LAB_REG_BASE + REG_LABIBB_VOLTAGE,
+			   LABIBB_VOLTAGE_OVERRIDE_EN |
+			   ((LAB_AMOLED_UV - pmi8998_lab_desc.min_uV) /
+			    pmi8998_lab_desc.uV_step));
+	if (ret)
+		return ret;
+
+	ibb_sel_v = (IBB_AMOLED_UV - pmi8998_ibb_desc.min_uV) /
+		    pmi8998_ibb_desc.uV_step;
+	ret = regmap_write(map, PMI8998_IBB_REG_BASE + REG_LABIBB_VOLTAGE,
+			   LABIBB_VOLTAGE_OVERRIDE_EN | ibb_sel_v);
+	if (ret)
+		return ret;
+
+	regmap_read(map, PMI8998_LAB_REG_BASE + REG_LABIBB_LCD_AMOLED_SEL,
+		    &lab_sel);
+	regmap_read(map, PMI8998_IBB_REG_BASE + REG_LABIBB_LCD_AMOLED_SEL,
+		    &ibb_sel);
+	regmap_read(map, PMI8998_LAB_REG_BASE + REG_LABIBB_VOLTAGE, &lab_v);
+	regmap_read(map, PMI8998_IBB_REG_BASE + REG_LABIBB_VOLTAGE, &ibb_v);
+	dev_info(dev,
+		 "labibb: AMOLED sel lab=0x%x ibb=0x%x volt lab=0x%x ibb=0x%x\n",
+		 lab_sel, ibb_sel, lab_v, ibb_v);
+	return 0;
+}
+
 static int qcom_labibb_regulator_probe(struct platform_device *pdev)
 {
 	struct labibb_regulator *vreg;
@@ -778,6 +845,15 @@ static int qcom_labibb_regulator_probe(struct platform_device *pdev)
 	reg_data = device_get_match_data(&pdev->dev);
 	if (!reg_data)
 		return -ENODEV;
+
+	if (of_property_read_bool(dev->of_node, "qcom,amoled-mode")) {
+		ret = qcom_labibb_configure_amoled(dev, reg_regmap);
+		if (ret) {
+			dev_err(dev, "labibb: AMOLED LCD_AMOLED_SEL failed %d\n",
+				ret);
+			return ret;
+		}
+	}
 
 	for (; reg_data->name; reg_data++) {
 		char *sc_irq_name;

@@ -111,23 +111,26 @@
 
 /*
  * PMI8994 LAB @ 0xde00 / IBB @ 0xdc00 (SID 3). 3.10 msm8994-chi.dtsi
- * enables &labibb (mode string "oled" is not a value 3.10
- * qpnp-labibb-regulator.c accepts). Mainline msm8994_dsi_cfg bulk_gets
- * lab_reg / ibb_reg. Same bases as pmi8998_labibb_data. Probe reads
- * PERPH_TYPE (0x24 / 0x20); do not stub. Interrupts match pmi8950.dtsi.
- * regulator-min/max from 3.10 msm-pmi8994.dtsi. Not regulator-fixed.
+ * enables &labibb with qpnp,qpnp-labibb-mode = "oled" (AMOLED; CAF
+ * string is "amoled"). LCD_AMOLED_SEL 0x44 BIT(7), LAB 4.6 V / IBB
+ * 4.0 V init-amoled, IBB discharge 32 kOhm. LCD mode on this OLED
+ * is a green tint and blacks that still emit (Snaccy 2026-08-27).
+ * Mainline msm8994_dsi_cfg bulk_gets lab_reg / ibb_reg. Probe reads
+ * PERPH_TYPE (0x24 / 0x20); do not stub.
  */
 &spmi_bus {
 	pmic@3 {
 		labibb {
 			compatible = "qcom,pmi8994-lab-ibb", "qcom,pmi8998-lab-ibb";
+			qcom,amoled-mode;
 
 			ibb: ibb {
 				interrupts = <0x3 0xdc 0x2 IRQ_TYPE_EDGE_RISING>,
 					     <0x3 0xdc 0x0 IRQ_TYPE_LEVEL_LOW>;
 				interrupt-names = "sc-err", "ocp";
-				regulator-min-microvolt = <4600000>;
+				regulator-min-microvolt = <4000000>;
 				regulator-max-microvolt = <6000000>;
+				qcom,discharge-resistor-kohms = <32>;
 			};
 
 			lab: lab {

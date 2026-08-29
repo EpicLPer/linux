@@ -24,6 +24,14 @@ properties:
               - qcom,pmi8994-lab-ibb
           - const: qcom,pmi8998-lab-ibb
 
+  qcom,amoled-mode:
+    type: boolean
+    description:
+      Program LAB/IBB LCD_AMOLED_SEL (offset 0x44) for AMOLED (bit 7).
+      Zero is LCD mode. OLED panels need AMOLED bias voltages; LCD
+      parameters produce a green tint. 3.10 qpnp,qpnp-labibb-mode
+      "amoled" / Microsoft "oled".
+
   lab:
     type: object
     $ref: regulator.yaml#
