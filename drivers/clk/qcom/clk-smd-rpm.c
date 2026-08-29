@@ -369,8 +369,16 @@ static int clk_smd_rpm_set_rate(struct clk_hw *hw, unsigned long rate,
 
 	guard(mutex)(&rpm_smd_clk_lock);
 
-	if (!r->enabled)
+	/*
+	 * 3.10 rpm_clk_set_rate() always updates the software rate and
+	 * only talks to RPM when the clock is already enabled. Caching
+	 * here lets prepare() vote a real kHz instead of the INT_MAX
+	 * DEFINE_CLK_SMD_RPM initialiser (Test T hung that vote).
+	 */
+	if (!r->enabled) {
+		r->rate = rate;
 		return 0;
+	}
 
 	to_active_sleep(r, rate, &this_rate, &this_sleep_rate);
 
