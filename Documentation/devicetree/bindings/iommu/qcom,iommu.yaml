@@ -35,6 +35,7 @@ properties:
           - qcom,msm8974-mdp-iommu
           - qcom,msm8974-venus-iommu
           - qcom,msm8992-mdp-iommu
+          - qcom,msm8994-gpu-iommu
           - qcom,msm8994-mdp-iommu
 
   clocks:
@@ -110,6 +111,22 @@ patternProperties:
       - compatible
       - interrupts
       - reg
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: qcom,msm8994-gpu-iommu
+    then:
+      properties:
+        clocks:
+          minItems: 2
+          maxItems: 2
+        clock-names:
+          items:
+            - const: iface
+            - const: tbu
 
 required:
   - compatible

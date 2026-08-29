@@ -31,6 +31,7 @@
 #include <linux/spinlock.h>
 
 #include "arm-smmu.h"
+#include <soc/qcom/msm8994-oxili.h>
 
 #define SMMU_INTR_SEL_NS     0x2000
 
@@ -47,6 +48,9 @@
 
 /* Redirect all cacheable requests to the L2 slave port */
 #define QCOM_IOMMU_ACTLR_BPRC		(BIT(28) | BIT(29) | BIT(30))
+
+/* SMMUv1 CB TLBIALL — missing from arm-smmu.h; 3.10 CB_TLBIALL */
+#define ARM_SMMU_CB_S1_TLBIALL		0x618
 
 enum qcom_iommu_clk {
 	CLK_IFACE,
@@ -229,6 +233,7 @@ static void qcom_iommu_tlb_inv_range_nosync(unsigned long iova, size_t size,
 {
 	struct qcom_iommu_domain *qcom_domain = cookie;
 	struct iommu_fwspec *fwspec = qcom_domain->fwspec;
+	unsigned long base = (iova >> 12) << 12;
 	unsigned i, reg;
 
 	reg = leaf ? ARM_SMMU_CB_S1_TLBIVAL : ARM_SMMU_CB_S1_TLBIVA;
@@ -236,12 +241,11 @@ static void qcom_iommu_tlb_inv_range_nosync(unsigned long iova, size_t size,
 	for (i = 0; i < fwspec->num_ids; i++) {
 		struct qcom_iommu_ctx *ctx = to_ctx(qcom_domain, fwspec->ids[i]);
 		size_t s = size;
+		unsigned long addr = base | ctx->asid;
 
-		iova = (iova >> 12) << 12;
-		iova |= ctx->asid;
 		do {
-			iommu_writel(ctx, reg, iova);
-			iova += granule;
+			iommu_writel(ctx, reg, addr);
+			addr += granule;
 		} while (s -= granule);
 	}
 }
@@ -265,6 +269,21 @@ static const struct iommu_flush_ops qcom_flush_ops = {
 	.tlb_flush_walk = qcom_iommu_tlb_flush_walk,
 	.tlb_add_page	= qcom_iommu_tlb_add_page,
 };
+
+static bool qcom_iommu_is_gpu(const struct device *dev)
+{
+	return dev && dev->of_node &&
+	       (of_device_is_compatible(dev->of_node,
+					"qcom,msm8974-gpu-iommu") ||
+		of_device_is_compatible(dev->of_node,
+					"qcom,msm8994-gpu-iommu"));
+}
+
+static bool qcom_iommu_is_msm8994_gpu(const struct device *dev)
+{
+	return dev && dev->of_node &&
+	       of_device_is_compatible(dev->of_node, "qcom,msm8994-gpu-iommu");
+}
 
 static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 {
@@ -468,6 +487,15 @@ static int qcom_iommu_init_domain(struct iommu_domain *domain,
 		.tlb		= &qcom_flush_ops,
 		.iommu_dev	= qcom_iommu->dev,
 	};
+
+	/*
+	 * MSM8994 GPU SMMU: TZ can leave the context bank Secure.
+	 * NSATTR=1 then permission-faults NS=0 L1 descriptors.
+	 * ARM_NS sets L1 table bit 3. Ignored if the bank is already
+	 * NS. Do not touch GR0 (TZ).
+	 */
+	if (qcom_iommu_is_msm8994_gpu(qcom_iommu->dev))
+		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_ARM_NS;
 
 	qcom_domain->iommu = qcom_iommu;
 	qcom_domain->fwspec = fwspec;
@@ -711,6 +739,7 @@ static void qcom_iommu_flush_iotlb_all(struct iommu_domain *domain)
 		return;
 
 	pm_runtime_get_sync(qcom_domain->iommu->dev);
+	/* Sync only. A context TLBI here hangs MDP at probe. */
 	qcom_iommu_tlb_sync(pgtable->cookie);
 	pm_runtime_put_sync(qcom_domain->iommu->dev);
 }
@@ -719,6 +748,46 @@ static void qcom_iommu_iotlb_sync(struct iommu_domain *domain,
 				  struct iommu_iotlb_gather *gather)
 {
 	qcom_iommu_flush_iotlb_all(domain);
+}
+
+static int qcom_iommu_iotlb_sync_map(struct iommu_domain *domain,
+				     unsigned long iova, size_t size)
+{
+	struct qcom_iommu_domain *qcom_domain = to_qcom_iommu_domain(domain);
+	struct io_pgtable *pgtable;
+
+	/*
+	 * V7S map_pages never TLBIs. The MSM8994 GPU SMMU needs a
+	 * context-local inv after late GEM maps. Do not touch MDP,
+	 * and do not inv before GX is voted.
+	 */
+	if (!qcom_domain->pgtbl_ops || !qcom_domain->fwspec ||
+	    !qcom_domain->iommu)
+		return 0;
+	if (!qcom_iommu_is_msm8994_gpu(qcom_domain->iommu->dev) ||
+	    !msm8994_oxili_pre_gpu_voted())
+		return 0;
+
+	pgtable = container_of(qcom_domain->pgtbl_ops, struct io_pgtable, ops);
+	pm_runtime_get_sync(qcom_domain->iommu->dev);
+	/*
+	 * TLBIASID left stale 4K translations in a live L2.
+	 * Downstream CB_TLBIALL is 0x618. Context-local only —
+	 * do not write GR0 TLBIALLNSNH.
+	 */
+	{
+		struct iommu_fwspec *fwspec = qcom_domain->fwspec;
+		unsigned int i;
+
+		for (i = 0; i < fwspec->num_ids; i++) {
+			struct qcom_iommu_ctx *ctx = to_ctx(qcom_domain,
+							    fwspec->ids[i]);
+			iommu_writel(ctx, ARM_SMMU_CB_S1_TLBIALL, 0);
+		}
+		qcom_iommu_tlb_sync(pgtable->cookie);
+	}
+	pm_runtime_put_sync(qcom_domain->iommu->dev);
+	return 0;
 }
 
 static phys_addr_t qcom_iommu_iova_to_phys(struct iommu_domain *domain,
@@ -834,6 +903,7 @@ static const struct iommu_ops qcom_iommu_ops = {
 		.unmap_pages	= qcom_iommu_unmap,
 		.flush_iotlb_all = qcom_iommu_flush_iotlb_all,
 		.iotlb_sync	= qcom_iommu_iotlb_sync,
+		.iotlb_sync_map	= qcom_iommu_iotlb_sync_map,
 		.iova_to_phys	= qcom_iommu_iova_to_phys,
 		.free		= qcom_iommu_domain_free,
 	}
@@ -1062,7 +1132,6 @@ static int qcom_iommu_device_probe(struct platform_device *pdev)
 		dev_info(dev, "talkman-iommu: 8992 mdp V7S BFB\n");
 	if (of_device_is_compatible(dev->of_node, "qcom,msm8994-mdp-iommu"))
 		dev_info(dev, "talkman-iommu: 8994 mdp V7S BFB\n");
-
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res) {
 		if (qcom_iommu->cfg) {
@@ -1086,7 +1155,8 @@ static int qcom_iommu_device_probe(struct platform_device *pdev)
 	}
 	qcom_iommu->clks[CLK_IFACE].clk = clk;
 
-	clk = devm_clk_get(dev, "bus");
+	/* 8994 GPU SMMU has no AXI bus clock (downstream: iface+core only) */
+	clk = devm_clk_get_optional(dev, "bus");
 	if (IS_ERR(clk)) {
 		dev_err(dev, "failed to get bus clock\n");
 		return PTR_ERR(clk);
@@ -1177,11 +1247,35 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 	unsigned int i;
 	int ret;
 
+	/*
+	 * GPU SMMU is a runtime supplier of &gpu. Second resume
+	 * (TIMESTAMP after autosuspend) ran scm(18) with GX off:
+	 * ret=-22 then RBBM read SEA. 3.10 rails before SMMU.
+	 * Do not uncollapse at bind (flag is clear; clk_bulk still
+	 * fails). After first hw_init, GX+CX before these clocks.
+	 */
+	if (qcom_iommu_is_msm8994_gpu(dev)) {
+		ret = msm8994_oxili_pre_gpu_power_if_live();
+		if (ret)
+			return ret;
+	}
+
 	ret = clk_bulk_prepare_enable(CLK_NUM, qcom_iommu->clks);
 	if (ret < 0)
 		return ret;
 
-	if (qcom_iommu->non_secure) {
+	/*
+	 * MSM8994 GPU SMMU is TZ-managed (3.10 qcom,iommu-secure-id
+	 * = <18>). Mainline DT omits that, so non_secure would
+	 * reset_ns (NS GR0) and abort. scm+BFB instead. Do not scm
+	 * at bind (create_vm) before GX is voted.
+	 */
+	if (qcom_iommu_is_msm8994_gpu(dev) &&
+	    msm8994_oxili_pre_gpu_voted()) {
+		ret = qcom_scm_restore_sec_cfg(18, 0);
+		if (ret)
+			return ret;
+	} else if (qcom_iommu->non_secure) {
 		ret = qcom_iommu_reset_ns(qcom_iommu);
 		if (ret)
 			return ret;
@@ -1201,6 +1295,31 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 			if (ctx && ctx->domain && !ctx->secured_ctx)
 				qcom_iommu_program_ctx(qcom_iommu, ctx);
 		}
+	}
+
+	/*
+	 * 3.10 msm8994-iommu.dtsi puts GPU SIDs 0 and 1 on CB0
+	 * (gfx3d_user) and leaves gfx3d_priv empty. 8974 SMR is
+	 * SID1→CB1. TZ owns GR0 so we cannot rewrite SMR. Clone
+	 * CB0's pagetable into CB1 so SID 1 translates either way.
+	 * Ctx MMIO only — do not touch GR0.
+	 */
+	if (qcom_iommu_is_msm8994_gpu(dev) &&
+	    qcom_iommu->max_asid >= 1 && qcom_iommu->ctxs[0] &&
+	    qcom_iommu->ctxs[1] && qcom_iommu->ctxs[0]->domain &&
+	    !qcom_iommu->ctxs[1]->secured_ctx) {
+		struct qcom_iommu_ctx *user = qcom_iommu->ctxs[0];
+		struct qcom_iommu_ctx *priv = qcom_iommu->ctxs[1];
+
+		priv->ttbr0 = user->ttbr0;
+		priv->tcr[0] = user->tcr[0];
+		priv->tcr[1] = user->tcr[1];
+		priv->mair[0] = user->mair[0];
+		priv->mair[1] = user->mair[1];
+		priv->sctlr = user->sctlr;
+		priv->contextidr = priv->asid;
+		priv->domain = user->domain;
+		qcom_iommu_program_ctx(qcom_iommu, priv);
 	}
 
 	return ret;
@@ -1236,6 +1355,41 @@ static const struct qcom_iommu_bfb_reg msm8974_gpu_bfb[] = {
 	{ 0x008, 0x00000000 },
 };
 
+/*
+ * 3.10 kgsl_iommu on MSM8994. Downstream qcom,iommu-bfb-regs with
+ * the 0x2000 impl-def bias removed. 0x000 is MICRO_MMU_CTRL reserved
+ * bits (0x3), not HALT_REQ (bit 2). 0x15c is S1L1BFBLP0.
+ */
+static const struct qcom_iommu_bfb_reg msm8994_gpu_bfb[] = {
+	{ 0x000, 0x00000003 },
+	{ 0x04c, 0x00000003 },
+	{ 0x060, 0x00001555 },
+	{ 0x514, 0x00000000 },
+	{ 0x540, 0x00000000 },
+	{ 0x56c, 0x00000010 },
+	{ 0x0ac, 0x00000000 },
+	{ 0x15c, 0x00000120 },
+	{ 0x20c, 0x00000120 },
+	{ 0x2bc, 0x00000010 },
+	{ 0x314, 0x00000000 },
+	{ 0x394, 0x00000000 },
+	{ 0x414, 0x00000000 },
+	{ 0x494, 0x00000001 },
+	{ 0x008, 0x00000000 },
+	{ 0x600, 0x00000007 },
+	{ 0x604, 0x00000000 },
+	{ 0x608, 0x00000020 },
+	{ 0x60c, 0x00000020 },
+	{ 0x610, 0x0000000c },
+	{ 0x614, 0x00000000 },
+	{ 0x618, 0x00000000 },
+	{ 0x61c, 0x00000000 },
+	{ 0x620, 0x00000010 },
+	{ 0x624, 0x00000000 },
+	{ 0x628, 0x00000000 },
+	{ 0x62c, 0x00000010 },
+};
+
 static const struct qcom_iommu_sid msm8974_gpu_sids[] = {
 	{ .cbndx = 0, .sid = 0 },	/* GFX3D_USER */
 	{ .cbndx = 1, .sid = 1 },	/* GFX3D_PRIV */
@@ -1248,6 +1402,17 @@ static const struct qcom_iommu_cfg msm8974_gpu_cfg = {
 	.ctx_restore = true,
 	.bfb = msm8974_gpu_bfb,
 	.num_bfb = ARRAY_SIZE(msm8974_gpu_bfb),
+	.sids = msm8974_gpu_sids,
+	.num_sids = ARRAY_SIZE(msm8974_gpu_sids),
+};
+
+static const struct qcom_iommu_cfg msm8994_gpu_cfg = {
+	.no_stall = true,
+	.fmt = ARM_V7S,
+	.no_afe = true,
+	.ctx_restore = true,
+	.bfb = msm8994_gpu_bfb,
+	.num_bfb = ARRAY_SIZE(msm8994_gpu_bfb),
 	.sids = msm8974_gpu_sids,
 	.num_sids = ARRAY_SIZE(msm8974_gpu_sids),
 };
@@ -1400,6 +1565,7 @@ static const struct of_device_id qcom_iommu_of_match[] = {
 	{ .compatible = "qcom,msm-iommu-v1" },
 	{ .compatible = "qcom,msm-iommu-v2" },
 	{ .compatible = "qcom,msm8974-gpu-iommu", .data = &msm8974_gpu_cfg },
+	{ .compatible = "qcom,msm8994-gpu-iommu", .data = &msm8994_gpu_cfg },
 	{ .compatible = "qcom,msm8974-mdp-iommu", .data = &msm8974_mdp_cfg },
 	{ .compatible = "qcom,msm8974-venus-iommu", .data = &msm8974_venus_cfg },
 	{ .compatible = "qcom,msm8992-mdp-iommu", .data = &msm8992_mdp_cfg },
