@@ -10,9 +10,11 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/clk-provider.h>
+#include <linux/clk.h>
 #include <linux/regmap.h>
 
 #include <dt-bindings/clock/qcom,mmcc-msm8994.h>
+#include <soc/qcom/msm8994-oxili.h>
 
 #include "common.h"
 #include "clk-regmap.h"
@@ -2397,6 +2399,24 @@ static struct gdsc oxili_gx_gdsc = {
 	.supply = "VDD_GFX",
 };
 
+/*
+ * MSM8994 GX is a sibling of CX (3.10 pmi8994_s2), not a child of
+ * oxili_cx_gdsc, and has no clamp_io_ctrl. gdsc.flags is const, so
+ * keep a second descriptor and swap it in only for mmcc-msm8994.
+ */
+static struct gdsc oxili_gx_gdsc_8994 = {
+	.gdscr = 0x4024,
+	.cxcs = (unsigned int []){ 0x4028 },
+	.cxc_count = 1,
+	.pd = {
+		.name = "oxili_gx_gdsc",
+	},
+	.pwrsts = PWRSTS_OFF_ON,
+	.supply = "vdd-gfx",
+};
+
+static struct gdsc *oxili_gx;
+
 static struct clk_regmap *mmcc_msm8994_clocks[] = {
 	[MMPLL0_EARLY] = &mmpll0_early.clkr,
 	[MMPLL0_PLL] = &mmpll0.clkr,
@@ -2572,9 +2592,96 @@ static const struct of_device_id mmcc_msm8994_match_table[] = {
 };
 MODULE_DEVICE_TABLE(of, mmcc_msm8994_match_table);
 
+static struct clk *oxili_gfx3d_src;
+static int (*oxili_gx_hw_power_on)(struct generic_pm_domain *domain);
+
+/*
+ * 3.10 kgsl_pwrctrl_enable: pwrlevel_change (gfx3d 300 MHz =
+ * initial-pwrlevel 2) then GX GDSCR. genpd enable at GPU bind
+ * must do the same.
+ */
+static void oxili_gx_pre_uncollapse(struct gdsc *sc)
+{
+	struct clk *src;
+
+	if (sc->regmap)
+		regmap_update_bits(sc->regmap, oxili_gfx3d_clk.clkr.enable_reg,
+				   BIT(0), 0);
+	if (IS_ERR_OR_NULL(oxili_gfx3d_src))
+		return;
+	src = clk_get_parent(oxili_gfx3d_src);
+	if (!src)
+		return;
+	clk_set_rate(src, 300000000);
+	clk_prepare_enable(src);
+}
+
+static int oxili_gx_pd_power_on(struct generic_pm_domain *domain)
+{
+	struct gdsc *sc = container_of(domain, struct gdsc, pd);
+	struct clk *src;
+
+	if (IS_ERR_OR_NULL(oxili_gfx3d_src) ||
+	    !(src = clk_get_parent(oxili_gfx3d_src)))
+		return -EPROBE_DEFER;
+
+	oxili_gx_pre_uncollapse(sc);
+	return oxili_gx_hw_power_on(domain);
+}
+
+static bool oxili_gpu_live;
+static bool oxili_pre_gpu_voted;
+
+void msm8994_oxili_mark_gpu_live(void)
+{
+	oxili_gpu_live = true;
+}
+EXPORT_SYMBOL_GPL(msm8994_oxili_mark_gpu_live);
+
+bool msm8994_oxili_pre_gpu_voted(void)
+{
+	return oxili_pre_gpu_voted;
+}
+EXPORT_SYMBOL_GPL(msm8994_oxili_pre_gpu_voted);
+
+int msm8994_oxili_pre_gpu_power(void)
+{
+	int ret;
+
+	if (!oxili_gx || !oxili_gx->pd.power_on || !oxili_cx_gdsc.pd.power_on)
+		return -ENODEV;
+
+	ret = oxili_gx->pd.power_on(&oxili_gx->pd);
+	if (ret)
+		return ret;
+
+	ret = oxili_cx_gdsc.pd.power_on(&oxili_cx_gdsc.pd);
+	if (!ret)
+		oxili_pre_gpu_voted = true;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(msm8994_oxili_pre_gpu_power);
+
+int msm8994_oxili_pre_gpu_power_if_live(void)
+{
+	if (!oxili_gpu_live)
+		return 0;
+	return msm8994_oxili_pre_gpu_power();
+}
+EXPORT_SYMBOL_GPL(msm8994_oxili_pre_gpu_power_if_live);
+
+
 static int mmcc_msm8994_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
+	int ret;
+
+	if (of_device_is_compatible(pdev->dev.of_node, "qcom,mmcc-msm8994")) {
+		oxili_gx = &oxili_gx_gdsc_8994;
+		mmcc_msm8994_gdscs[OXILI_GX_GDSC] = oxili_gx;
+	} else {
+		oxili_gx = &oxili_gx_gdsc;
+	}
 
 	if (of_device_is_compatible(pdev->dev.of_node, "qcom,mmcc-msm8992")) {
 		/* MSM8992 features less clocks and some have different freq tables */
@@ -2618,7 +2725,18 @@ static int mmcc_msm8994_probe(struct platform_device *pdev)
 	clk_alpha_pll_configure(&mmpll3_early, regmap, &mmpll_p_config);
 	clk_alpha_pll_configure(&mmpll5_early, regmap, &mmpll_p_config);
 
-	return qcom_cc_really_probe(&pdev->dev, &mmcc_msm8994_desc, regmap);
+	ret = qcom_cc_really_probe(&pdev->dev, &mmcc_msm8994_desc, regmap);
+	if (ret)
+		return ret;
+
+	if (of_device_is_compatible(pdev->dev.of_node, "qcom,mmcc-msm8994")) {
+		oxili_gfx3d_src = clk_hw_get_clk(&oxili_gfx3d_clk.clkr.hw,
+						 "oxili-gx");
+		oxili_gx_hw_power_on = oxili_gx->pd.power_on;
+		if (oxili_gx_hw_power_on)
+			oxili_gx->pd.power_on = oxili_gx_pd_power_on;
+	}
+	return 0;
 }
 
 static struct platform_driver mmcc_msm8994_driver = {
