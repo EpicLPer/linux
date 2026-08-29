@@ -2,6 +2,7 @@
 /* Copyright (c) 2014 The Linux Foundation. All rights reserved.
  */
 #include "a4xx_gpu.h"
+#include <linux/iopoll.h>
 
 #define A4XX_INT0_MASK \
 	(A4XX_INT0_RBBM_AHB_ERROR |        \
@@ -26,6 +27,21 @@ static void a4xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 {
 	struct msm_ringbuffer *ring = submit->ring;
 	unsigned int i;
+
+	if (adreno_is_a430(to_adreno_gpu(gpu))) {
+		unsigned int pwr;
+		int err;
+
+		gpu_write(gpu, REG_A4XX_RBBM_POWER_CNTL_IP, 0x778000);
+		err = read_poll_timeout(gpu_read, pwr,
+					pwr & A4XX_RBBM_POWER_CNTL_IP_SP_TP_PWR_ON,
+					5, 100000, false, gpu,
+					REG_A4XX_RBBM_POWER_STATUS);
+		if (err)
+			DRM_DEV_ERROR(gpu->dev->dev,
+				      "A430 SP/TP power-on timeout status=0x%08x\n",
+				      pwr);
+	}
 
 	for (i = 0; i < submit->nr_cmds; i++) {
 		switch (submit->cmd[i].type) {
@@ -236,6 +252,14 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	gpu_write(gpu, REG_A4XX_RBBM_INTERFACE_HANG_INT_CTL,
 			(1 << 30) | 0xFFFF);
 
+	/*
+	 * Secure OCMEM lock belongs after GX is on (downstream
+	 * process_map). Look up at bind; allocate here.
+	 */
+	ret = adreno_gpu_ocmem_alloc(adreno_gpu, &a4xx_gpu->ocmem);
+	if (ret)
+		return ret;
+
 	gpu_write(gpu, REG_A4XX_RB_GMEM_BASE_ADDR,
 			(unsigned int)(a4xx_gpu->ocmem.base >> 14));
 
@@ -344,12 +368,32 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	/* clear ME_HALT to start micro engine */
 	gpu_write(gpu, REG_A4XX_CP_ME_CNTL, 0);
 
-	return a4xx_me_init(gpu) ? 0 : -EINVAL;
+	if (!a4xx_me_init(gpu))
+		return -EINVAL;
+
+	return 0;
 }
 
 static void a4xx_recover(struct msm_gpu *gpu)
 {
 	int i;
+
+	if (adreno_is_a430(to_adreno_gpu(gpu))) {
+		/*
+		 * Full register dump and SW_RESET SEA on VMIDMT/XPU
+		 * ranges in a4xx_registers. Print the CP window only.
+		 */
+		pr_err("%s: recover status=0x%08x int0=0x%08x rptr=0x%x wptr=0x%x\n",
+		       gpu->name,
+		       gpu_read(gpu, REG_A4XX_RBBM_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_INT_0_STATUS),
+		       gpu_read(gpu, REG_A4XX_CP_RB_RPTR),
+		       get_wptr(gpu->rb[0]));
+		for (i = 0; i < 8; i++)
+			pr_err("CP_SCRATCH_REG%d: %u\n", i,
+			       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
+		return;
+	}
 
 	adreno_dump_info(gpu);
 
@@ -555,6 +599,24 @@ static struct msm_gpu_state *a4xx_gpu_state_get(struct msm_gpu *gpu)
 	if (!state)
 		return ERR_PTR(-ENOMEM);
 
+	/*
+	 * a4xx_registers includes VMIDMT/XPU ranges. Reading them
+	 * SEAs on A430 (TZ). Snapshot the CP/RBBM window only.
+	 */
+	if (adreno_is_a430(to_adreno_gpu(gpu))) {
+		struct msm_ringbuffer *ring = gpu->rb[0];
+
+		kref_init(&state->ref);
+		ktime_get_real_ts64(&state->time);
+		state->ring[0].fence = ring->memptrs->fence;
+		state->ring[0].iova = ring->iova;
+		state->ring[0].seqno = ring->fctx->last_fence;
+		state->ring[0].rptr = gpu_read(gpu, REG_A4XX_CP_RB_RPTR);
+		state->ring[0].wptr = get_wptr(ring);
+		state->rbbm_status = gpu_read(gpu, REG_A4XX_RBBM_STATUS);
+		return state;
+	}
+
 	adreno_gpu_state_get(gpu, state);
 
 	state->rbbm_status = gpu_read(gpu, REG_A4XX_RBBM_STATUS);
@@ -573,18 +635,32 @@ static int a4xx_pm_resume(struct msm_gpu *gpu) {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
 	int ret;
 
+	/*
+	 * Do not call msm8994_oxili_pre_gpu_power() here. get_sync
+	 * resumes the GPU SMMU first; re-toggling GX after that scm
+	 * hangs the SoC. Rails belong in load_gpu and in GPU-iommu
+	 * resume after the first hw_init. Do not put GX on &gpu.
+	 */
 	ret = msm_gpu_pm_resume(gpu);
 	if (ret)
 		return ret;
 
 	if (adreno_is_a430(adreno_gpu)) {
 		unsigned int reg;
+		int err;
+
 		/* Set the default register values; set SW_COLLAPSE to 0 */
 		gpu_write(gpu, REG_A4XX_RBBM_POWER_CNTL_IP, 0x778000);
-		do {
-			udelay(5);
-			reg = gpu_read(gpu, REG_A4XX_RBBM_POWER_STATUS);
-		} while (!(reg & A4XX_RBBM_POWER_CNTL_IP_SP_TP_PWR_ON));
+		err = read_poll_timeout(gpu_read, reg,
+					reg & A4XX_RBBM_POWER_CNTL_IP_SP_TP_PWR_ON,
+					5, 100000, false, gpu,
+					REG_A4XX_RBBM_POWER_STATUS);
+		if (err) {
+			DRM_DEV_ERROR(gpu->dev->dev,
+				      "A430 SP/TP power-on timeout status=0x%08x\n",
+				      reg);
+			return err;
+		}
 	}
 	return 0;
 }
@@ -656,12 +732,19 @@ static struct msm_gpu *a4xx_gpu_init(struct drm_device *dev)
 	if (ret)
 		goto fail;
 
+	/*
+	 * Firmware often lives in the initrd. drm_fb_helper can open the
+	 * primary node before switch_root; later hw_init then fails if
+	 * the blobs were not loaded here.
+	 */
+	ret = adreno_load_fw(adreno_gpu);
+	if (ret)
+		goto fail;
+
 	adreno_gpu->registers = adreno_is_a405(adreno_gpu) ? a405_registers :
 							     a4xx_registers;
 
-	/* if needed, allocate gmem: */
-	ret = adreno_gpu_ocmem_init(dev->dev, adreno_gpu,
-				    &a4xx_gpu->ocmem);
+	ret = adreno_gpu_ocmem_get(&pdev->dev, adreno_gpu, &a4xx_gpu->ocmem);
 	if (ret)
 		goto fail;
 

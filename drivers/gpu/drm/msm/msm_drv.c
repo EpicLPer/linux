@@ -8,6 +8,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/fault-inject.h>
 #include <linux/debugfs.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/uaccess.h>
 
@@ -264,10 +265,16 @@ static int context_init(struct drm_device *dev, struct drm_file *file)
 
 static int msm_open(struct drm_device *dev, struct drm_file *file)
 {
-	/* For now, load gpu on open.. to avoid the requirement of having
-	 * firmware in the initrd.
+	/*
+	 * drm_fb_helper opens the primary node from drm_dev_register.
+	 * MSM8994 A430 CP ME bus-stalls if hw_init runs then (ring
+	 * fetch through the GPU SMMU). 3.10 kgsl inits on the first
+	 * GPU client, not display bind. Load from render-node open
+	 * (and GPU ioctls call load_gpu if still NULL).
 	 */
-	load_gpu(dev);
+	if (!(of_machine_is_compatible("qcom,msm8994") &&
+	      file->minor && file->minor->type == DRM_MINOR_PRIMARY))
+		load_gpu(dev);
 
 	return context_init(dev, file);
 }
@@ -311,8 +318,9 @@ static int msm_ioctl_get_param(struct drm_device *dev, void *data,
 	if ((args->pipe != MSM_PIPE_3D0) || (args->pad != 0))
 		return -EINVAL;
 
+	if (!priv->gpu)
+		load_gpu(dev);
 	gpu = priv->gpu;
-
 	if (!gpu)
 		return -ENXIO;
 
@@ -330,8 +338,9 @@ static int msm_ioctl_set_param(struct drm_device *dev, void *data,
 	if ((args->pipe != MSM_PIPE_3D0) || (args->pad != 0))
 		return -EINVAL;
 
+	if (!priv->gpu)
+		load_gpu(dev);
 	gpu = priv->gpu;
-
 	if (!gpu)
 		return -ENXIO;
 
@@ -424,6 +433,8 @@ static int msm_ioctl_gem_info_iova(struct drm_device *dev,
 	struct msm_context *ctx = file->driver_priv;
 
 	if (!priv->gpu)
+		load_gpu(dev);
+	if (!priv->gpu)
 		return -EINVAL;
 
 	if (msm_context_is_vmbind(ctx))
@@ -447,6 +458,8 @@ static int msm_ioctl_gem_info_set_iova(struct drm_device *dev,
 	struct msm_context *ctx = file->driver_priv;
 	struct drm_gpuvm *vm = msm_context_vm(dev, ctx);
 
+	if (!priv->gpu)
+		load_gpu(dev);
 	if (!priv->gpu)
 		return -EINVAL;
 
@@ -714,6 +727,8 @@ static int msm_ioctl_wait_fence(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
+	if (!priv->gpu)
+		load_gpu(dev);
 	if (!priv->gpu)
 		return 0;
 
