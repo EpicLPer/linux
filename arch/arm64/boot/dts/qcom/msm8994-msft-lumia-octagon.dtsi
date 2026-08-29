@@ -323,6 +323,14 @@
 
 		vdd-supply = <&vreg_l22a_3p0>;
 		reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
+		/*
+		 * 3.10 RESET_DELAY is 100 ms after reset GPIO.
+		 * Probe at 0.72 s NACKs page-select (-6). Bind at
+		 * 214 s on living CJ succeeded with LVS1 still off
+		 * (i2cget 0x4b worked; i2cdetect SMBus quick cannot).
+		 * Do not vote LVS1 here (testCZ/DA hung).
+		 */
+		syna,startup-delay-ms = <100>;
 
 		pinctrl-names = "default";
 		pinctrl-0 = <&touch_pins>;
