@@ -26,8 +26,63 @@
 	no-map;
 };
 
+/*
+ * Catalog 0x04030000. gfx-mem ICC is BIMC GFX3D. Vote RPM VDDGFX
+ * (gfx_s2b) on the GPU. Do not put OXILI_GX_GDSC on &gpu or
+ * gpu_iommu — that collapses the wrong domain at bind.
+ */
 &gpu {
 	status = "okay";
+	power-domains = <&rpmpd MSM8994_VDDGFX>;
+	required-opps = <&rpmpd_opp_svs_soc>;
+	/* BIMC GFX3D master, not MDP port0 (that is mdss). */
+	interconnects = <&bimc BIMC_MAS_GRAPHICS_3D &bimc BIMC_SLV_EBI_CH0>,
+			<&ovirt OCMEM_MAS_GFX3D &ovirt OCMEM_SLV_OCMEM_GFX>;
+	interconnect-names = "gfx-mem", "ocmem";
+	/*
+	 * 3.10 gfx3d_user carries SIDs 0 and 1. Stock dtsi only
+	 * lists 0, so SID 1 would miss the user context bank.
+	 */
+	iommus = <&gpu_iommu 0>, <&gpu_iommu 1>;
+};
+
+/*
+ * 8994 GPU SMMU has no AXI bus clock (downstream kgsl_iommu uses
+ * core_clk=gfx3d + iface_clk=oxilicx_ahb). tbu must stay gfx3d.
+ * Own compatible so the 8994 BFB table is not applied to 8974.
+ */
+&gpu_iommu {
+	compatible = "qcom,msm8994-gpu-iommu";
+	clocks = <&mmcc OXILICX_AHB_CLK>,
+		 <&mmcc OXILI_GFX3D_CLK>;
+	clock-names = "iface", "tbu";
+};
+
+/*
+ * VDD_GFX via PMI8994 SPMI s2. The RPM SMD vdd_gfx node hangs
+ * this board. 8996 boards wire mmcc the same way. Consumer vote,
+ * not always-on.
+ */
+&pmi8994_spmi_regulators {
+	vdd_gfx_spmi: s2 {
+		regulator-name = "vdd_gfx_spmi";
+		regulator-min-microvolt = <1015000>;
+		regulator-max-microvolt = <1015000>;
+	};
+};
+
+&mmcc {
+	vdd-gfx-supply = <&vdd_gfx_spmi>;
+};
+
+/*
+ * 8994 OCMEM is four regions / 2 MiB (not 8974's three / 1.5 MiB).
+ * vdd-gfx keeps the controller powered; unused-disable of this rail
+ * makes later TZ ocmem_lock hang. Consumer vote, not always-on.
+ */
+&ocmem {
+	compatible = "qcom,msm8994-ocmem";
+	vdd-gfx-supply = <&vdd_gfx_spmi>;
 };
 
 /*
