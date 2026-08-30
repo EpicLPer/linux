@@ -292,6 +292,7 @@ static u32 vfe_src_pad_code(struct vfe_line *line, u32 sink_code,
 	case CAMSS_8x16:
 	case CAMSS_8x39:
 	case CAMSS_8x53:
+	case CAMSS_8x94:
 		switch (sink_code) {
 		case MEDIA_BUS_FMT_YUYV8_1X16:
 		{
@@ -1068,8 +1069,12 @@ static int vfe_check_clock_rates(struct vfe_device *vfe)
 			camss_add_clock_margin(&min_rate);
 
 			rate = clk_get_rate(clock->clk);
-			if (rate < min_rate)
+			if (rate < min_rate) {
+				dev_err(vfe->camss->dev,
+					"VFE clock %s rate %lu < min %llu\n",
+					clock->name, rate, min_rate);
 				return -EBUSY;
+			}
 		}
 	}
 

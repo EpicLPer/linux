@@ -99,9 +99,23 @@ static void csid_configure_stream(struct csid_device *csid, u8 enable)
 			writel_relaxed(val, csid->base + CAMSS_CSID_CORE_CTRL_0);
 
 			val = phy->csiphy_id << 17;
-			val |= 0x9;
+			/*
+			 * CSID v3.0+ (8994 qcom,csid-v3.1): CAF msm_csid.c
+			 * writes phy_sel<<17 | 0xF. 0x9 is the 8x16-era
+			 * value in this file and must stay on 8x16/8x39.
+			 */
+			if (csid->camss->res->version == CAMSS_8x94)
+				val |= 0xF;
+			else
+				val |= 0x9;
 
 			writel_relaxed(val, csid->base + CAMSS_CSID_CORE_CTRL_1);
+			dev_info(csid->camss->dev,
+				 "CSID ctrl0=0x%x ctrl1=0x%x lanes=%u assign=0x%x phy=%u\n",
+				 readl_relaxed(csid->base + CAMSS_CSID_CORE_CTRL_0),
+				 readl_relaxed(csid->base + CAMSS_CSID_CORE_CTRL_1),
+				 phy->lane_cnt, phy->lane_assign,
+				 phy->csiphy_id);
 		}
 
 		/* Config LUT */

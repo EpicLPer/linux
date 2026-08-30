@@ -634,7 +634,8 @@ u32 csid_hw_version(struct csid_device *csid)
 u32 csid_src_pad_code(struct csid_device *csid, u32 sink_code,
 		      unsigned int match_format_idx, u32 match_code)
 {
-	if (csid->camss->res->version == CAMSS_8x16) {
+	if (csid->camss->res->version == CAMSS_8x16 ||
+	    csid->camss->res->version == CAMSS_8x94) {
 		if (match_format_idx > 0)
 			return 0;
 
@@ -781,6 +782,32 @@ static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 		csid->res->hw_ops->configure_stream(csid, enable);
 		csid->phy.need_vc_update = false;
 	}
+
+	/*
+	 * configure_stream(0) is skipped unless need_vc_update.
+	 * 8994 CSID v3.1 map is CAF msm_csid.h + msm_csid_3_1_hwreg.h:
+	 * 0x6c–0x7c captured headers, 0x80–0x8c PIF MISR (not stats),
+	 * 0x90/0x94/0x98 packet/ECC/CRC stats. Clocks still on here.
+	 */
+	if (!enable && csid->base &&
+	    csid->camss->res->version == CAMSS_8x94)
+		dev_info(csid->camss->dev,
+			 "CSID stats pkts=0x%x ecc=0x%x crc=0x%x irq=0x%x unmap=0x%x map=0x%x short=0x%x long=0x%x ftr=0x%x cidlut=0x%x cidcfg=0x%x misr=0x%x/0x%x/0x%x/0x%x\n",
+			 readl_relaxed(csid->base + 0x090),
+			 readl_relaxed(csid->base + 0x094),
+			 readl_relaxed(csid->base + 0x098),
+			 readl_relaxed(csid->base + 0x068),
+			 readl_relaxed(csid->base + 0x06c),
+			 readl_relaxed(csid->base + 0x070),
+			 readl_relaxed(csid->base + 0x074),
+			 readl_relaxed(csid->base + 0x078),
+			 readl_relaxed(csid->base + 0x07c),
+			 readl_relaxed(csid->base + 0x010),
+			 readl_relaxed(csid->base + 0x020),
+			 readl_relaxed(csid->base + 0x080),
+			 readl_relaxed(csid->base + 0x084),
+			 readl_relaxed(csid->base + 0x088),
+			 readl_relaxed(csid->base + 0x08c));
 
 	return 0;
 }

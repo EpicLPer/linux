@@ -19,6 +19,7 @@ qcom-camss-objs += \
 		camss-tpg-gen1.o \
 		camss-vfe.o \
 		camss-vfe-4-1.o \
+		camss-vfe-4-6.o \
 		camss-vfe-4-7.o \
 		camss-vfe-4-8.o \
 		camss-vfe-17x.o \

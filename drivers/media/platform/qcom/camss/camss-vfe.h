@@ -242,6 +242,7 @@ extern const struct camss_formats vfe_formats_rdi_845;
 extern const struct camss_formats vfe_formats_pix_845;
 
 extern const struct vfe_hw_ops vfe_ops_4_1;
+extern const struct vfe_hw_ops vfe_ops_4_6;
 extern const struct vfe_hw_ops vfe_ops_4_7;
 extern const struct vfe_hw_ops vfe_ops_4_8;
 extern const struct vfe_hw_ops vfe_ops_170;

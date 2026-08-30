@@ -17,6 +17,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/iopoll.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
@@ -59,6 +60,7 @@ static const struct ccs_module_ident ccs_module_idents[] = {
 	CCS_IDENT_LQ(0x0c, 0x560f, -1, "jt8ew9", &smiapp_jt8ew9_quirk),
 	CCS_IDENT_LQ(0x10, 0x4141, -1, "jt8ev1", &smiapp_jt8ev1_quirk),
 	CCS_IDENT_LQ(0x10, 0x4241, -1, "imx125es", &smiapp_imx125es_quirk),
+	CCS_IDENT_LQ(0x0a, 0xeaca, -1, "eaca", &smiapp_eaca_quirk),
 };
 
 #define CCS_DEVICE_FLAG_IS_SMIA		BIT(0)
@@ -1664,6 +1666,7 @@ static int ccs_power_on(struct device *dev)
 
 	if (sensor->reset || sensor->xshutdown || sensor->ext_clk) {
 		unsigned int sleep;
+		bool is_smia = ccsdev->flags & CCS_DEVICE_FLAG_IS_SMIA;
 
 		rval = clk_prepare_enable(sensor->ext_clk);
 		if (rval < 0) {
@@ -1671,23 +1674,35 @@ static int ccs_power_on(struct device *dev)
 			goto out_xclk_fail;
 		}
 
+		/*
+		 * ACPI CAMS D0 waits 0x19 ms after MCLK mux. 3.10
+		 * smia65pp matches that before releasing xshutdown.
+		 */
+		if (is_smia)
+			fsleep(25000);
+
 		gpiod_set_value(sensor->reset, 0);
 		gpiod_set_value(sensor->xshutdown, 1);
 
-		if (ccsdev->flags & CCS_DEVICE_FLAG_IS_SMIA)
-			sleep = SMIAPP_RESET_DELAY(sensor->hwcfg.ext_clk);
+		if (is_smia)
+			/* spec delay + the extra 10 ms smia65pp notes */
+			sleep = SMIAPP_RESET_DELAY(sensor->hwcfg.ext_clk) +
+				10000;
 		else
 			sleep = CCS_RESET_DELAY_US;
 
-		usleep_range(sleep, sleep);
+		fsleep(sleep);
 	}
 
 	/*
 	 * Some devices take longer than the spec-defined time to respond
 	 * after reset. Try until some time has passed before flagging it
-	 * an error.
+	 * an error. SMIA++ (3.10 smia65pp) always software-resets after
+	 * xshutdown even when a reset GPIO is present; skip that and
+	 * the first CCI write (COMPRESSION_MODE) NACKs.
 	 */
-	if (!sensor->reset && !sensor->xshutdown) {
+	if ((ccsdev->flags & CCS_DEVICE_FLAG_IS_SMIA) ||
+	    (!sensor->reset && !sensor->xshutdown)) {
 		u32 reset;
 
 		rval = read_poll_timeout(ccs_write, rval, !rval,
@@ -1711,6 +1726,10 @@ static int ccs_power_on(struct device *dev)
 				      "failed to respond after reset\n");
 			goto out_cci_addr_fail;
 		}
+
+		if (ccsdev->flags & CCS_DEVICE_FLAG_IS_SMIA)
+			dev_info(dev, "SMIA xshutdown + software reset ok, extclk %u\n",
+				 sensor->hwcfg.ext_clk);
 	}
 
 	if (sensor->hwcfg.i2c_addr_alt) {
@@ -1724,8 +1743,18 @@ static int ccs_power_on(struct device *dev)
 	rval = ccs_write(sensor, COMPRESSION_MODE,
 			 CCS_COMPRESSION_MODE_DPCM_PCM_SIMPLE);
 	if (rval) {
-		dev_err(dev, "compression mode set failed\n");
-		goto out_cci_addr_fail;
+		/*
+		 * 3.10 ident never writes 0x0500. WP SMIA++ modules may
+		 * NACK it; do not fail probe if the sensor already
+		 * answered the software reset.
+		 */
+		if (ccsdev->flags & CCS_DEVICE_FLAG_IS_SMIA)
+			dev_warn(dev, "compression mode set failed: %d\n",
+				 rval);
+		else {
+			dev_err(dev, "compression mode set failed\n");
+			goto out_cci_addr_fail;
+		}
 	}
 
 	rval = ccs_write(sensor, EXTCLK_FREQUENCY_MHZ,
@@ -1870,6 +1899,15 @@ static int ccs_enable_streams(struct v4l2_subdev *subdev,
 	u8 binning_mode, binh, binv;
 	int rval;
 
+	/*
+	 * MODE_SELECT is owned by the CSI output (src, pad CCS_PAD_SRC).
+	 * pixel_array / binner share these ops; their source pad is
+	 * CCS_PA_PAD_SRC (0). v4l2_subdev_s_stream_helper then calls
+	 * enable_streams(pad=0) → -EINVAL. CAMSS walks every entity.
+	 * V4L2 enable_streams is on the transmitter source pad only.
+	 */
+	if (subdev != &sensor->src->sd)
+		return 0;
 	if (pad != CCS_PAD_SRC)
 		return -EINVAL;
 
@@ -2000,6 +2038,49 @@ static int ccs_enable_streams(struct v4l2_subdev *subdev,
 	}
 
 	rval = ccs_write(sensor, MODE_SELECT, CCS_MODE_SELECT_STREAMING);
+	if (rval) {
+		dev_err(&client->dev, "MODE_SELECT STREAMING failed: %d\n",
+			rval);
+		goto err_pm_put;
+	}
+
+	dev_info(&client->dev, "MODE_SELECT STREAMING ok\n");
+	{
+		struct ccs_pll *pll = &sensor->pll;
+		u32 mode = 0, dt = 0, lanes = 0, sig = 0, phy = 0, phycap = 0;
+		u32 pre = 0, mult = 0, vt_pix = 0, vt_sys = 0;
+		u32 op_pix = 0, op_sys = 0, xout = 0, yout = 0, rate = 0, ext = 0;
+
+		ccs_read(sensor, MODE_SELECT, &mode);
+		ccs_read(sensor, CSI_DATA_FORMAT, &dt);
+		ccs_read(sensor, CSI_LANE_MODE, &lanes);
+		ccs_read(sensor, CSI_SIGNALING_MODE, &sig);
+		ccs_read(sensor, PHY_CTRL, &phy);
+		ccs_read(sensor, PHY_CTRL_CAPABILITY, &phycap);
+		ccs_read(sensor, PRE_PLL_CLK_DIV, &pre);
+		ccs_read(sensor, PLL_MULTIPLIER, &mult);
+		ccs_read(sensor, VT_PIX_CLK_DIV, &vt_pix);
+		ccs_read(sensor, VT_SYS_CLK_DIV, &vt_sys);
+		ccs_read(sensor, OP_PIX_CLK_DIV, &op_pix);
+		ccs_read(sensor, OP_SYS_CLK_DIV, &op_sys);
+		ccs_read(sensor, X_OUTPUT_SIZE, &xout);
+		ccs_read(sensor, Y_OUTPUT_SIZE, &yout);
+		ccs_read(sensor, REQUESTED_LINK_RATE, &rate);
+		ccs_read(sensor, EXTCLK_FREQUENCY_MHZ, &ext);
+		dev_info(&client->dev,
+			 "CCS stream mode=0x%x dt=0x%x lanes=0x%x sig=0x%x phy=0x%x/%x ext=0x%x rate=0x%x %ux%u pll=%u/%u vt=%u/%u op=%u/%u\n",
+			 mode, dt, lanes, sig, phy, phycap, ext, rate,
+			 xout, yout, pre, mult, vt_sys, vt_pix, op_sys,
+			 op_pix);
+		dev_info(&client->dev,
+			 "CCS pll calc link=%u ext=%u bpp=%u lanes=%u flags=0x%x vt_fr=%u/%u op_bk=%u/%u pix=%u csi=%u\n",
+			 pll->link_freq, pll->ext_clk_freq_hz,
+			 pll->bits_per_pixel, pll->csi2.lanes, pll->flags,
+			 pll->vt_fr.pre_pll_clk_div,
+			 pll->vt_fr.pll_multiplier,
+			 pll->op_bk.sys_clk_div, pll->op_bk.pix_clk_div,
+			 pll->pixel_rate_pixel_array, pll->pixel_rate_csi);
+	}
 
 	sensor->streaming |= streams_mask;
 
@@ -2019,6 +2100,8 @@ static int ccs_disable_streams(struct v4l2_subdev *subdev,
 	struct i2c_client *client = v4l2_get_subdevdata(&sensor->src->sd);
 	int rval;
 
+	if (subdev != &sensor->src->sd)
+		return 0;
 	if (pad != CCS_PAD_SRC)
 		return -EINVAL;
 
@@ -3368,13 +3451,18 @@ static int ccs_probe(struct i2c_client *client)
 		goto out_power_off;
 	}
 
-	rval = request_firmware(&fw, filename, &client->dev);
+	/* Optional CCS data; skip the 60 s sysfs fallback when missing. */
+	rval = request_firmware_direct(&fw, filename, &client->dev);
 	if (!rval) {
+		dev_info(&client->dev, "CCS firmware %s loaded\n", filename);
 		rval = ccs_data_parse(&sensor->sdata, fw->data, fw->size,
 				      &client->dev, true);
 		release_firmware(fw);
 		if (rval)
 			goto out_power_off;
+	} else {
+		dev_info(&client->dev, "CCS firmware %s missing (%d)\n",
+			 filename, rval);
 	}
 
 	if (!(ccsdev->flags & CCS_DEVICE_FLAG_IS_SMIA) ||
@@ -3386,13 +3474,18 @@ static int ccs_probe(struct i2c_client *client)
 			goto out_release_sdata;
 		}
 
-		rval = request_firmware(&fw, filename, &client->dev);
+		rval = request_firmware_direct(&fw, filename, &client->dev);
 		if (!rval) {
+			dev_info(&client->dev, "CCS firmware %s loaded\n",
+				 filename);
 			rval = ccs_data_parse(&sensor->mdata, fw->data,
 					      fw->size, &client->dev, true);
 			release_firmware(fw);
 			if (rval)
 				goto out_release_sdata;
+		} else {
+			dev_info(&client->dev, "CCS firmware %s missing (%d)\n",
+				 filename, rval);
 		}
 	}
 

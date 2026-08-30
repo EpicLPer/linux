@@ -8,6 +8,7 @@
  * Copyright (C) 2016-2018 Linaro Ltd.
  */
 
+#include "camss.h"
 #include "camss-csiphy.h"
 
 #include <linux/delay.h>
@@ -16,7 +17,12 @@
 
 #define CAMSS_CSI_PHY_LNn_CFG2(n)		(0x004 + 0x40 * (n))
 #define CAMSS_CSI_PHY_LNn_CFG3(n)		(0x008 + 0x40 * (n))
+#define CAMSS_CSI_PHY_LNn_TEST_IMP(n)		(0x01c + 0x40 * (n))
+#define CAMSS_CSI_PHY_LNn_MISC1(n)		(0x028 + 0x40 * (n))
 #define		CAMSS_CSI_PHY_LN_CLK		1
+#define CAMSS_CSI_PHY_20NM_CLK_LANE		1
+#define CAMSS_CSI_PHY_20NM_NUM_LANES_SHIFT	4
+#define CAMSS_CSI_PHY_20NM_TEST_IMP		0x17
 #define CAMSS_CSI_PHY_GLBL_RESET		0x140
 #define CAMSS_CSI_PHY_GLBL_PWR_CFG		0x144
 #define CAMSS_CSI_PHY_GLBL_IRQ_CMD		0x164
@@ -132,6 +138,61 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
 		writel_relaxed(0x3f, csiphy->base +
 			       CAMSS_CSI_PHY_INTERRUPT_CLEARn(l));
 	}
+
+	/*
+	 * MSM8994 CSIPHY is qcom,csiphy-v3.1.1 (20nm). Stock CAF
+	 * msm_csiphy.c (is_3_1_20nm_hw) writes per-lane MISC1 +
+	 * TEST_IMP after the 2ph CFG2/CFG3/IRQ setup. Offsets are
+	 * from CAF msm_csiphy_3_1_hwreg.h (test_imp 0x1c, misc1
+	 * 0x28). Do not use 3ph_1_0: that map is 0x100 stride.
+	 * Talkman-only settle/PN module params are not applied.
+	 */
+	if (csiphy->camss->res->version == CAMSS_8x94) {
+		u8 mask = lane_mask & 0x1f;
+		u8 lane_cnt = c->num_data;
+		u8 curr_lane = 0;
+		u8 j = 0;
+		u8 hw_ver = readl_relaxed(csiphy->base +
+					  CAMSS_CSI_PHY_HW_VERSION);
+
+		dev_info(csiphy->camss->dev,
+			 "CSIPHY 20nm hw=0x%02x settle=0x%x mask=0x%x timer=%u combo=%u\n",
+			 hw_ver, settle_cnt, lane_mask,
+			 csiphy->timer_clk_rate, cfg->combo_mode);
+
+		while (mask & 0x1f) {
+			if (mask & 0x1) {
+				u8 lane_val = 0;
+
+				if (j > CAMSS_CSI_PHY_20NM_CLK_LANE) {
+					if (lane_cnt < curr_lane) {
+						dev_err(csiphy->camss->dev,
+							"CSIPHY 20nm lane_cnt %u < curr %u\n",
+							lane_cnt, curr_lane);
+					} else {
+						lane_val = 0x8 |
+							((lane_cnt - curr_lane) <<
+							 CAMSS_CSI_PHY_20NM_NUM_LANES_SHIFT);
+					}
+				} else if (j == CAMSS_CSI_PHY_20NM_CLK_LANE) {
+					lane_val = 0x4;
+				}
+				if (cfg->combo_mode && curr_lane == 0 &&
+				    (lane_mask & 0x18) == 0x18)
+					lane_val = 0x4;
+
+				writel_relaxed(lane_val,
+					       csiphy->base +
+					       CAMSS_CSI_PHY_LNn_MISC1(j));
+				writel_relaxed(CAMSS_CSI_PHY_20NM_TEST_IMP,
+					       csiphy->base +
+					       CAMSS_CSI_PHY_LNn_TEST_IMP(j));
+				curr_lane++;
+			}
+			j++;
+			mask >>= 1;
+		}
+	}
 }
 
 static void csiphy_lanes_disable(struct csiphy_device *csiphy,
@@ -149,6 +210,12 @@ static void csiphy_lanes_disable(struct csiphy_device *csiphy,
 
 		writel_relaxed(0x0, csiphy->base +
 			       CAMSS_CSI_PHY_LNn_CFG2(l));
+		if (csiphy->camss->res->version == CAMSS_8x94) {
+			writel_relaxed(0x0, csiphy->base +
+				       CAMSS_CSI_PHY_LNn_MISC1(l));
+			writel_relaxed(0x0, csiphy->base +
+				       CAMSS_CSI_PHY_LNn_TEST_IMP(l));
+		}
 	}
 
 	writel_relaxed(0x0, csiphy->base + CAMSS_CSI_PHY_GLBL_PWR_CFG);

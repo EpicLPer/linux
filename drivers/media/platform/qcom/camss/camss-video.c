@@ -282,8 +282,11 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 		subdev = media_entity_to_v4l2_subdev(entity);
 
 		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
-		if (ret < 0 && ret != -ENOIOCTLCMD)
+		if (ret < 0 && ret != -ENOIOCTLCMD) {
+			dev_err(video->camss->dev, "s_stream(1) %s failed: %d\n",
+				entity->name, ret);
 			goto error;
+		}
 	}
 
 	return 0;

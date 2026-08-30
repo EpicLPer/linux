@@ -248,65 +248,79 @@
 
 
 /*
- * When cci_i2c buses are brought up,
- * 3 camera sensors need to be added as follows:
+ * Octagon cameras (ACPI camera.asl, not the old comment's GPIO 105/106).
+ * Hill CAMS  CCI1 CSI0 GPIO 13/92/91  L25 + L29 + L23 + LVS1
+ * Front CAMF CCI0 CSI2 GPIO 15/104/105 L17 + LVS1 (not in this pack)
+ * Iris CAMT  CCI0 CSI3 GPIO 14/102/106 L17 + L3 + LVS1 (not in this pack)
  *
- * &cci_i2c0 {
- *  // H1400/1 Ducati (FF CAM FPC) (Front) (Sharp)
- *	ffc_sensor: ffc-sensor@20 {
- *		compatible = "nokia,smia";
- *
- *		reg = <0x20>;
- *
- *		reset-gpios = <&tlmm 104 GPIO_ACTIVE_HIGH>;
- *		vana-supply = <&vreg_l17a_2p7>;
- *
- *		clocks = <&CAM_MCLK2 0>;
- *		clock-frequency = <xxxxxx>;
- *		...
- *	};
- *
- *  // H1000/1 Siiri (IRIS CAM FPC) (Iris) (Toshiba) (T4KE1)
- *	iris_sensor: iris-sensor@6c {
- *		compatible = "nokia,smia";
- *
- *		reg = <0x6c>;
- *
- *		reset-gpios = <&tlmm 102 GPIO_ACTIVE_HIGH>;
- *		vana-supply = <&vreg_l17a_2p7>;
- *
- *		clocks = <&CAM_MCLK1 0>;
- *		clock-frequency = <xxxxxx>;
- *		...
- *	};
- *
- * Also on the same bus:
- * Austrianmicrosystems AS3638 triple LED flash controller (No driver available)
- * };
- *
- * &cci_i2c1 {
- *  // N1400/1 Hill (Sub board FPC) (Rear) (Sony) (IMX230)
- *	rfc_sensor: rfc-sensor@20 {
- *		compatible = "nokia,smia";
- *
- *		reg = <0x20>;
- *
- *		reset-gpios = <&tlmm 106 GPIO_ACTIVE_HIGH>; // This is either 105 or 106
- *		vana-supply = <&vreg_l29a_2p8>;
- *
- *		clocks = <&CAM_MCLK0 0>;
- *		clock-frequency = <xxxxxx>;
- *		link-frequencies = ...;
- *
- *		port {
- *			smiapp_ep: endpoint {
- *				data-lanes = <... ...>;
- *				remote-endpoint = <&...>;
- *			};
- *		};
- *	};
- * };
+ * LVS1 is shared 1.8 V VIO — enable and never disable. Do not put it
+ * on vio-supply (CCS power_off would drop it; testCZ/DA hung).
+ * Hill first: two nokia,smia nodes crashed the Android wrapper.
  */
+
+&cci {
+	status = "okay";
+};
+
+&cci_i2c1 {
+	/* Rear PureView 20MP (Hill / IMX230) */
+	/* 3.10 qcom,slave-id 0x20 is 8-bit; CCI then >> 1. Mainline is 7-bit. */
+	rfc_sensor@10 {
+		compatible = "nokia,smia";
+		reg = <0x10>;
+
+		vana-supply = <&vreg_l29a_2p8>;
+		vcore-supply = <&vreg_l25a_1p1>;
+		/* L23 is ACPI extra 2.85 V (cam_vaf), not VIO. */
+		vio-supply = <&vreg_l23a_2p8>;
+
+		clocks = <&mmcc CAMSS_MCLK0_CLK>;
+		/* ACPI / 3.10 smia65pp: 9.6 MHz (XO/2), not 19.2. */
+		clock-frequency = <9600000>;
+
+		/*
+		 * CCS treats reset=0 as deassert. Hill XSHUTDOWN is
+		 * released high (3.10 GPIO_OUT_HIGH after MCLK).
+		 */
+		reset-gpios = <&tlmm 92 GPIO_ACTIVE_LOW>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&camera_rear_default>;
+		pinctrl-1 = <&camera_rear_sleep>;
+
+		port {
+			smiapp_rfc_ep: endpoint {
+				clock-lanes = <1>;
+				data-lanes = <0 2 3 4>;
+				/* Talkman WP10 ETL SensorMode[11].DDRClk */
+				link-frequencies = /bits/ 64 <379200000>;
+				bus-type = <4>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&camss {
+	status = "okay";
+	vdda-supply = <&vreg_l2a_1p25>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* CSIPHY0 -> Hill (csid 0) */
+		port@0 {
+			reg = <0>;
+
+			csiphy0_ep: endpoint {
+				clock-lanes = <1>;
+				data-lanes = <0 2 3 4>;
+				remote-endpoint = <&smiapp_rfc_ep>;
+			};
+		};
+	};
+};
 
 
 &blsp1_i2c1 {
@@ -645,7 +659,7 @@
 };
 
 &pmi8994_spmi_regulators {
-	vdd_gfx: s2 {
+	s2 {
 		regulator-min-microvolt = <980000>;
 		regulator-max-microvolt = <980000>;
 	};
@@ -932,7 +946,13 @@
 			regulator-max-microvolt = <1800000>;
 		};
 
-		vreg_lvs1a_1p8: lvs1 { };
+		/* Shared 1.8 V VIO (cameras + others). Hold on; do not
+		 * put this on a CCS vio-supply (power_off would drop it).
+		 */
+		vreg_lvs1a_1p8: lvs1 {
+			regulator-always-on;
+			regulator-boot-on;
+		};
 
 		vreg_lvs2a_1p8: lvs2 { };
 	};
@@ -941,6 +961,8 @@
 		compatible = "qcom,rpm-pmi8994-regulators";
 
 		vdd_s1-supply = <&vph_pwr>;
+		vdd_s2-supply = <&vph_pwr>;
+		vdd_s3-supply = <&vph_pwr>;
 		vdd_bst_byp-supply = <&vph_pwr>;
 
 		vreg_s1b_1p0: s1 {
@@ -948,7 +970,12 @@
 			regulator-max-microvolt = <1025000>;
 		};
 
-		/* S2 & S3 - VDD_GFX */
+		/* PMI8994 S2+S3 are VDD_GFX. 3.10 gx parent is RPM
+		 * pmi8994_s2_corner; qcom_smd-regulator.c s2 is SMPB 2. */
+		vdd_gfx: s2 {
+			regulator-min-microvolt = <980000>;
+			regulator-max-microvolt = <1230000>;
+		};
 
 		vph_pwr_bbyp: boost-bypass {
 			regulator-min-microvolt = <3300000>;
@@ -1126,6 +1153,49 @@
 		"RFFE2_DATA", /* GPIO_139 */
 		"RFFE3_CLK", /* GPIO_140 */
 		"RFFE3_DATA"; /* GPIO_141 */
+
+	/*
+	 * Hill: MCLK0 GPIO 13, reset 92, standby 91.
+	 * ACPI CAMSENSOR_1_STANBY (no _N): 0 = out of standby.
+	 */
+	camera_rear_default: camera-rear-default-state {
+		mclk-pins {
+			pins = "gpio13";
+			function = "cam_mclk0";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		gpio-pins {
+			pins = "gpio91", "gpio92";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	camera_rear_sleep: camera-rear-sleep-state {
+		mclk-pins {
+			pins = "gpio13";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		gpio-pins {
+			pins = "gpio91", "gpio92";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+	};
+
+	hill_standby_hog {
+		gpio-hog;
+		gpios = <91 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "cam-standby-hill";
+	};
 
 	touch_pins: touch {
 		irq {

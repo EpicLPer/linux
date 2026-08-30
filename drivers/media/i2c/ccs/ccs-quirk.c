@@ -215,3 +215,68 @@ static int tcm8500md_limits(struct ccs_sensor *sensor)
 const struct ccs_quirk smiapp_tcm8500md_quirk = {
 	.limits = tcm8500md_limits,
 };
+
+/*
+ * Hill / Carrera (SMIA 0x0a-eaca). Register lists from WP
+ * 0AEACA05.dcc (WOA Lumia-Drivers HARDWARE.CAMERA.MMO_8994
+ * Calibration; same bytes as the laptop copy). Do not write
+ * the idle analog block (Talkman #68 silenced CSID at ident
+ * PLL). Do not write SensorMode PLL/window — those tables are
+ * RAW8/10/14 at 5344x3008 / 2496x1872, not CCS 5344x4016 RAW12.
+ */
+static int eaca_write8(struct ccs_sensor *sensor, u16 addr, u8 val)
+{
+	return ccs_write_addr(sensor, CCI_REG8(addr), val);
+}
+
+static int eaca_pre_streamon(struct ccs_sensor *sensor)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&sensor->src->sd);
+	int i, rval;
+	/*
+	 * DCC override id 5 at 2327. Skip 0x0011=0x08: that address is
+	 * SMIA++ SMIAPP_VERSION (smiapp-reg-defs.h). CCS has no write
+	 * width for it; testDS #182 failed with "invalid reg-width 0".
+	 */
+	static const u16 override[][2] = {
+		{ 0x1b04, 0x06 },
+		{ 0x1b40, 0x00 },
+		{ 0x1b41, 0x81 },
+		{ 0x1b42, 0x7c },
+		{ 0x1b44, 0x05 },
+		{ 0x1b45, 0xf0 },
+	};
+	/* Mode-table Sony vendor prefix, DCC offset 2674 (all 17 modes) */
+	static const u16 vendor[][2] = {
+		{ 0x3006, 0x01 },
+		{ 0x31e0, 0x03 },
+		{ 0x6914, 0x01 },
+		{ 0x3123, 0x01 },
+		{ 0x3013, 0x00 },
+	};
+
+	rval = ccs_write(sensor, GROUPED_PARAMETER_HOLD, 1);
+	if (rval)
+		return rval;
+	for (i = 0; i < ARRAY_SIZE(override); i++) {
+		rval = eaca_write8(sensor, override[i][0], override[i][1]);
+		if (rval)
+			return rval;
+	}
+	for (i = 0; i < ARRAY_SIZE(vendor); i++) {
+		rval = eaca_write8(sensor, vendor[i][0], vendor[i][1]);
+		if (rval)
+			return rval;
+	}
+	rval = ccs_write(sensor, GROUPED_PARAMETER_HOLD, 0);
+	if (rval)
+		return rval;
+
+	dev_info(&client->dev,
+		 "Hill CDCC vendor+override from 0AEACA05.dcc (skip 0x0011)\n");
+	return 0;
+}
+
+const struct ccs_quirk smiapp_eaca_quirk = {
+	.pre_streamon = eaca_pre_streamon,
+};
