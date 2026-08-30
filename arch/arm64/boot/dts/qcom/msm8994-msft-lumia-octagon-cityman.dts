@@ -10,11 +10,54 @@
 #include "msm8994-msft-lumia-octagon.dtsi"
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/soc/qcom,apr.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 
 / {
 	model = "Microsoft Lumia 950 XL";
 	compatible = "microsoft,cityman", "qcom,msm8994";
 	chassis-type = "handset";
+
+	/*
+	 * q6asm MM1 → q6routing → QUAT MI2S → TAS2553.
+	 * Pinmux is GPIO 58/59/62 only (SD2).
+	 */
+	sound {
+		compatible = "qcom,apq8096-sndcard";
+		model = "cityman-speaker";
+
+		/* lpaif_quat_mode_muxsel: machine selects I2S vs PCM. */
+		reg = <0x0 0xfe037000 0x0 0x4>;
+		reg-names = "lpaif_quat_mode_muxsel";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&quat_mi2s_default>;
+
+		mm1-dai-link {
+			link-name = "MultiMedia1";
+
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+			};
+		};
+
+		speaker-dai-link {
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&q6afedai QUATERNARY_MI2S_RX>;
+			};
+
+			platform {
+				sound-dai = <&q6routing>;
+			};
+
+			codec {
+				sound-dai = <&tas2553>;
+			};
+		};
+	};
 };
 
 /*
@@ -24,6 +67,21 @@
  */
 &{/reserved-memory/ramoops@d9d00000} {
 	no-map;
+};
+
+/*
+ * 3.10 audio_region@0 is 0x614000. Mainline CMA rejects that
+ * size ("incorrect alignment"); 8 MiB / 4 MiB align is the
+ * next legal pool that still covers the ION heap. Not
+ * audio_mem@c7000000.
+ */
+&{/reserved-memory} {
+	cityman_audio_mem: audio-pool {
+		compatible = "shared-dma-pool";
+		size = <0x0 0x800000>;
+		alignment = <0x0 0x400000>;
+		reusable;
+	};
 };
 
 /*
@@ -277,4 +335,175 @@
 	vddio-supply = <&vreg_l12a_1p8>;
 	vcca-supply = <&vreg_l28a_1p0>;
 	qcom,dsi-phy-regulator-ldo-mode;
+};
+
+/*
+ * LPASS Q6 / ADSP. Same node as Android4Lumia950/linux 0299fe45
+ * msm8994.dtsi remoteproc@fe200000 (Talkman ADSP loaded there).
+ * Not in msm8994.dtsi here: boards such as libra delete &adsp_mem
+ * and dtc still resolves phandles on disabled nodes.
+ *
+ * 0299fe45 Talkman remaps adsp_mem to 0xce00000 — do not copy that.
+ * Cityman keeps octagon adsp_mem@ca00000 (24 MiB). qcadsp8994.mbn
+ * is relocatable; loadable span is exactly 0x1800000.
+ *
+ * firmware-name was Talkman-only on that tree. Cityman blob is
+ * firmware/cityman-adsp/qcadsp8994.mbn. Do not use 8992 on the XL.
+ * Do not enable &mss_pil.
+ */
+&soc {
+	adsp_pil: remoteproc@fe200000 {
+		compatible = "qcom,msm8994-adsp-pil";
+		reg = <0xfe200000 0x80000>;
+
+		interrupts-extended = <&intc GIC_SPI 162 IRQ_TYPE_EDGE_RISING>,
+				      <&adsp_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
+				      <&adsp_smp2p_in 1 IRQ_TYPE_EDGE_RISING>,
+				      <&adsp_smp2p_in 2 IRQ_TYPE_EDGE_RISING>,
+				      <&adsp_smp2p_in 3 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "wdog", "fatal", "ready",
+				  "handover", "stop-ack";
+
+		clocks = <&xo_board>;
+		clock-names = "xo";
+
+		memory-region = <&adsp_mem>;
+
+		qcom,smem-states = <&adsp_smp2p_out 0>;
+		qcom,smem-state-names = "stop";
+
+		firmware-name = "qcom/msft/cityman/qcadsp8994.mbn";
+
+		smd-edge {
+			interrupts = <GIC_SPI 156 IRQ_TYPE_EDGE_RISING>;
+
+			label = "lpass";
+			/*
+			 * 3.10 qcom,smd-adsp irq-bitmask 0x100 = bit 8.
+			 * 8994 APCS mailbox writes BIT(n) at offset 8
+			 * (qcom-apcs-ipc-mailbox msm8994_apcs_data).
+			 * RPM already uses mboxes = <&apcs 0>.
+			 * 6.13 0299fe45 qcom,ipc = <&apcs 8 10> rings
+			 * bit 10 — testED: every LPASS SMD OPEN timed
+			 * out (-12). Do not copy that.
+			 */
+			mboxes = <&apcs 8>;
+			qcom,smd-edge = <1>;
+			/*
+			 * 8996 lpass smd-edge and octagon smp2p-lpass
+			 * use pid 2. Without this, qcom_smd defaults to
+			 * QCOM_SMEM_HOST_ANY and looks up FIFO items in
+			 * the global TOC (item 338+cid). testEA: those
+			 * entries overflow the 2 MiB smem@6a00000 map
+			 * (smem.c:577) and no apr_audio_svc appears.
+			 */
+			qcom,remote-pid = <2>;
+
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/*
+			 * testEB: apr_audio_svc is on the SMD edge.
+			 * 8996 msm8996.dtsi APR + msm8916.dtsi
+			 * q6asm-dais (no iommus: 8994 has no LPASS
+			 * SMMU; driver sid = -1). No 8994
+			 * HLOS1_VOTE_LPASS_* GDSC — do not copy that.
+			 * sd-line 2 only (3.10 Cityman common: SD2;
+			 * 60/61 touch, 63 XPU reset).
+			 */
+			apr {
+				compatible = "qcom,apr-v2";
+				qcom,smd-channels = "apr_audio_svc";
+				qcom,domain = <APR_DOMAIN_ADSP>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				service@3 {
+					compatible = "qcom,q6core";
+					reg = <APR_SVC_ADSP_CORE>;
+				};
+
+				q6afe: service@4 {
+					compatible = "qcom,q6afe";
+					reg = <APR_SVC_AFE>;
+
+					clock-controller {
+						compatible = "qcom,q6afe-clocks";
+						#clock-cells = <2>;
+					};
+
+					q6afedai: dais {
+						compatible = "qcom,q6afe-dais";
+						#address-cells = <1>;
+						#size-cells = <0>;
+						#sound-dai-cells = <1>;
+
+						dai@22 {
+							reg = <QUATERNARY_MI2S_RX>;
+							qcom,sd-lines = <2>;
+						};
+					};
+				};
+
+				q6asm: service@7 {
+					compatible = "qcom,q6asm";
+					reg = <APR_SVC_ASM>;
+
+					q6asmdai: dais {
+						compatible = "qcom,q6asm-dais";
+						#address-cells = <1>;
+						#size-cells = <0>;
+						#sound-dai-cells = <1>;
+						memory-region = <&cityman_audio_mem>;
+						/* 3.10 audio_heap qcom,proc-id */
+						qcom,proc-id = <1>;
+
+						dai@0 {
+							reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+							direction = <Q6ASM_DAI_RX>;
+						};
+					};
+				};
+
+				q6adm: service@8 {
+					compatible = "qcom,q6adm";
+					reg = <APR_SVC_ADM>;
+
+					q6routing: routing {
+						compatible = "qcom,q6adm-routing";
+						#sound-dai-cells = <0>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&tas2553 {
+	#sound-dai-cells = <0>;
+};
+
+&tlmm {
+	quat_mi2s_default: quat-mi2s-default-state {
+		pins = "gpio58", "gpio59", "gpio62";
+		function = "qua_mi2s";
+		drive-strength = <8>;
+		bias-disable;
+	};
+};
+
+/*
+ * Volume Down is PM8994 PON resin. Stock pm8994.dtsi leaves
+ * that node disabled; octagon sets KEY_VOLUMEDOWN but not
+ * status. Volume Up is PMGPIO 3 (VOL_UP_N, high at rest).
+ * Camera Focus was also KEY_VOLUMEUP on PMGPIO 5 (low at
+ * rest), so vol-up looked stuck held. Cityman only — do
+ * not copy onto Talkman.
+ */
+&pm8994_resin {
+	status = "okay";
+};
+
+&{/gpio-keys/camfocus-key} {
+	linux,code = <KEY_CAMERA_FOCUS>;
 };
