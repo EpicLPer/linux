@@ -2,6 +2,8 @@
 /*
  * Copyright (c) 2020, Konrad Dybcio <konrad.dybcio@somainline.org>
  * Copyright (c) 2020, Gustave Monce <gustave.monce@outlook.com>
+ *
+ * Audio status: Documentation/sound/soc/qcom-lumia-octagon.rst
  */
 
 /dts-v1/;
@@ -34,6 +36,11 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&quat_mi2s_default>;
 
+		/* 3.10 audio.dtsi RX_BIAS/MCLK; jack widget is qcom common */
+		audio-routing =
+			"RX_BIAS", "MCLK",
+			"Headphone Jack", "HEADPHONE";
+
 		mm1-dai-link {
 			link-name = "MultiMedia1";
 
@@ -55,6 +62,27 @@
 
 			codec {
 				sound-dai = <&tas2553>;
+			};
+		};
+
+		/*
+		 * 3.10 LPASS_BE_SLIMBUS_0_RX → tomtom_rx1. The
+		 * machine driver sets slim chmap + 9.6 MHz on
+		 * non-QUAT BE links. Jack is not on QUAT MI2S.
+		 */
+		headset-dai-link {
+			link-name = "Slimbus Playback";
+
+			cpu {
+				sound-dai = <&q6afedai SLIMBUS_0_RX>;
+			};
+
+			platform {
+				sound-dai = <&q6routing>;
+			};
+
+			codec {
+				sound-dai = <&tomtom 0>;
 			};
 		};
 	};
@@ -442,6 +470,11 @@
 							reg = <QUATERNARY_MI2S_RX>;
 							qcom,sd-lines = <2>;
 						};
+
+						/* 3.10 jack backend: SLIMBUS_0_RX → WCD9330 */
+						dai@2 {
+							reg = <SLIMBUS_0_RX>;
+						};
 					};
 				};
 
@@ -479,6 +512,83 @@
 	};
 };
 
+/*
+ * 3.10 msm8994.dtsi slim@fe12f000: core 0xfe12f000/0x2c000 IRQ 163,
+ * BAM 0xfe104000/0x20000 IRQ 164. Mainline NGD compatible is
+ * qcom,slim-ngd-v1.5.0 (same SPI and core size as MSM8996).
+ * ADSP owns the BAM (controlled-remotely, 31 channels, 2 EEs).
+ * MSGQ pipes 3/4 match in-tree slim-ngd. WCD9330 EA is
+ * slim217,130 — not WCD9335 (slim217,1a0).
+ */
+&soc {
+	slimbam: dma-controller@fe104000 {
+		compatible = "qcom,bam-v1.7.0";
+		reg = <0xfe104000 0x20000>;
+		interrupts = <GIC_SPI 164 IRQ_TYPE_LEVEL_HIGH>;
+		#dma-cells = <1>;
+		qcom,ee = <1>;
+		qcom,num-ees = <2>;
+		num-channels = <31>;
+		qcom,controlled-remotely;
+	};
+
+	slim_msm: slim-ngd@fe12f000 {
+		compatible = "qcom,slim-ngd-v1.5.0";
+		reg = <0xfe12f000 0x2c000>;
+		interrupts = <GIC_SPI 163 IRQ_TYPE_LEVEL_HIGH>;
+		dmas = <&slimbam 3>, <&slimbam 4>;
+		dma-names = "rx", "tx";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/*
+		 * Mapping NGD at probe reboots this SoC. The
+		 * driver attaches after ADSP is up (sysfs ngd_hw,
+		 * then ngd_up). See qcom-lumia-octagon.rst.
+		 */
+		status = "okay";
+
+		slim@1 {
+			reg = <1>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			/* 3.10 IFD [00 00 30 01 17 02], PGD [00 01 30 01 17 02] */
+			tomtom_ifd: codec@0,0 {
+				compatible = "slim217,130";
+				reg = <0 0>;
+			};
+
+			tomtom: codec@1,0 {
+				compatible = "slim217,130";
+				reg = <1 0>;
+				#sound-dai-cells = <1>;
+				reset-gpios = <&tlmm 68 GPIO_ACTIVE_LOW>;
+				slim-ifc-dev = <&tomtom_ifd>;
+				/*
+				 * 3.10 osr_clk is clock_rpm clk_div_clk1
+				 * plus PMGPIO 15. Octagon already has
+				 * that as divclk1 (gpio-gate + audio_mclk).
+				 */
+				clocks = <&divclk1>;
+				clock-names = "mclk";
+				/* 3.10 msm8994.dtsi cdc-static-supplies */
+				vdd-buck-supply = <&vreg_s5a_2p15>;
+				vdd-tx-h-supply = <&vreg_s4a_1p8>;
+				vdd-rx-h-supply = <&vreg_s4a_1p8>;
+				vdd-px-supply = <&vreg_s4a_1p8>;
+				vdd-a-1p2v-supply = <&vreg_l11a_1p2>;
+				vdd-cx1-supply = <&vreg_l11a_1p2>;
+				vdd-cx2-supply = <&vreg_l11a_1p2>;
+				/* 3.10 wcd9xxx-irq cdc-int: TLMM 72, HIGH */
+				interrupts-extended = <&tlmm 72 IRQ_TYPE_LEVEL_HIGH>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&wcd_intr_default>;
+				qcom,mbhc-insert-detect-inverted;
+			};
+		};
+	};
+};
+
 &tas2553 {
 	#sound-dai-cells = <0>;
 };
@@ -489,6 +599,15 @@
 		function = "qua_mi2s";
 		drive-strength = <8>;
 		bias-disable;
+	};
+
+	/* 3.10 msm8994-pinctrl.dtsi wcd_intr_default */
+	wcd_intr_default: wcd-intr-default-state {
+		pins = "gpio72";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
 	};
 };
 
