@@ -8,12 +8,12 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <sound/soc.h>
-#include <sound/soc-dapm.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
-#include <sound/control.h>
+#include <sound/jack.h>
 #include "common.h"
 #include "qdsp6/q6afe.h"
+#include "../codecs/wcd9330.h"
 
 #define SLIM_MAX_TX_PORTS 16
 #define SLIM_MAX_RX_PORTS 16
@@ -21,11 +21,18 @@
 #define MI2S_BCLK_RATE			1536000
 #define I2S_PCM_SEL_I2S		0
 #define I2S_PCM_SEL_OFFSET	1
-/* TAS2552 PGA: −7 dB + 1 dB/step. 22 = +15 dB. */
-#define TAS2552_PGA_P15DB	22
 
 struct apq8096_data {
 	void __iomem *quat_mux;
+	struct snd_soc_jack jack;
+	bool jack_setup;
+};
+
+static struct snd_soc_jack_pin apq8096_jack_pins[] = {
+	{
+		.pin = "Headphone Jack",
+		.mask = SND_JACK_HEADPHONE,
+	},
 };
 
 static int apq8096_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
@@ -77,20 +84,12 @@ end:
 	return ret;
 }
 
-static void apq8096_kctl_set(struct snd_soc_card *card, const char *name,
-			     long val)
-{
-	struct snd_kcontrol *kctl;
-	struct snd_ctl_elem_value ucontrol = {};
-
-	kctl = snd_soc_card_get_kcontrol(card, name);
-	if (!kctl)
-		return;
-
-	ucontrol.value.integer.value[0] = val;
-	kctl->put(kctl, &ucontrol);
-}
-
+/*
+ * BE startup may only program clocks and DAI format. q6routing mixers
+ * and codec DAPM muxes are userspace (ALSA UCM); kcontrol put from
+ * here runs under the DPCM mutex and deadlocks in
+ * snd_soc_dpcm_runtime_update (sm8250/sdm845/upstream apq8096).
+ */
 static int apq8096_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
@@ -124,11 +123,6 @@ static int apq8096_startup(struct snd_pcm_substream *substream)
 				       MI2S_BCLK_RATE, SND_SOC_CLOCK_IN);
 	}
 
-	apq8096_kctl_set(rtd->card,
-			 "QUAT_MI2S_RX Audio Mixer MultiMedia1", 1);
-	apq8096_kctl_set(rtd->card, "Speaker Driver Playback Volume",
-			 TAS2552_PGA_P15DB);
-
 	return 0;
 }
 
@@ -150,6 +144,9 @@ static const struct snd_soc_ops apq8096_ops = {
 static int apq8096_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_card *card = rtd->card;
+	struct apq8096_data *priv = snd_soc_card_get_drvdata(card);
 
 	/*
 	 * Codec SLIMBUS configuration
@@ -169,6 +166,45 @@ static int apq8096_init(struct snd_soc_pcm_runtime *rtd)
 	snd_soc_dai_set_sysclk(codec_dai, 0, WCD9335_DEFAULT_MCLK_RATE,
 				SNDRV_PCM_STREAM_PLAYBACK);
 
+	/*
+	 * sdm845 slim BE: machine jack + codec set_jack. qcom_snd_wcd_jack_setup
+	 * only attaches LPI_MI2S / TX_CODEC_DMA, not SLIMBUS_0_RX.
+	 */
+	if (cpu_dai->id == SLIMBUS_0_RX) {
+		int rval;
+
+		if (!priv->jack_setup) {
+			rval = snd_soc_card_jack_new_pins(card, "Headphone Jack",
+							  SND_JACK_HEADPHONE,
+							  &priv->jack,
+							  apq8096_jack_pins,
+							  ARRAY_SIZE(apq8096_jack_pins));
+			if (rval < 0)
+				return rval;
+			priv->jack_setup = true;
+		}
+
+		rval = snd_soc_component_set_jack(codec_dai->component,
+						  &priv->jack, NULL);
+		if (rval != 0 && rval != -ENOTSUPP) {
+			dev_err(card->dev, "Failed to set jack: %d\n", rval);
+			return rval;
+		}
+
+		/*
+		 * 3.10 msm8994.c msm_audrx_init → msm_afe_set_config.
+		 * ADSP needs the tomtom CDC register map and PGD EA
+		 * before SLIMBUS_0_RX start (IFD port enable lives there).
+		 */
+		rval = wcd9330_afe_set_config(codec_dai->component,
+					      cpu_dai->dev);
+		if (rval) {
+			dev_err(card->dev, "Failed to set AFE config %d\n",
+				rval);
+			return rval;
+		}
+	}
+
 	return 0;
 }
 
@@ -176,6 +212,9 @@ static void apq8096_add_be_ops(struct snd_soc_card *card)
 {
 	struct snd_soc_dai_link *link;
 	int i;
+
+	/* Same marker as apq8016 — UCM matches qdsp6 cards this way. */
+	card->components = "qdsp6";
 
 	for_each_card_prelinks(card, i, link) {
 		if (link->no_pcm == 1) {
