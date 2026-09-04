@@ -205,6 +205,16 @@ static void mdp5_encoder_enable(struct drm_encoder *encoder)
 	/* this isn't right I think */
 	struct drm_crtc_state *cstate = encoder->crtc->state;
 
+	/*
+	 * 3.10 idle_pc_restore: mdss_hw_init then ctl_restore.
+	 * CRTC already pm_runtime_get'd (clocks/GDSC up). Do not
+	 * reset from mdp5_runtime_resume. 3.10 mdss_hw_init does
+	 * not zero INTF_SEL; ctl_restore ORs it. Wiping INTF_SEL
+	 * on cmd dual-LM (no PPB) after the PHY is up scrambles
+	 * the right half.
+	 */
+	if (!mdp5_hw_dual_lm_no_ppb(mdp5_cfg_get_hw_config(get_kms(encoder)->cfg)))
+		mdp5_hw_reset_after_pc(get_kms(encoder));
 	mdp5_encoder_mode_set(encoder, &cstate->mode, &cstate->adjusted_mode);
 
 	if (intf->mode == MDP5_INTF_DSI_MODE_COMMAND)

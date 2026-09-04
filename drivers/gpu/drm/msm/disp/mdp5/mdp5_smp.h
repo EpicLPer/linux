@@ -82,7 +82,9 @@ int mdp5_smp_assign(struct mdp5_smp *smp, struct mdp5_smp_state *state,
 void mdp5_smp_release(struct mdp5_smp *smp, struct mdp5_smp_state *state,
 		enum mdp5_pipe pipe);
 
-void mdp5_smp_prepare_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state);
+void mdp5_smp_prepare_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state,
+			     unsigned long staged_pipes);
 void mdp5_smp_complete_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state);
+void mdp5_smp_reset_cache(struct mdp5_smp *smp);
 
 #endif /* __MDP5_SMP_H__ */

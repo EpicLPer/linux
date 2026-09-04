@@ -1105,6 +1105,14 @@ const struct msm_dsi_phy_cfg dsi_phy_20nm_cfgs = {
 	.max_pll_rate = VCO_MAX_RATE,
 	.io_start = { 0xfd998500, 0xfd9a0500 },
 	.num_dsi_phy = 2,
+	/*
+	 * 3.10 lock is FB_BLANK_POWERDOWN → PHY disable, not
+	 * LP2/idle-PC. keep_phy_on_blank made Phosh DPMS look
+	 * like ULP (doze): last GRAM frame, no 0x28/0x10.
+	 * Idle PC is a later self-refresh path while the CRTC
+	 * stays effectively active.
+	 */
+	.keep_phy_on_blank = false,
 };
 
 const struct msm_dsi_phy_cfg dsi_phy_20nm_8992_cfgs = {

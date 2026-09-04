@@ -37,6 +37,12 @@ struct msm_dsi_phy_cfg {
 	const int quirks;
 	bool has_phy_regulator;
 	bool has_phy_lane;
+	/*
+	 * Command-mode CRTC/connector off must not call phy_disable.
+	 * This msm DSI PHY has no ULPS; 3.10 mdss_dsi_off(LP2) left
+	 * the 20nm PHY up ("dsi_off with panel always on").
+	 */
+	bool keep_phy_on_blank;
 };
 
 extern const struct msm_dsi_phy_cfg dsi_phy_28nm_hpm_cfgs;
@@ -125,6 +131,7 @@ struct msm_dsi_phy {
 	u8 dphy_panel_timings[12];
 	bool has_dphy_panel_timings;
 	bool state_saved;
+	bool idle_pc_put;
 };
 
 /*

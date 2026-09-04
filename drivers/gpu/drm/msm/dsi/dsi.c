@@ -5,11 +5,22 @@
 
 #include "dsi.h"
 
+#include <linux/of.h>
+#include <linux/pm_runtime.h>
+
 bool msm_dsi_is_cmd_mode(struct msm_dsi *msm_dsi)
 {
 	unsigned long host_flags = msm_dsi_host_get_mode_flags(msm_dsi->host);
 
 	return !(host_flags & MIPI_DSI_MODE_VIDEO);
+}
+
+bool msm_dsi_keep_phy_on_blank(struct msm_dsi *msm_dsi)
+{
+	if (!msm_dsi || !msm_dsi_is_cmd_mode(msm_dsi))
+		return false;
+
+	return msm_dsi_phy_keep_on_blank(msm_dsi->phy);
 }
 
 struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi)
@@ -200,10 +211,34 @@ static const struct of_device_id dt_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dt_match);
 
+static int msm_dsi_system_suspend(struct device *dev)
+{
+	struct msm_dsi *msm_dsi = dev_get_drvdata(dev);
+
+	/*
+	 * LP2 idle PC already dropped the host_power_on runtime
+	 * get in lp2_enter. force_suspend would be a second put;
+	 * lp2_exit does the matching get. Skip while PHY is up.
+	 */
+	if (msm_dsi_keep_phy_on_blank(msm_dsi) && msm_dsi->phy_enabled)
+		return 0;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int msm_dsi_system_resume(struct device *dev)
+{
+	struct msm_dsi *msm_dsi = dev_get_drvdata(dev);
+
+	if (msm_dsi_keep_phy_on_blank(msm_dsi) && msm_dsi->phy_enabled)
+		return 0;
+
+	return pm_runtime_force_resume(dev);
+}
+
 static const struct dev_pm_ops dsi_pm_ops = {
 	SET_RUNTIME_PM_OPS(msm_dsi_runtime_suspend, msm_dsi_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(msm_dsi_system_suspend, msm_dsi_system_resume)
 };
 
 static struct platform_driver dsi_driver = {

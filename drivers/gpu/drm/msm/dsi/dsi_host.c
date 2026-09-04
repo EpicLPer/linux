@@ -6,14 +6,17 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/iopoll.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
+#include <linux/io.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/of_irq.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/pm_opp.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spinlock.h>
@@ -187,6 +190,16 @@ struct msm_dsi_host {
 	bool power_on;
 	bool enabled;
 	int irq;
+
+	/*
+	 * 3.10 mmss_misc ULP clamp (idle PC). Optional; only mapped
+	 * when the host DT has an "mmss_misc" register.
+	 */
+	void __iomem *mmss_misc;
+	u32 ulps_clamp_off;
+	u32 ulps_phyrst_off;
+	bool mmss_clamp;
+	bool lp2_runtime_put;
 };
 
 static inline u32 dsi_read(struct msm_dsi_host *msm_host, u32 reg)
@@ -790,9 +803,233 @@ dsi_get_cmd_fmt(const enum mipi_dsi_pixel_format mipi_fmt)
 	}
 }
 
+static void dsi_sw_reset(struct msm_dsi_host *msm_host);
+
+/*
+ * 3.10 mdss_dsi_controller_cfg(0): poll DMA busy and HS FIFO
+ * empty, sw_reset if the video engine is still busy, then
+ * clear DSI_EN. Do not poll CMD_MODE_MDP_BUSY here; that
+ * wait is mdss_dsi_cmd_mdp_busy before DMA.
+ */
+#define DSI_FIFO_HS_EMPTY					\
+	(DSI_FIFO_STATUS_DLN0_LP_FIFO_EMPTY |			\
+	 DSI_FIFO_STATUS_DLN0_HS_FIFO_EMPTY |			\
+	 DSI_FIFO_STATUS_DLN1_HS_FIFO_EMPTY |			\
+	 DSI_FIFO_STATUS_DLN2_HS_FIFO_EMPTY |			\
+	 DSI_FIFO_STATUS_DLN3_HS_FIFO_EMPTY)
+
 static void dsi_ctrl_disable(struct msm_dsi_host *msm_host)
 {
-	dsi_write(msm_host, REG_DSI_CTRL, 0);
+	u32 status;
+	u32 dsi_ctrl;
+	void __iomem *base = msm_host->ctrl_base;
+
+	if (readl_poll_timeout(base + REG_DSI_STATUS0, status,
+			       !(status & DSI_STATUS0_CMD_MODE_DMA_BUSY),
+			       1000, 16000))
+		pr_info("talkman-mdss: dsi%d dma busy status=%x\n",
+			msm_host->id, status);
+
+	if (readl_poll_timeout(base + REG_DSI_FIFO_STATUS, status,
+			       (status & DSI_FIFO_HS_EMPTY) == DSI_FIFO_HS_EMPTY,
+			       1000, 16000))
+		pr_info("talkman-mdss: dsi%d fifo status=%x\n",
+			msm_host->id, status);
+
+	if (readl_poll_timeout(base + REG_DSI_STATUS0, status,
+			       !(status & DSI_STATUS0_VIDEO_MODE_ENGINE_BUSY),
+			       1000, 16000)) {
+		pr_info("talkman-mdss: dsi%d sw_reset video busy status=%x\n",
+			msm_host->id, status);
+		dsi_sw_reset(msm_host);
+	}
+
+	dsi_ctrl = dsi_read(msm_host, REG_DSI_CTRL);
+	dsi_write(msm_host, REG_DSI_CTRL, dsi_ctrl & ~DSI_CTRL_ENABLE);
+	wmb();
+}
+
+/*
+ * 3.10 mdss_dsi_clamp_ctrl: command-mode idle PC keeps the 20nm PHY
+ * up while MDSS GDSC collapses. Link clocks must already be off.
+ * Sergej has no qcom,ulps-enabled; clamp the clock lane and active
+ * data lanes without the ULPS companion bits.
+ */
+static u32 dsi_mmss_clamp_mask(const struct msm_dsi_host *msm_host)
+{
+	u32 clamp_reg = BIT(9);
+	int i;
+
+	for (i = 0; i < msm_host->num_data_lanes && i < 4; i++)
+		clamp_reg |= BIT(7 - 2 * i);
+
+	return clamp_reg;
+}
+
+static int dsi_mmss_clamp_ctrl(struct msm_dsi_host *msm_host, bool enable)
+{
+	u32 clamp_reg, regval;
+	u32 off = msm_host->ulps_clamp_off;
+
+	if (!msm_host->mmss_misc)
+		return enable ? -ENODEV : 0;
+
+	clamp_reg = dsi_mmss_clamp_mask(msm_host);
+
+	if (enable && !msm_host->mmss_clamp) {
+		regval = readl(msm_host->mmss_misc + off);
+		if (msm_host->id == DSI_0) {
+			writel_relaxed(regval | clamp_reg,
+				       msm_host->mmss_misc + off);
+			writel_relaxed(regval | clamp_reg | BIT(15),
+				       msm_host->mmss_misc + off);
+		} else {
+			writel_relaxed(regval | (clamp_reg << 16),
+				       msm_host->mmss_misc + off);
+			writel_relaxed(regval | (clamp_reg << 16) | BIT(31),
+				       msm_host->mmss_misc + off);
+		}
+		writel_relaxed(0x1, msm_host->mmss_misc +
+			       msm_host->ulps_phyrst_off);
+		wmb();
+		msm_host->mmss_clamp = true;
+	} else if (!enable && msm_host->mmss_clamp) {
+		writel_relaxed(0x0, msm_host->mmss_misc +
+			       msm_host->ulps_phyrst_off);
+		regval = readl(msm_host->mmss_misc + off);
+		if (msm_host->id == DSI_0)
+			writel_relaxed(regval & ~(clamp_reg | BIT(15)),
+				       msm_host->mmss_misc + off);
+		else
+			writel_relaxed(regval & ~((clamp_reg << 16) | BIT(31)),
+				       msm_host->mmss_misc + off);
+		wmb();
+		msm_host->mmss_clamp = false;
+	}
+
+	return 0;
+}
+
+static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi);
+static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
+			struct msm_dsi_phy_shared_timings *phy_shared_timings,
+			struct msm_dsi_phy *phy);
+
+int msm_dsi_host_lp2_enter(struct mipi_dsi_host *host, struct msm_dsi_phy *phy)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	struct device *dev = &msm_host->pdev->dev;
+	u32 clamp_val = 0, phyrst_val = 0;
+	int ret;
+
+	if (msm_host->mmss_clamp)
+		return 0;
+
+	cfg_hnd->ops->link_clk_disable(msm_host);
+
+	ret = dsi_mmss_clamp_ctrl(msm_host, true);
+	if (ret) {
+		cfg_hnd->ops->link_clk_enable(msm_host);
+		return ret;
+	}
+
+	if (msm_host->mmss_misc) {
+		clamp_val = readl(msm_host->mmss_misc +
+				  msm_host->ulps_clamp_off);
+		phyrst_val = readl(msm_host->mmss_misc +
+				   msm_host->ulps_phyrst_off);
+	}
+	dev_info(dev, "LP2 clamp enter dsi%d clamp=0x%08x phyrst=0x%08x\n",
+		 msm_host->id, clamp_val, phyrst_val);
+
+	/*
+	 * 3.10 mdss_dsi_core_power_ctrl(0): bus clocks off after a
+	 * successful clamp, then GDSC off. PHY runtime stays held
+	 * from phy_enable; put it without phy_disable so analog
+	 * regulators stay up while MDSS GDSC can fall.
+	 */
+	if (!msm_host->lp2_runtime_put) {
+		pm_runtime_put_sync(dev);
+		msm_host->lp2_runtime_put = true;
+	}
+	if (phy)
+		msm_dsi_phy_idle_pc_put(phy);
+
+	return 0;
+}
+
+int msm_dsi_host_lp2_exit(struct mipi_dsi_host *host, struct msm_dsi_phy *phy,
+			  bool is_bonded_dsi)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	struct device *dev = &msm_host->pdev->dev;
+	struct msm_dsi_phy_clk_request clk_req;
+	struct msm_dsi_phy_shared_timings shared_timings = { };
+	int ret;
+
+	if (!msm_host->mmss_clamp && !msm_host->lp2_runtime_put)
+		return 0;
+
+	if (msm_host->lp2_runtime_put) {
+		ret = pm_runtime_get_sync(dev);
+		if (ret < 0) {
+			pm_runtime_put_noidle(dev);
+			return ret;
+		}
+		msm_host->lp2_runtime_put = false;
+	}
+
+	if (phy) {
+		ret = msm_dsi_phy_idle_pc_get(phy);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * 3.10 core_power_ctrl(1) with mmss_clamp: phy_init +
+	 * ctrl_setup while still clamped, then unclamp. No
+	 * phy_sw_reset (that is the full POWER_OFF on path).
+	 */
+	if (phy && msm_host->mmss_clamp) {
+		msm_dsi_host_get_phy_clk_req(host, &clk_req, is_bonded_dsi);
+		ret = msm_dsi_phy_restore_clamped(phy, &clk_req,
+						  &shared_timings);
+		if (ret)
+			return ret;
+		dsi_timing_setup(msm_host, is_bonded_dsi);
+		dsi_ctrl_enable(msm_host, &shared_timings, phy);
+	}
+
+	dev_info(dev, "LP2 restore clamped dsi%d phy_restored=%d\n",
+		 msm_host->id, phy ? 1 : 0);
+	return 0;
+}
+
+int msm_dsi_host_lp2_unclamp(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	struct device *dev = &msm_host->pdev->dev;
+	int ret;
+
+	/*
+	 * After encoder INTF_SEL / split / tearcheck. Panel DCS
+	 * is skipped on LP2 (keep_prepared); do not unclamp in
+	 * pre_enable (that scrambled dual-LM on testGF).
+	 */
+	ret = dsi_mmss_clamp_ctrl(msm_host, false);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "LP2 unclamp dsi%d\n", msm_host->id);
+
+	return cfg_hnd->ops->link_clk_enable(msm_host);
+}
+
+bool msm_dsi_host_mmss_clamped(struct mipi_dsi_host *host)
+{
+	return to_msm_dsi_host(host)->mmss_clamp;
 }
 
 static bool msm_dsi_host_version_geq(struct msm_dsi_host *msm_host,
@@ -870,9 +1107,20 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		}
 	}
 
-	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL,
-			DSI_CMD_DMA_CTRL_FROM_FRAME_BUFFER |
-			DSI_CMD_DMA_CTRL_LOW_POWER);
+	/*
+	 * 3.10 mdss_dsi_op_mode_config: dma_ctrl = BIT(28)|BIT(26)
+	 * and BIT(31) BROADCAST_EN when cmd-sync-wait-broadcast
+	 * (mainline qcom,sync-dual-dsi). Without it, DSI0 does not
+	 * wait for the DSI1 trigger; 0x11 after reset can miss the
+	 * left half.
+	 */
+	data = DSI_CMD_DMA_CTRL_FROM_FRAME_BUFFER |
+	       DSI_CMD_DMA_CTRL_LOW_POWER;
+	if (of_property_read_bool(msm_host->pdev->dev.of_node,
+				  "qcom,sync-dual-dsi"))
+		data |= DSI_CMD_DMA_CTRL_BROADCAST_EN;
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL, data);
+	pr_info("talkman-mdss: dsi%d dma_ctrl=%08x\n", msm_host->id, data);
 
 	data = 0;
 	/* Always assume dedicated TE pin */
@@ -928,6 +1176,13 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 	data |= DSI_CTRL_ENABLE;
 
 	dsi_write(msm_host, REG_DSI_CTRL, data);
+	pr_info("talkman-mdss: dsi%d cfg0=%08x trig=%08x mdp2=%08x ctrl=%08x st=%08x\n",
+		msm_host->id,
+		dsi_read(msm_host, REG_DSI_CMD_CFG0),
+		dsi_read(msm_host, REG_DSI_TRIG_CTRL),
+		dsi_read(msm_host, REG_DSI_CMD_MODE_MDP_CTRL2),
+		dsi_read(msm_host, REG_DSI_CTRL),
+		dsi_read(msm_host, REG_DSI_STATUS0));
 
 	if (msm_host->cphy_mode)
 		dsi_write(msm_host, REG_DSI_CPHY_MODE_CTRL, BIT(0));
@@ -1110,6 +1365,15 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 			 */
 			wc = msm_host->dsc->slice_chunk_size * msm_host->dsc_slice_per_pkt + 1;
 
+		/*
+		 * 3.10 mdss_dsi_mode_setup writes the same word
+		 * count into COMMAND_MODE_MDP_STREAM 0 and 1
+		 * (ctrl_base + 0x58/0x60 and 0x5C/0x64). Mainline
+		 * only programmed stream 0. After POWER_OFF GDSC
+		 * drop, stream 1 is 0; lk leftover had kept first
+		 * boot working. DSI then sits in CMD_MODE_MDP_BUSY
+		 * and PP_DONE never latches.
+		 */
 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL,
 			DSI_CMD_MDP_STREAM0_CTRL_WORD_COUNT(wc) |
 			DSI_CMD_MDP_STREAM0_CTRL_VIRTUAL_CHANNEL(
@@ -1120,6 +1384,21 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL,
 			DSI_CMD_MDP_STREAM0_TOTAL_H_TOTAL(hdisplay) |
 			DSI_CMD_MDP_STREAM0_TOTAL_V_TOTAL(mode->vdisplay));
+
+		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL,
+			DSI_CMD_MDP_STREAM1_CTRL_WORD_COUNT(wc) |
+			DSI_CMD_MDP_STREAM1_CTRL_VIRTUAL_CHANNEL(
+					msm_host->channel) |
+			DSI_CMD_MDP_STREAM1_CTRL_DATA_TYPE(
+					MIPI_DSI_DCS_LONG_WRITE));
+
+		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM1_TOTAL,
+			DSI_CMD_MDP_STREAM1_TOTAL_H_TOTAL(hdisplay) |
+			DSI_CMD_MDP_STREAM1_TOTAL_V_TOTAL(mode->vdisplay));
+		pr_info("talkman-mdss: dsi%d mdp_stream wc=%u h=%u v=%u s0=%08x s1=%08x\n",
+			msm_host->id, wc, hdisplay, mode->vdisplay,
+			dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL),
+			dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL));
 	}
 }
 
@@ -1176,6 +1455,36 @@ static void dsi_op_mode_config(struct msm_dsi_host *msm_host,
 	}
 
 	dsi_write(msm_host, REG_DSI_CTRL, dsi_ctrl);
+}
+
+void msm_dsi_host_dump_hang(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host;
+
+	if (!host)
+		return;
+	msm_host = to_msm_dsi_host(host);
+	if (!msm_host->ctrl_base)
+		return;
+
+	pr_info("talkman-mdss: hang dsi%d ctrl=%08x st=%08x fifo=%08x lane=%08x lnctl=%08x trig=%08x intr=%08x\n",
+		msm_host->id,
+		dsi_read(msm_host, REG_DSI_CTRL),
+		dsi_read(msm_host, REG_DSI_STATUS0),
+		dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+		dsi_read(msm_host, REG_DSI_LANE_STATUS),
+		dsi_read(msm_host, REG_DSI_LANE_CTRL),
+		dsi_read(msm_host, REG_DSI_TRIG_CTRL),
+		dsi_read(msm_host, REG_DSI_INTR_CTRL));
+	pr_info("talkman-mdss: hang dsi%d s0c=%08x s0t=%08x s1c=%08x s1t=%08x dma=%08x mdp2=%08x cfg0=%08x\n",
+		msm_host->id,
+		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL),
+		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL),
+		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL),
+		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_TOTAL),
+		dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL),
+		dsi_read(msm_host, REG_DSI_CMD_MODE_MDP_CTRL2),
+		dsi_read(msm_host, REG_DSI_CMD_CFG0));
 }
 
 static void dsi_set_tx_power_mode(int mode, struct msm_dsi_host *msm_host)
@@ -1434,6 +1743,26 @@ int dsi_dma_base_get_v2(struct msm_dsi_host *msm_host, uint64_t *dma_base)
 	return 0;
 }
 
+static void dsi_wait_cmd_mdp_busy(struct msm_dsi_host *msm_host)
+{
+	u32 status;
+
+	if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)
+		return;
+
+	/*
+	 * 3.10 mdss_dsi_cmd_mdp_busy waits on CMD_MDP_DONE
+	 * before every cmdlist (including DCS 0x28/0x10).
+	 * Mainline has no mdp_busy completion; STATUS0 bit 2
+	 * is the hardware bit that irq would have cleared.
+	 */
+	if (readl_poll_timeout(msm_host->ctrl_base + REG_DSI_STATUS0, status,
+			       !(status & DSI_STATUS0_CMD_MODE_MDP_BUSY),
+			       1000, 200000))
+		pr_info("talkman-mdss: dsi%d cmd_mdp busy status=%x\n",
+			msm_host->id, status);
+}
+
 static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 {
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
@@ -1449,6 +1778,7 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 
 	reinit_completion(&msm_host->dma_comp);
 
+	dsi_wait_cmd_mdp_busy(msm_host);
 	dsi_wait4video_eng_busy(msm_host);
 
 	triggered = msm_dsi_manager_cmd_xfer_trigger(
@@ -2044,6 +2374,31 @@ int msm_dsi_host_init(struct msm_dsi *msm_dsi)
 				     "%s: unable to identify DSI host index\n",
 				     __func__);
 
+	{
+		struct resource *misc;
+
+		misc = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						    "mmss_misc");
+		if (misc) {
+			if (resource_size(misc) < 0x10c)
+				return dev_err_probe(&pdev->dev, -EINVAL,
+					"mmss_misc too small for phyreset 0x108\n");
+			msm_host->mmss_misc = devm_ioremap(&pdev->dev,
+							   misc->start,
+							   resource_size(misc));
+			if (!msm_host->mmss_misc)
+				return -ENOMEM;
+			if (of_property_read_u32(pdev->dev.of_node,
+					"qcom,mmss-ulp-clamp-ctrl-offset",
+					&msm_host->ulps_clamp_off))
+				msm_host->ulps_clamp_off = 0x14;
+			if (of_property_read_u32(pdev->dev.of_node,
+					"qcom,mmss-phyreset-ctrl-offset",
+					&msm_host->ulps_phyrst_off))
+				msm_host->ulps_phyrst_off = 0x108;
+		}
+	}
+
 	/* fixup base address by io offset */
 	msm_host->ctrl_base += cfg->io_offset;
 	msm_host->ctrl_size -= cfg->io_offset;
@@ -2498,6 +2853,8 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	int ret = 0;
 
 	mutex_lock(&msm_host->dev_mutex);
+	pr_info("talkman-mdss: host_on %s power_on=%d\n",
+		dev_name(&msm_host->pdev->dev), msm_host->power_on);
 	if (msm_host->power_on) {
 		DBG("dsi host already on");
 		goto unlock_ret;
@@ -2516,6 +2873,8 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 			__func__, ret);
 		goto unlock_ret;
 	}
+	pr_info("talkman-mdss: host_on regs %s\n",
+		dev_name(&msm_host->pdev->dev));
 
 	pm_runtime_get_sync(&msm_host->pdev->dev);
 	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
@@ -2526,6 +2885,8 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		       __func__, ret);
 		goto fail_disable_reg;
 	}
+	pr_info("talkman-mdss: host_on clks %s\n",
+		dev_name(&msm_host->pdev->dev));
 
 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
 	if (ret) {
@@ -2533,10 +2894,24 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 			__func__, ret);
 		goto fail_disable_clk;
 	}
+	pr_info("talkman-mdss: host_on pinctrl %s\n",
+		dev_name(&msm_host->pdev->dev));
 
-	dsi_timing_setup(msm_host, is_bonded_dsi);
+	/*
+	 * 3.10 mdss_dsi_on: ctrl_setup (mode_setup streams +
+	 * host_init) then sw_reset(restore). DSI_RESET does not
+	 * keep stream 1 if we never wrote it. Reset first, then
+	 * program both streams, then enable.
+	 */
 	dsi_sw_reset(msm_host);
+	pr_info("talkman-mdss: host_on reset %s\n",
+		dev_name(&msm_host->pdev->dev));
+	dsi_timing_setup(msm_host, is_bonded_dsi);
+	pr_info("talkman-mdss: host_on timing %s\n",
+		dev_name(&msm_host->pdev->dev));
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+	pr_info("talkman-mdss: host_on ctrl %s\n",
+		dev_name(&msm_host->pdev->dev));
 
 	msm_host->power_on = true;
 	mutex_unlock(&msm_host->dev_mutex);

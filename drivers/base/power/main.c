@@ -824,8 +824,13 @@ static void device_resume_noirq(struct device *dev, pm_message_t state, bool asy
 		goto Out;
 	}
 
+	pr_info("talkman-pm: res-noirq %s parent=%s\n",
+		dev_name(dev),
+		dev->parent ? dev_name(dev->parent) : "-");
+
 	if (!dpm_wait_for_superior(dev, async))
 		goto Out;
+	pr_info("talkman-pm: res-noirq-waited %s\n", dev_name(dev));
 
 	skip_resume = dev_pm_skip_resume(dev);
 	/*
@@ -872,6 +877,7 @@ Run:
 
 Skip:
 	dev->power.is_noirq_suspended = false;
+	pr_info("talkman-pm: res-noirq-ok %s\n", dev_name(dev));
 
 Out:
 	complete_all(&dev->power.completion);
@@ -951,9 +957,13 @@ static void dpm_noirq_resume_devices(pm_message_t state)
 void dpm_resume_noirq(pm_message_t state)
 {
 	dpm_noirq_resume_devices(state);
+	pr_info("talkman-pm: noirq devices done\n");
 
+	pr_info("talkman-pm: resume_device_irqs\n");
 	resume_device_irqs();
+	pr_info("talkman-pm: resume_device_irqs ok\n");
 	device_wakeup_disarm_wake_irqs();
+	pr_info("talkman-pm: wakeup_disarm ok\n");
 }
 
 static void async_resume_early(void *data, async_cookie_t cookie);
@@ -983,6 +993,8 @@ static void device_resume_early(struct device *dev, pm_message_t state, bool asy
 
 	if (dev->power.syscore)
 		goto Skip;
+
+	pr_info("talkman-pm: res-early %s\n", dev_name(dev));
 
 	if (!dpm_wait_for_superior(dev, async))
 		goto Out;
@@ -1017,6 +1029,7 @@ Run:
 Skip:
 	dev->power.is_late_suspended = false;
 	pm_runtime_enable(dev);
+	pr_info("talkman-pm: res-early-ok %s\n", dev_name(dev));
 
 Out:
 	TRACE_RESUME(error);
@@ -1141,6 +1154,8 @@ static void device_resume(struct device *dev, pm_message_t state, bool async)
 		goto Complete;
 	}
 
+	pr_info("talkman-pm: res %s\n", dev_name(dev));
+
 	if (!dpm_wait_for_superior(dev, async))
 		goto Complete;
 
@@ -1190,6 +1205,7 @@ static void device_resume(struct device *dev, pm_message_t state, bool async)
 
  End:
 	error = dpm_run_callback(callback, dev, state, info);
+	pr_info("talkman-pm: res-ok %s\n", dev_name(dev));
 
 	device_unlock(dev);
 	dpm_watchdog_clear(&wd);
@@ -1308,7 +1324,9 @@ static void device_complete(struct device *dev, pm_message_t state)
 
 	if (callback) {
 		pm_dev_dbg(dev, state, info);
+		pr_info("talkman-pm: complete %s\n", dev_name(dev));
 		callback(dev);
+		pr_info("talkman-pm: complete-ok %s\n", dev_name(dev));
 	}
 
 	device_unlock(dev);
@@ -1370,9 +1388,12 @@ void dpm_complete(pm_message_t state)
  */
 void dpm_resume_end(pm_message_t state)
 {
+	pr_info("talkman-pm: dpm_resume\n");
 	dpm_resume(state);
+	pr_info("talkman-pm: dpm_resume ok\n");
 	pm_restore_gfp_mask();
 	dpm_complete(state);
+	pr_info("talkman-pm: dpm_complete ok\n");
 }
 EXPORT_SYMBOL_GPL(dpm_resume_end);
 

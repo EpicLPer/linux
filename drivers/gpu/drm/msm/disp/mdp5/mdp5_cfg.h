@@ -92,6 +92,12 @@ struct mdp5_perf_block {
 	u32 clk_inefficiency;
 };
 
+/* 3.10 qcom,mdp-settings entry; off is from the MDP5 mmio base. */
+struct mdp5_hw_setting {
+	u32 off;
+	u32 val;
+};
+
 struct mdp5_cfg_hw {
 	char  *name;
 
@@ -120,6 +126,9 @@ struct mdp5_cfg_hw {
 		u32 ppb_cfg;
 		u32 slave_pp_off;
 	} pp_split;
+
+	const struct mdp5_hw_setting *hw_settings;
+	unsigned int nhw_settings;
 
 	uint32_t max_clk;
 };

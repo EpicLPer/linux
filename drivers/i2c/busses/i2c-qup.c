@@ -18,6 +18,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
@@ -230,6 +231,7 @@ struct qup_i2c_dev {
 	int			irq;
 	struct clk		*clk;
 	struct clk		*pclk;
+	bool			clocks_on;
 	struct icc_path		*icc_path;
 	struct i2c_adapter	adap;
 
@@ -1432,7 +1434,11 @@ qup_i2c_conf_xfer_v2(struct qup_i2c_dev *qup, bool is_rx, bool is_first,
 	if (ret)
 		goto err;
 
+	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: fifo wait\n");
 	ret = qup_i2c_wait_for_complete(qup, msg);
+	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: fifo wait ret=%d\n", ret);
 	if (ret)
 		goto err;
 
@@ -1444,7 +1450,11 @@ qup_i2c_conf_xfer_v2(struct qup_i2c_dev *qup, bool is_rx, bool is_first,
 	}
 
 err:
+	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: fifo disable_irq\n");
 	disable_irq(qup->irq);
+	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: fifo disable_irq done\n");
 	return ret;
 }
 
@@ -1573,7 +1583,17 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	qup->bus_err = 0;
 	qup->qup_err = 0;
 
+	if (of_machine_is_compatible("qcom,msm8994") && num &&
+	    msgs[0].addr == 0x4b)
+		dev_info(qup->dev,
+			 "talkman-qup: xfer 0x4b get_sync rpm_sus=%d\n",
+			 pm_runtime_suspended(qup->dev));
+
 	ret = pm_runtime_get_sync(qup->dev);
+	if (of_machine_is_compatible("qcom,msm8994") && num &&
+	    msgs[0].addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: xfer 0x4b get_sync ret=%d\n",
+			 ret);
 	if (ret < 0)
 		goto out;
 
@@ -1581,8 +1601,16 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	if (ret)
 		goto out;
 
+	if (of_machine_is_compatible("qcom,msm8994") && num &&
+	    msgs[0].addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: xfer 0x4b sw_reset\n");
 	writel(1, qup->base + QUP_SW_RESET);
 	ret = qup_i2c_poll_state(qup, QUP_RESET_STATE);
+	if (of_machine_is_compatible("qcom,msm8994") && num &&
+	    msgs[0].addr == 0x4b)
+		dev_info(qup->dev,
+			 "talkman-qup: xfer 0x4b reset_poll ret=%d dma=%d\n",
+			 ret, qup->use_dma);
 	if (ret)
 		goto out;
 
@@ -1596,9 +1624,16 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	}
 
 	if (qup->use_dma) {
+		if (of_machine_is_compatible("qcom,msm8994") && num &&
+		    msgs[0].addr == 0x4b)
+			dev_info(qup->dev, "talkman-qup: xfer 0x4b bam\n");
 		reinit_completion(&qup->xfer);
 		ret = qup_i2c_bam_xfer(adap, &msgs[0], num);
 		qup->use_dma = false;
+		if (of_machine_is_compatible("qcom,msm8994") && num &&
+		    msgs[0].addr == 0x4b)
+			dev_info(qup->dev, "talkman-qup: xfer 0x4b bam ret=%d\n",
+				 ret);
 	} else {
 		qup_i2c_conf_mode_v2(qup);
 
@@ -1623,6 +1658,9 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	if (ret == 0)
 		ret = num;
 out:
+	if (of_machine_is_compatible("qcom,msm8994") && num &&
+	    msgs[0].addr == 0x4b)
+		dev_info(qup->dev, "talkman-qup: xfer 0x4b done ret=%d\n", ret);
 	pm_runtime_put_autosuspend(qup->dev);
 
 	return ret;
@@ -1671,6 +1709,7 @@ static int qup_i2c_enable_clocks(struct qup_i2c_dev *qup)
 		return ret;
 	}
 
+	qup->clocks_on = true;
 	return 0;
 }
 
@@ -1685,6 +1724,7 @@ static void qup_i2c_disable_clocks(struct qup_i2c_dev *qup)
 	writel(config, qup->base + QUP_CONFIG);
 	qup_i2c_vote_bw(qup, 0);
 	clk_disable_unprepare(qup->pclk);
+	qup->clocks_on = false;
 }
 
 static const struct acpi_device_id qup_i2c_acpi_match[] = {
@@ -1993,6 +2033,12 @@ static int qup_i2c_pm_resume_runtime(struct device *device)
 
 static int qup_i2c_suspend(struct device *device)
 {
+	/*
+	 * 3.10 i2c-qup has no .suspend/.resume — only noirq.
+	 * Clock gate + RPM sync happen in suspend_noirq.
+	 */
+	if (of_machine_is_compatible("qcom,msm8994"))
+		return 0;
 	if (!pm_runtime_suspended(device))
 		return qup_i2c_pm_suspend_runtime(device);
 	return 0;
@@ -2002,6 +2048,10 @@ static int qup_i2c_resume(struct device *device)
 {
 	int ret;
 
+	/* 3.10: clocks come up on the next xfer, not here. */
+	if (of_machine_is_compatible("qcom,msm8994"))
+		return 0;
+
 	ret = qup_i2c_pm_resume_runtime(device);
 	if (ret)
 		return ret;
@@ -2010,8 +2060,59 @@ static int qup_i2c_resume(struct device *device)
 	return 0;
 }
 
+/*
+ * 8994 3.10 binds qcom,i2c-msm-v2 (not i2c-qup.c). That driver's
+ * sys_suspend_noirq: if pwr_state != RT_ACTIVE, do nothing; if
+ * ACTIVE, pinctrl + path unvote only — no QUP_STATE MMIO, no
+ * clk_disable in the PM callback (clocks are xfer-scoped via
+ * i2c_msm_pm_clk_disable_unprepare). testFJ: f9923000 noirq
+ * disable_clocks (change_state readl) ok, then f9924000 (TAS2553)
+ * SEA 96000010 in qup_i2c_change_state. Mainline dpm_suspend
+ * runtime-resumes (enable_clocks) before our empty .suspend;
+ * noirq must drop those clocks without QUP MMIO.
+ */
+static int qup_i2c_suspend_noirq(struct device *device)
+{
+	struct qup_i2c_dev *qup = dev_get_drvdata(device);
+
+	if (!of_machine_is_compatible("qcom,msm8994"))
+		return 0;
+
+	dev_info(device, "talkman-qup: noirq sus rpm_sus=%d clk=%d\n",
+		 pm_runtime_suspended(device), qup->clocks_on);
+	if (!pm_runtime_suspended(device)) {
+		/*
+		 * 3.10 i2c-msm-v2: clk drop only if RT_ACTIVE (clocks
+		 * on). Idle QUPs can be rpm_sus=0 with clocks already
+		 * off (TAS2553 RPM underflow); do not unbalance.
+		 * Never QUP_STATE MMIO here (testFJ SEA).
+		 */
+		if (qup->clocks_on) {
+			clk_disable_unprepare(qup->clk);
+			clk_disable_unprepare(qup->pclk);
+			qup_i2c_vote_bw(qup, 0);
+			qup->clocks_on = false;
+		}
+		pm_runtime_disable(device);
+		pm_runtime_set_suspended(device);
+		pm_runtime_enable(device);
+	}
+	dev_info(device, "talkman-qup: noirq sus ok\n");
+	return 0;
+}
+
+static int qup_i2c_resume_noirq(struct device *device)
+{
+	if (!of_machine_is_compatible("qcom,msm8994"))
+		return 0;
+
+	dev_info(device, "talkman-qup: noirq res (clocks on next xfer)\n");
+	return 0;
+}
+
 static const struct dev_pm_ops qup_i2c_qup_pm_ops = {
 	SYSTEM_SLEEP_PM_OPS(qup_i2c_suspend, qup_i2c_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(qup_i2c_suspend_noirq, qup_i2c_resume_noirq)
 	RUNTIME_PM_OPS(qup_i2c_pm_suspend_runtime,
 		       qup_i2c_pm_resume_runtime, NULL)
 };

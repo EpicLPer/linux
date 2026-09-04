@@ -269,6 +269,17 @@ struct drm_panel {
 	bool prepare_prev_first;
 
 	/**
+	 * @keep_prepared:
+	 *
+	 * Leave the panel prepared/enabled across CRTC off. 3.10
+	 * mdss_dsi_panel_power_lp / BLANK_FLAG_ULP is a no-op:
+	 * do not DCS 28/10 + reset on idle PC. Resume then skips
+	 * prepare (no DCS 0x11), so the PHY can unclamp after
+	 * encoder INTF_SEL instead of in pre_enable.
+	 */
+	bool keep_prepared;
+
+	/**
 	 * @prepared:
 	 *
 	 * If true then the panel has been prepared.

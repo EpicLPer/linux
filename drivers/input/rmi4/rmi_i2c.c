@@ -297,6 +297,18 @@ static int rmi_i2c_suspend(struct device *dev)
 	if (ret)
 		dev_warn(dev, "Failed to resume device: %d\n", ret);
 
+	/*
+	 * F01 SENSOR_SLEEP is required on mainline: without it the
+	 * EDGE_FALLING line keeps firing and dpm_resume_noirq hangs
+	 * (testFH). 3.10 empty pm_ops get that from FB blank; echo
+	 * mem on mainline must do it here. Keep L22 (s2idle is not
+	 * the 3.10 FB power-down path).
+	 */
+	if (of_machine_is_compatible("qcom,msm8994")) {
+		dev_info(dev, "talkman-rmi: F01 sleep, keep L22\n");
+		return ret;
+	}
+
 	regulator_bulk_disable(ARRAY_SIZE(rmi_i2c->supplies),
 			       rmi_i2c->supplies);
 
@@ -309,6 +321,11 @@ static int rmi_i2c_resume(struct device *dev)
 	struct rmi_i2c_xport *rmi_i2c = i2c_get_clientdata(client);
 	int ret;
 
+	if (of_machine_is_compatible("qcom,msm8994")) {
+		dev_info(dev, "talkman-rmi: F01 wake (L22 held)\n");
+		goto resume_dev;
+	}
+
 	ret = regulator_bulk_enable(ARRAY_SIZE(rmi_i2c->supplies),
 				    rmi_i2c->supplies);
 	if (ret)
@@ -316,9 +333,12 @@ static int rmi_i2c_resume(struct device *dev)
 
 	msleep(rmi_i2c->startup_delay);
 
+resume_dev:
 	ret = rmi_driver_resume(rmi_i2c->xport.rmi_dev, true);
 	if (ret)
 		dev_warn(dev, "Failed to resume device: %d\n", ret);
+	else if (of_machine_is_compatible("qcom,msm8994"))
+		dev_info(dev, "talkman-rmi: resume done\n");
 
 	return ret;
 }

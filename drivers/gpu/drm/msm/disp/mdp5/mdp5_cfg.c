@@ -434,6 +434,25 @@ static const struct mdp5_cfg_hw msm8x36_config = {
 	.max_clk = 366670000,
 };
 
+/*
+ * 3.10 msm8994-mdss.dtsi qcom,mdp-settings, relative to mdp_phys
+ * 0xfd900000. This driver's MDP map starts at 0xfd901000.
+ */
+static const struct mdp5_hw_setting msm8994_mdp_settings[] = {
+	{ 0x017c, 0x00005555 },
+	{ 0x0184, 0xc000ff00 },
+	{ 0x01e0, 0x000000a4 },
+	{ 0x01e4, 0x00000000 },
+	{ 0x02ac, 0xc0000ccc },
+	{ 0x02b4, 0xc0000ccc },
+	{ 0x02bc, 0x00cccccc },
+	{ 0x02c4, 0x000000cc },
+	{ 0x03a8, 0x0cccc0c0 },
+	{ 0x03b0, 0xccccc0c0 },
+	{ 0x03b8, 0xccccc0c0 },
+	{ 0x03d0, 0x00ccc000 },
+};
+
 static const struct mdp5_cfg_hw msm8x94_config = {
 	.name = "msm8x94",
 	.mdp = {
@@ -549,6 +568,8 @@ static const struct mdp5_cfg_hw msm8x94_config = {
 		.ppb_cfg = 0,
 		.slave_pp_off = 0,
 	},
+	.hw_settings = msm8994_mdp_settings,
+	.nhw_settings = ARRAY_SIZE(msm8994_mdp_settings),
 	.max_clk = 400000000,
 };
 

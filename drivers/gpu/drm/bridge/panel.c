@@ -183,6 +183,12 @@ static void panel_bridge_atomic_post_disable(struct drm_bridge *bridge,
 	if (new_crtc_state && new_crtc_state->self_refresh_active)
 		return;
 
+	if (panel_bridge->panel->keep_prepared) {
+		dev_info(panel_bridge->panel->dev,
+			 "LP2 keep panel prepared\n");
+		return;
+	}
+
 	drm_panel_unprepare(panel_bridge->panel);
 }
 

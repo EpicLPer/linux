@@ -47,6 +47,8 @@ struct mdp5_kms {
 
 	/* io/register spaces: */
 	void __iomem *mmio;
+	/* 3.10 vbif_phys 0xfd9c8000; QoS remapper after GDSC. */
+	void __iomem *vbif;
 
 	struct clk *axi_clk;
 	struct clk *ahb_clk;
@@ -168,12 +170,15 @@ struct mdp5_interface {
  * dest-split. msm8x94_config keeps SPLIT_DISPLAY_* offsets but leaves
  * ppb_ctl=0. msm8992_config.ppb_ctl=0x334 stays dest-split.
  */
+static inline bool mdp5_hw_dual_lm_no_ppb(const struct mdp5_cfg_hw *hw)
+{
+	return hw && hw->pp_split.split_display_en && !hw->pp_split.ppb_ctl;
+}
+
 static inline bool mdp5_cmd_dual_lm(const struct mdp5_cfg_hw *hw,
 				    const struct mdp5_interface *intf)
 {
-	if (!hw || !intf)
-		return false;
-	if (!hw->pp_split.split_display_en || hw->pp_split.ppb_ctl)
+	if (!mdp5_hw_dual_lm_no_ppb(hw) || !intf)
 		return false;
 	if (intf->type != INTF_DSI ||
 	    intf->mode != MDP5_INTF_DSI_MODE_COMMAND)
@@ -320,6 +325,8 @@ struct drm_encoder *mdp5_encoder_init(struct drm_device *dev,
 		struct mdp5_interface *intf, struct mdp5_ctl *ctl);
 struct mdp5_ctl *mdp5_encoder_get_slave_ctl(struct drm_encoder *encoder);
 struct mdp5_interface *mdp5_encoder_get_slave_intf(struct drm_encoder *encoder);
+void mdp5_hw_reset_after_pc(struct mdp5_kms *mdp5_kms);
+void mdp5_sspp_clk_force_on(struct mdp5_kms *mdp5_kms, enum mdp5_pipe pipe);
 void mdp5_encoder_set_intf_mode(struct drm_encoder *encoder, bool cmd_mode);
 int mdp5_encoder_get_linecount(struct drm_encoder *encoder);
 u32 mdp5_encoder_get_framecount(struct drm_encoder *encoder);
@@ -330,6 +337,8 @@ void mdp5_cmd_encoder_mode_set(struct drm_encoder *encoder,
 			       struct drm_display_mode *adjusted_mode);
 void mdp5_cmd_encoder_disable(struct drm_encoder *encoder);
 void mdp5_cmd_encoder_enable(struct drm_encoder *encoder);
+void mdp5_cmd_encoder_kickoff(struct drm_encoder *encoder);
+void mdp5_cmd_tearcheck_setup_crtc(struct drm_crtc *crtc);
 #else
 static inline void mdp5_cmd_encoder_mode_set(struct drm_encoder *encoder,
 					     struct drm_display_mode *mode,
@@ -340,6 +349,12 @@ static inline void mdp5_cmd_encoder_disable(struct drm_encoder *encoder)
 {
 }
 static inline void mdp5_cmd_encoder_enable(struct drm_encoder *encoder)
+{
+}
+static inline void mdp5_cmd_encoder_kickoff(struct drm_encoder *encoder)
+{
+}
+static inline void mdp5_cmd_tearcheck_setup_crtc(struct drm_crtc *crtc)
 {
 }
 #endif

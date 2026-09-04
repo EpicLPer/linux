@@ -7,6 +7,7 @@
 
 #include <linux/aperture.h>
 #include <linux/kthread.h>
+#include <linux/of.h>
 #include <linux/sched/mm.h>
 #include <uapi/linux/sched/types.h>
 

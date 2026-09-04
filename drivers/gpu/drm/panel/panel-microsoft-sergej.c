@@ -45,6 +45,13 @@ static int sergej_dcs_write_buf(struct sergej_panel *ctx, const void *data,
 {
 	int i, ret = 0;
 
+	/*
+	 * 3.10: DSI0 cmd-sync-wait-broadcast, DSI1 broadcast+trigger.
+	 * Mainline msm_dsi_manager_cmd_xfer() is a no-op on DSI0 and
+	 * the DSI1 call prepares both hosts then triggers both. testHC
+	 * wrote DSI1 only; first boot hung with DSI st=0. Keep the
+	 * DSI0 call (GW).
+	 */
 	for (i = 0; i < ARRAY_SIZE(ctx->dsi); i++) {
 		if (!ctx->dsi[i])
 			continue;
@@ -52,7 +59,7 @@ static int sergej_dcs_write_buf(struct sergej_panel *ctx, const void *data,
 		if (ret < 0)
 			return ret;
 	}
-	return 0;
+	return ret;
 }
 
 static int sergej_dcs_write_cmd(struct sergej_panel *ctx, u8 cmd)
@@ -66,7 +73,7 @@ static int sergej_dcs_write_cmd(struct sergej_panel *ctx, u8 cmd)
 		if (ret < 0)
 			return ret;
 	}
-	return 0;
+	return ret;
 }
 
 static int sergej_reset(struct sergej_panel *ctx)

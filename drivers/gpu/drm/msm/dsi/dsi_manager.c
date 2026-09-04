@@ -5,6 +5,8 @@
 
 #include "drm/drm_bridge_connector.h"
 
+#include <linux/of.h>
+
 #include "msm_kms.h"
 #include "dsi.h"
 #include "phy/dsi_phy.h"
@@ -249,16 +251,20 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 	int ret;
 
 	DBG("id=%d", id);
+	pr_info("talkman-mdss: bridge_power_on id=%d bonded=%d\n",
+		id, is_bonded_dsi);
 
 	ret = dsi_mgr_phy_enable(id, phy_shared_timings);
 	if (ret)
 		goto phy_en_fail;
+	pr_info("talkman-mdss: bridge_phy_ok id=%d\n", id);
 
 	ret = msm_dsi_host_power_on(host, &phy_shared_timings[id], is_bonded_dsi, msm_dsi->phy);
 	if (ret) {
 		pr_err("%s: power on host %d failed, %d\n", __func__, id, ret);
 		goto host_on_fail;
 	}
+	pr_info("talkman-mdss: bridge_host0_ok id=%d\n", id);
 
 	if (is_bonded_dsi && msm_dsi1) {
 		ret = msm_dsi_host_power_on(msm_dsi1->host,
@@ -268,6 +274,7 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 							__func__, ret);
 			goto host1_on_fail;
 		}
+		pr_info("talkman-mdss: bridge_host1_ok id=%d\n", id);
 	}
 
 	/*
@@ -278,6 +285,7 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 	if (is_bonded_dsi && msm_dsi1)
 		msm_dsi_host_enable_irq(msm_dsi1->host);
 
+	pr_info("talkman-mdss: bridge_power_on done id=%d\n", id);
 	return 0;
 
 host1_on_fail:
@@ -295,6 +303,13 @@ static void dsi_mgr_bridge_power_off(struct drm_bridge *bridge)
 	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
 	struct mipi_dsi_host *host = msm_dsi->host;
 	bool is_bonded_dsi = IS_BONDED_DSI();
+
+	/*
+	 * 3.10 mdss_dsi_off(LP2): "dsi_off with panel always on" —
+	 * no controller_cfg(0), no phy_disable.
+	 */
+	if (msm_dsi_keep_phy_on_blank(msm_dsi) && msm_dsi->phy_enabled)
+		return;
 
 	msm_dsi_host_disable_irq(host);
 	if (is_bonded_dsi && msm_dsi1) {
@@ -320,6 +335,25 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge,
 	/* Do nothing with the host if it is slave-DSI in case of bonded DSI */
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		return;
+
+	/*
+	 * 3.10 core_power_ctrl(1): phy_init + ctrl_setup while
+	 * clamped. Unclamp is bridge atomic_enable, after
+	 * encoder INTF_SEL. Panel stays prepared (ULP).
+	 */
+	if (msm_dsi_keep_phy_on_blank(msm_dsi) && msm_dsi->phy_enabled) {
+		msm_dsi_copy_panel_dphy_timings(msm_dsi);
+		if (is_bonded_dsi && msm_dsi1)
+			msm_dsi_copy_panel_dphy_timings(msm_dsi1);
+		if (msm_dsi_host_lp2_exit(host, msm_dsi->phy, is_bonded_dsi))
+			dev_err(&msm_dsi->pdev->dev, "LP2 restore failed\n");
+		if (is_bonded_dsi && msm_dsi1 &&
+		    msm_dsi_host_lp2_exit(msm_dsi1->host, msm_dsi1->phy,
+					  is_bonded_dsi))
+			dev_err(&msm_dsi->pdev->dev,
+				"LP2 restore host1 failed\n");
+		return;
+	}
 
 	ret = dsi_mgr_bridge_power_on(bridge);
 	if (ret) {
@@ -349,6 +383,30 @@ host_en_fail:
 	dsi_mgr_bridge_power_off(bridge);
 }
 
+static void dsi_mgr_bridge_atomic_enable(struct drm_bridge *bridge,
+					 struct drm_atomic_commit *commit)
+{
+	int id = dsi_mgr_bridge_get_id(bridge);
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+	bool is_bonded_dsi = IS_BONDED_DSI();
+
+	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+		return;
+
+	if (!(msm_dsi_keep_phy_on_blank(msm_dsi) && msm_dsi->phy_enabled))
+		return;
+
+	if (msm_dsi_host_lp2_unclamp(msm_dsi->host))
+		dev_err(&msm_dsi->pdev->dev, "LP2 unclamp failed\n");
+	if (is_bonded_dsi && msm_dsi1 &&
+	    msm_dsi_host_lp2_unclamp(msm_dsi1->host))
+		dev_err(&msm_dsi->pdev->dev, "LP2 unclamp host1 failed\n");
+
+	if (bridge->encoder)
+		mdp5_cmd_encoder_kickoff(bridge->encoder);
+}
+
 void msm_dsi_manager_tpg_enable(void)
 {
 	struct msm_dsi *m_dsi = dsi_mgr_get_dsi(DSI_0);
@@ -373,6 +431,25 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge,
 	int ret;
 
 	DBG("id=%d", id);
+
+	/*
+	 * helper_suspend and connector-off both land here. 3.10
+	 * mdss_dsi_off(LP2) does not mdss_dsi_controller_cfg(0),
+	 * dsi_sw_reset, host_power_off, or phy_disable. Stop link
+	 * clocks and clamp PHY (idle PC). cmd_stop already turned
+	 * tearcheck off (encoder disable).
+	 */
+	if (msm_dsi_keep_phy_on_blank(msm_dsi) && msm_dsi->phy_enabled) {
+		if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+			return;
+		if (msm_dsi_host_lp2_enter(host, msm_dsi->phy))
+			dev_err(&msm_dsi->pdev->dev, "LP2 clamp enter failed\n");
+		if (is_bonded_dsi && msm_dsi1 &&
+		    msm_dsi_host_lp2_enter(msm_dsi1->host, msm_dsi1->phy))
+			dev_err(&msm_dsi->pdev->dev,
+				"LP2 clamp enter host1 failed\n");
+		return;
+	}
 
 	/*
 	 * Do nothing with the host if it is slave-DSI in case of bonded DSI.
@@ -482,6 +559,7 @@ static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.attach = dsi_mgr_bridge_attach,
 	.atomic_pre_enable = dsi_mgr_bridge_pre_enable,
+	.atomic_enable = dsi_mgr_bridge_atomic_enable,
 	.atomic_post_disable = dsi_mgr_bridge_post_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,
@@ -633,6 +711,28 @@ void msm_dsi_manager_unregister(struct msm_dsi *msm_dsi)
 
 	if (msm_dsi->id >= 0)
 		msm_dsim->dsi[msm_dsi->id] = NULL;
+}
+
+bool msm_dsi_idle_pc_blocks_gdsc(void)
+{
+	int id;
+
+	/*
+	 * 3.10 core_power_ctrl leaves MDSS GDSC on if clamp failed.
+	 * Do not clk-disable MDSS under an unclamped 20nm PHY.
+	 */
+	for (id = 0; id < DSI_MAX; id++) {
+		struct msm_dsi *dsi = dsi_mgr_get_dsi(id);
+
+		if (!dsi || !dsi->host)
+			continue;
+		if (!msm_dsi_keep_phy_on_blank(dsi) || !dsi->phy_enabled)
+			continue;
+		if (!msm_dsi_host_mmss_clamped(dsi->host))
+			return true;
+	}
+
+	return false;
 }
 
 bool msm_dsi_is_bonded_dsi(struct msm_dsi *msm_dsi)

@@ -109,11 +109,15 @@ static void s2idle_enter(void)
 	s2idle_state = S2IDLE_STATE_ENTER;
 	raw_spin_unlock_irq(&s2idle_lock);
 
+	pr_info("talkman-pm: s2idle enter\n");
+
 	/* Push all the CPUs into the idle loop. */
 	wake_up_all_idle_cpus();
 	/* Make the current CPU wait so it can enter the idle loop too. */
 	swait_event_exclusive(s2idle_wait_head,
 		    s2idle_state == S2IDLE_STATE_WAKE);
+
+	pr_info("talkman-pm: s2idle wake\n");
 
 	/*
 	 * Kick all CPUs to ensure that they resume their timers and restore
@@ -424,20 +428,24 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	if (error)
 		goto Platform_finish;
 
+	pr_info("talkman-pm: dpm_suspend_late\n");
 	error = dpm_suspend_late(PMSG_SUSPEND);
 	if (error) {
 		pr_err("late suspend of devices failed\n");
 		goto Platform_finish;
 	}
+	pr_info("talkman-pm: dpm_suspend_late ok\n");
 	error = platform_suspend_prepare_late(state);
 	if (error)
 		goto Devices_early_resume;
 
+	pr_info("talkman-pm: dpm_suspend_noirq\n");
 	error = dpm_suspend_noirq(PMSG_SUSPEND);
 	if (error) {
 		pr_err("noirq suspend of devices failed\n");
 		goto Platform_early_resume;
 	}
+	pr_info("talkman-pm: dpm_suspend_noirq ok\n");
 	error = platform_suspend_prepare_noirq(state);
 	if (error)
 		goto Platform_wake;
@@ -483,14 +491,20 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	pm_sleep_enable_secondary_cpus();
 
  Platform_wake:
+	pr_info("talkman-pm: resume noirq\n");
 	platform_resume_noirq(state);
+	pr_info("talkman-pm: dpm_resume_noirq\n");
 	dpm_resume_noirq(PMSG_RESUME);
+	pr_info("talkman-pm: dpm_resume_noirq ok\n");
 
  Platform_early_resume:
+	pr_info("talkman-pm: resume early\n");
 	platform_resume_early(state);
 
  Devices_early_resume:
+	pr_info("talkman-pm: dpm_resume_early\n");
 	dpm_resume_early(PMSG_RESUME);
+	pr_info("talkman-pm: dpm_resume_early ok\n");
 
  Platform_finish:
 	platform_resume_finish(state);
@@ -520,11 +534,13 @@ int suspend_devices_and_enter(suspend_state_t state)
 
 	console_suspend_all();
 	suspend_test_start();
+	pr_info("talkman-pm: dpm_suspend_start\n");
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
 		pr_err("Some devices failed to suspend, or early wake event detected\n");
 		goto Recover_platform;
 	}
+	pr_info("talkman-pm: dpm_suspend_start ok\n");
 	suspend_test_finish("suspend devices");
 	if (suspend_test(TEST_DEVICES))
 		goto Recover_platform;

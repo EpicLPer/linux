@@ -11,6 +11,7 @@
 #include <linux/irqchip.h>
 #include <linux/irqdesc.h>
 #include <linux/irqchip/chained_irq.h>
+#include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -450,12 +451,24 @@ static int __maybe_unused mdss_pm_suspend(struct device *dev)
 	if (pm_runtime_suspended(dev))
 		return 0;
 
+	/*
+	 * 3.10 leaves MDSS GDSC on if the 20nm PHY is not clamped.
+	 * After a successful LP2 clamp, children put and this device
+	 * is already runtime-suspended (first check). If clamp failed,
+	 * keep clocks on — same as core_power_ctrl leaving GDSC on.
+	 */
+	if (msm_dsi_idle_pc_blocks_gdsc())
+		return 0;
+
 	return mdss_runtime_suspend(dev);
 }
 
 static int __maybe_unused mdss_pm_resume(struct device *dev)
 {
 	if (pm_runtime_suspended(dev))
+		return 0;
+
+	if (msm_dsi_idle_pc_blocks_gdsc())
 		return 0;
 
 	return mdss_runtime_resume(dev);

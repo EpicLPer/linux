@@ -7,8 +7,12 @@
 
 #include <linux/delay.h>
 #include <linux/interconnect.h>
+#include <linux/iopoll.h>
 #include <linux/of_irq.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 
+#include <drm/drm_atomic.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -19,11 +23,256 @@
 #include "msm_mmu.h"
 #include "mdp5_kms.h"
 
+void qcom_iommu_restore_ctx_after_pc(struct device *master);
+
+/*
+ * 3.10 SEC_DEVICE_MDSS. GDSC notifier and overlay_start both
+ * scm_restore_sec_cfg before programming VBIF / mdp-settings.
+ */
+#define MDP5_SCM_MDSS_DEV_ID	1
+
+/*
+ * 3.10 msm8994-mdss.dtsi xin-id + vbif-qos-rt-setting. Written by
+ * mdss_mdp_qos_vbif_remapper_setup on every pipe; mdp5 never did.
+ */
+static const u8 msm8994_vbif_rt_xins[] = {
+	0, 1, 2, 4, 5, 7, 8, 9, 10, 12, 13
+};
+static const u8 msm8994_vbif_rt_qos[] = { 1, 2, 2, 2 };
+
+/* 3.10 msm8994-mdss.dtsi pipe-dma-xin-id / clk-ctrl-offsets. */
+#define MMSS_VBIF_XIN_HALT_CTRL0	0x200
+#define MMSS_VBIF_XIN_HALT_CTRL1	0x204
+#define XIN_HALT_TIMEOUT_US		0x4000
+#define MDP5_SSPP_CLK_CTRL0		0x2ac
+#define MDP5_SSPP_CLK_CTRL1		0x2b4
+#define MDP5_DMA_CLK_FORCE_ON		BIT(8)
+
+static void mdp5_vbif_xin_halt_cycle(struct mdp5_kms *mdp5_kms, u32 xin_id)
+{
+	u32 val, status;
+	int rc;
+
+	val = readl_relaxed(mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL0);
+	writel_relaxed(val | BIT(xin_id),
+		       mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL0);
+	wmb();
+	rc = readl_poll_timeout(mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL1,
+				status, status & BIT(xin_id), 1000,
+				XIN_HALT_TIMEOUT_US);
+	if (rc)
+		pr_info("talkman-mdss: xin %u halt timeout st=%08x\n",
+			xin_id,
+			readl_relaxed(mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL1));
+	val = readl_relaxed(mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL0);
+	writel_relaxed(val & ~BIT(xin_id),
+		       mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL0);
+}
+
+static void mdp5_restore_vbif_qos(struct mdp5_kms *mdp5_kms)
+{
+	unsigned int i, x;
+	u32 val, mask, qos, clk0, clk1;
+
+	if (!mdp5_kms->vbif)
+		return;
+
+	/*
+	 * 8974 mdss_hw_init writes VBIF:0x004 = 1 (CLKON). 8994 DT
+	 * has no vbif-settings; after GDSC AXI gating can drop OT
+	 * writes on the fetch path while APB still reads them back.
+	 */
+	writel_relaxed(1, mdp5_kms->vbif + 0x004);
+
+	for (i = 0; i < ARRAY_SIZE(msm8994_vbif_rt_qos); i++) {
+		val = readl_relaxed(mdp5_kms->vbif + 0x20 + i * 4);
+		qos = msm8994_vbif_rt_qos[i];
+		for (x = 0; x < ARRAY_SIZE(msm8994_vbif_rt_xins); x++) {
+			mask = 0x3u << (msm8994_vbif_rt_xins[x] * 2);
+			val &= ~mask;
+			val |= qos << (msm8994_vbif_rt_xins[x] * 2);
+		}
+		writel_relaxed(val, mdp5_kms->vbif + 0x20 + i * 4);
+	}
+	/*
+	 * 3.10 msm8994-mdss.dtsi qcom,mdss-default-ot-rd-limit
+	 * and -wr-limit are 16. mdss_mdp_set_ot_limit writes
+	 * MMSS_VBIF_RD_LIM_CONF (0xb0) / WR_LIM_CONF (0xc0) on
+	 * every pipe queue. After GDSC those regs are 0: no
+	 * outstanding AXI beats, SSPP fetch stalls, PP_DONE
+	 * never latches. First boot kept lk OT=16.
+	 */
+	clk0 = mdp5_read(mdp5_kms, MDP5_SSPP_CLK_CTRL0);
+	clk1 = mdp5_read(mdp5_kms, MDP5_SSPP_CLK_CTRL1);
+	pr_info("talkman-mdss: vbif qos0=%08x rdlim0=%08x wrlim0=%08x clk0=%08x halt0=%08x halt1=%08x\n",
+		readl_relaxed(mdp5_kms->vbif + 0x20),
+		readl_relaxed(mdp5_kms->vbif + 0xb0),
+		readl_relaxed(mdp5_kms->vbif + 0xc0),
+		clk0,
+		readl_relaxed(mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL0),
+		readl_relaxed(mdp5_kms->vbif + MMSS_VBIF_XIN_HALT_CTRL1));
+	for (i = 0; i < 4; i++) {
+		writel_relaxed(0x10101010, mdp5_kms->vbif + 0xb0 + i * 4);
+		writel_relaxed(0x10101010, mdp5_kms->vbif + 0xc0 + i * 4);
+	}
+	/*
+	 * 3.10 mdss_mdp_set_ot_limit: force_on_xin_clk then
+	 * XIN_HALT_CTRL0 set / wait CTRL1 / clear. DMA0 xin 2
+	 * clk 0x2AC bit 8; DMA1 xin 10 clk 0x2B4 bit 8.
+	 * Drop force-on after the cycle (hw_settings 0xc0000ccc).
+	 */
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL0, clk0 | MDP5_DMA_CLK_FORCE_ON);
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL1, clk1 | MDP5_DMA_CLK_FORCE_ON);
+	wmb();
+	mdp5_vbif_xin_halt_cycle(mdp5_kms, 2);
+	mdp5_vbif_xin_halt_cycle(mdp5_kms, 10);
+	/*
+	 * 3.10 set_ot_limit drops force-on only because pipe_queue
+	 * calls force_on_xin_clk again. MDP5 never did. Writing
+	 * hw_settings 0xc0000ccc back gated DMA0 (bit 8): AHB still
+	 * sees SRC_ADDR, CURRENT stays 0, DSI sits CMD_MDP_BUSY.
+	 */
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL0, clk0 | MDP5_DMA_CLK_FORCE_ON);
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL1, clk1 | MDP5_DMA_CLK_FORCE_ON);
+}
+
+void mdp5_sspp_clk_force_on(struct mdp5_kms *mdp5_kms, enum mdp5_pipe pipe)
+{
+	u32 off, bit, val;
+
+	switch (pipe) {
+	case SSPP_DMA0:
+		off = MDP5_SSPP_CLK_CTRL0;
+		bit = MDP5_DMA_CLK_FORCE_ON;
+		break;
+	case SSPP_DMA1:
+		off = MDP5_SSPP_CLK_CTRL1;
+		bit = MDP5_DMA_CLK_FORCE_ON;
+		break;
+	case SSPP_VIG0:
+		off = MDP5_SSPP_CLK_CTRL0;
+		bit = BIT(0);
+		break;
+	case SSPP_VIG1:
+		off = MDP5_SSPP_CLK_CTRL1;
+		bit = BIT(0);
+		break;
+	case SSPP_RGB0:
+		off = MDP5_SSPP_CLK_CTRL0;
+		bit = BIT(4);
+		break;
+	case SSPP_RGB1:
+		off = MDP5_SSPP_CLK_CTRL1;
+		bit = BIT(4);
+		break;
+	default:
+		return;
+	}
+
+	val = mdp5_read(mdp5_kms, off);
+	if (val & bit)
+		return;
+	mdp5_write(mdp5_kms, off, val | bit);
+	pr_info("talkman-mdss: sspp clk force-on pipe=%d %03x=%08x\n",
+		pipe, off, val | bit);
+}
+
+/*
+ * 3.10 overlay_start after POWER_OFF (not idle_pc): iommu attach
+ * (TZ restore_sec_cfg) then mdss_hw_init then ctl_start.
+ * mdss_hw_init does not zero CTL_OP; ctl_start programs it.
+ */
+void mdp5_hw_reset_after_pc(struct mdp5_kms *mdp5_kms)
+{
+	const struct mdp5_cfg_hw *hw;
+	unsigned int i;
+	int ret;
+
+	/*
+	 * First pm_runtime_get is read_mdp_hw_revision, before
+	 * mdp5_ctlm_init. 3.10 overlay_start / idle_pc_restore
+	 * run mdss_hw_init only after MDP is fully up.
+	 */
+	if (!mdp5_kms->ctlm)
+		return;
+
+	hw = mdp5_cfg_get_hw_config(mdp5_kms->cfg);
+
+	if (qcom_scm_restore_sec_cfg_available()) {
+		ret = qcom_scm_restore_sec_cfg(MDP5_SCM_MDSS_DEV_ID, 0);
+		pr_info("talkman-mdss: restore_sec_cfg mdss ret=%d\n", ret);
+	}
+
+	/*
+	 * 3.10 overlay_start: iommu_ctrl(1) before mdss_hw_init.
+	 * Reprogram MDP CB0 after GDSC; domain stays attached.
+	 */
+	qcom_iommu_restore_ctx_after_pc(&mdp5_kms->pdev->dev);
+
+	if (mdp5_kms->smp)
+		mdp5_smp_reset_cache(mdp5_kms->smp);
+
+	/*
+	 * 3.10 mdss_hw_init: replay qcom,mdp-settings. It does
+	 * not write INTF_SEL=0; ctl_start / ctl_restore OR it.
+	 * Wiping INTF_SEL here was dual-LM scramble after GDSC.
+	 */
+	if (hw && hw->hw_settings) {
+		for (i = 0; i < hw->nhw_settings; i++)
+			mdp5_write(mdp5_kms, hw->hw_settings[i].off,
+				   hw->hw_settings[i].val);
+		pr_info("talkman-mdss: mdss_hw_init %u mdp-settings\n",
+			hw->nhw_settings);
+		/*
+		 * 3.10 PANIC_ROBUST_CTRL 0x178 (COMMON_REG, rev 105).
+		 * pipe-dma-panic-ctrl-offsets 8/9. hw_settings write
+		 * LUT0 at 0x17c, not this enable. pipe_queue sets the
+		 * bit; after GDSC it is 0. DMA clk force-on (testGV)
+		 * left CURRENT=0 with DSI CMD_MDP_BUSY.
+		 */
+		mdp5_write(mdp5_kms, 0x178,
+			   mdp5_read(mdp5_kms, 0x178) | BIT(8) | BIT(9));
+		mdp5_restore_vbif_qos(mdp5_kms);
+	}
+
+	/*
+	 * 3.10 mdss_hw_init after mdp-settings: identity enhist
+	 * LUT + swap on every DSPP and VIG. First boot kept lk
+	 * LUTs; POWER_OFF GDSC zeros them.
+	 */
+	if (hw) {
+		static const enum mdp5_pipe vig[] = {
+			SSPP_VIG0, SSPP_VIG1, SSPP_VIG2, SSPP_VIG3
+		};
+
+		for (i = 0; i < hw->dspp.count; i++) {
+			unsigned int j;
+
+			for (j = 0; j < 256; j++)
+				mdp5_write(mdp5_kms,
+					   REG_MDP5_DSPP_HIST_LUT_BASE(i), j);
+			mdp5_write(mdp5_kms,
+				   REG_MDP5_DSPP_HIST_LUT_SWAP(i), 1);
+		}
+		for (i = 0; i < ARRAY_SIZE(vig) && i < hw->pipe_vig.count; i++) {
+			unsigned int j;
+
+			for (j = 0; j < 256; j++)
+				mdp5_write(mdp5_kms,
+					   REG_MDP5_PIPE_HIST_LUT_BASE(vig[i]),
+					   j);
+			mdp5_write(mdp5_kms,
+				   REG_MDP5_PIPE_HIST_LUT_SWAP(vig[i]), 1);
+		}
+		pr_info("talkman-mdss: mdss_hw_init hist dspp=%u vig=%u\n",
+			hw->dspp.count, hw->pipe_vig.count);
+	}
+}
+
 static int mdp5_hw_init(struct msm_kms *kms)
 {
 	struct mdp5_kms *mdp5_kms = to_mdp5_kms(to_mdp_kms(kms));
 	struct device *dev = &mdp5_kms->pdev->dev;
-	unsigned long flags;
 
 	pm_runtime_get_sync(dev);
 
@@ -51,11 +300,7 @@ static int mdp5_hw_init(struct msm_kms *kms)
 	 * care.
 	 */
 
-	spin_lock_irqsave(&mdp5_kms->resource_lock, flags);
-	mdp5_write(mdp5_kms, REG_MDP5_DISP_INTF_SEL, 0);
-	spin_unlock_irqrestore(&mdp5_kms->resource_lock, flags);
-
-	mdp5_ctlm_hw_reset(mdp5_kms->ctlm);
+	mdp5_hw_reset_after_pc(mdp5_kms);
 
 	pm_runtime_put_sync(dev);
 
@@ -160,15 +405,90 @@ static void mdp5_disable_commit(struct msm_kms *kms)
 	pm_runtime_put_sync(&mdp5_kms->pdev->dev);
 }
 
+/*
+ * 3.10 overlay_start runs before pipes are queued. msm_atomic
+ * commit_tail writes planes, then modeset enable. After GDSC the
+ * plane flush hits CTL_OP=0; crtc enable then restores INTF and
+ * STARTs without that flush. Do ctl_start here, clocks already on
+ * from enable_commit.
+ */
+static void mdp5_overlay_start_before_planes(struct mdp5_kms *mdp5_kms,
+					     struct drm_atomic_commit *state)
+{
+	const struct mdp5_cfg_hw *hw =
+		mdp5_cfg_get_hw_config(mdp5_kms->cfg);
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_s, *new_s;
+	int i;
+	bool restored = false;
+
+	if (!mdp5_hw_dual_lm_no_ppb(hw))
+		return;
+
+	/*
+	 * 3.10 overlay_start only when ctl was power-off. Do not
+	 * replay TZ/hw_init on every page flip.
+	 */
+	for_each_oldnew_crtc_in_state(state, crtc, old_s, new_s, i) {
+		struct mdp5_crtc_state *cs;
+
+		if (!new_s || !new_s->active || (old_s && old_s->active))
+			continue;
+		if (!restored) {
+			mdp5_hw_reset_after_pc(mdp5_kms);
+			restored = true;
+		}
+		cs = to_mdp5_crtc_state(new_s);
+		if (!cs->ctl || !cs->pipeline.intf)
+			continue;
+		mdp5_ctl_set_pipeline(cs->ctl, &cs->pipeline);
+		if (cs->pipeline.intf->mode == MDP5_INTF_DSI_MODE_COMMAND)
+			mdp5_cmd_tearcheck_setup_crtc(crtc);
+		pr_info("talkman-mdss: overlay_start before planes\n");
+		pr_info("talkman-mdss: restore smp0=%08x lyr0_2=%08x lyr1_5=%08x pp2_h=%08x pp3_h=%08x te2=%08x te3=%08x\n",
+			mdp5_read(mdp5_kms, REG_MDP5_SMP_ALLOC_W_REG(0)),
+			mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(0, 2)),
+			mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(1, 5)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(2)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(3)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(2)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(3)));
+	}
+}
+
+static unsigned long mdp5_smp_staged_pipes(struct drm_atomic_commit *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *new_s;
+	unsigned long pipes = 0;
+	int i;
+
+	for_each_new_plane_in_state(state, plane, new_s, i) {
+		struct mdp5_plane_state *ps;
+
+		if (!new_s || !new_s->crtc || !new_s->fb)
+			continue;
+		ps = to_mdp5_plane_state(new_s);
+		if (ps->hwpipe)
+			pipes |= BIT(ps->hwpipe->pipe);
+		if (ps->r_hwpipe)
+			pipes |= BIT(ps->r_hwpipe->pipe);
+	}
+	return pipes;
+}
+
 static void mdp5_prepare_commit(struct msm_kms *kms, struct drm_atomic_commit *state)
 {
 	struct mdp5_kms *mdp5_kms = to_mdp5_kms(to_mdp_kms(kms));
 	struct mdp5_global_state *global_state;
 
+	mdp5_overlay_start_before_planes(mdp5_kms, state);
+
 	global_state = mdp5_get_existing_global_state(mdp5_kms);
 
 	if (mdp5_kms->smp)
-		mdp5_smp_prepare_commit(mdp5_kms->smp, &global_state->smp);
+		mdp5_smp_prepare_commit(mdp5_kms->smp, &global_state->smp,
+					mdp5_smp_staged_pipes(state));
 }
 
 static void mdp5_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
@@ -843,6 +1163,18 @@ static int mdp5_dev_probe(struct platform_device *pdev)
 	if (IS_ERR(mdp5_kms->mmio))
 		return PTR_ERR(mdp5_kms->mmio);
 
+	if (pdev->dev.parent) {
+		struct platform_device *mdss_pdev =
+			to_platform_device(pdev->dev.parent);
+		struct resource *vres;
+
+		vres = platform_get_resource_byname(mdss_pdev, IORESOURCE_MEM,
+						    "vbif_phys");
+		if (vres)
+			mdp5_kms->vbif = devm_ioremap(&pdev->dev, vres->start,
+						      resource_size(vres));
+	}
+
 	/* mandatory clocks: */
 	ret = get_clk(pdev, &mdp5_kms->axi_clk, "bus", true);
 	if (ret)
@@ -933,10 +1265,58 @@ static __maybe_unused int mdp5_runtime_resume(struct device *dev)
 	return mdp5_enable(mdp5_kms);
 }
 
+static void mdp5_pm_complete(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct msm_drm_private *priv = platform_get_drvdata(pdev);
+
+	/*
+	 * 3.10 mdss_mdp_idle_pc_restore runs on the first screen
+	 * update after GDSC collapse, before ping-pong: clk on,
+	 * mdss_hw_init, ctl_restore (INTF_SEL + split_display_enable).
+	 * drm_mode_config_helper_resume is that update. testFM:
+	 * dpm_resume finished, then 20nm PLL locked with no
+	 * encoder_enable / hw_reset — hang is inside helper_resume.
+	 */
+	if (priv && priv->kms) {
+		struct mdp5_kms *mdp5_kms = to_mdp5_kms(to_mdp_kms(priv->kms));
+		const struct mdp5_cfg_hw *hw =
+			mdp5_cfg_get_hw_config(mdp5_kms->cfg);
+
+		/*
+		 * 3.10 ctl_restore: mdss_mdp_clk_ctrl(POWER_ON) stays
+		 * up for the screen update. put_sync before
+		 * helper_resume dropped GDSC under a live PHY.
+		 * INTF_SEL + split_display_enable(1) + CTL_OP, never
+		 * INTF_SEL=0.
+		 */
+		if (mdp5_hw_dual_lm_no_ppb(hw)) {
+			struct drm_crtc *crtc;
+
+			pm_runtime_get_sync(dev);
+			drm_for_each_crtc(crtc, mdp5_kms->dev) {
+				struct mdp5_crtc_state *cs;
+
+				if (!crtc->state)
+					continue;
+				cs = to_mdp5_crtc_state(crtc->state);
+				if (!cs->ctl || !cs->pipeline.intf)
+					continue;
+				mdp5_ctl_set_pipeline(cs->ctl, &cs->pipeline);
+			}
+			msm_kms_pm_complete(dev);
+			pm_runtime_put_sync(dev);
+			return;
+		}
+	}
+
+	msm_kms_pm_complete(dev);
+}
+
 static const struct dev_pm_ops mdp5_pm_ops = {
 	SET_RUNTIME_PM_OPS(mdp5_runtime_suspend, mdp5_runtime_resume, NULL)
 	.prepare = msm_kms_pm_prepare,
-	.complete = msm_kms_pm_complete,
+	.complete = mdp5_pm_complete,
 };
 
 static const struct of_device_id mdp5_dt_match[] = {

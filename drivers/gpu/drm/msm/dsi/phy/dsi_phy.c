@@ -747,6 +747,7 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 		return -EINVAL;
 
 	dev = &phy->pdev->dev;
+	pr_info("talkman-mdss: phy_enable %s\n", dev_name(dev));
 
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret) {
@@ -770,6 +771,8 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 
 	memcpy(shared_timings, &phy->timing.shared_timings,
 	       sizeof(*shared_timings));
+	pr_info("talkman-mdss: phy_enable ok %s slave=%d\n",
+		dev_name(dev), phy->usecase == MSM_DSI_PHY_SLAVE);
 
 	/*
 	 * Resetting DSI PHY silently changes its PLL registers to reset status,
@@ -778,12 +781,14 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 	 * source.
 	 */
 	if (phy->usecase != MSM_DSI_PHY_SLAVE) {
+		pr_info("talkman-mdss: pll_restore %s\n", dev_name(dev));
 		ret = msm_dsi_phy_pll_restore_state(phy);
 		if (ret) {
 			DRM_DEV_ERROR(dev, "%s: failed to restore phy state, %d\n",
 				__func__, ret);
 			goto pll_restor_fail;
 		}
+		pr_info("talkman-mdss: pll_restore ok %s\n", dev_name(dev));
 	}
 
 	return 0;
@@ -797,6 +802,73 @@ reg_en_fail:
 	pm_runtime_put(dev);
 res_en_fail:
 	return ret;
+}
+
+int msm_dsi_phy_restore_clamped(struct msm_dsi_phy *phy,
+			struct msm_dsi_phy_clk_request *clk_req,
+			struct msm_dsi_phy_shared_timings *shared_timings)
+{
+	struct device *dev;
+	int ret;
+
+	if (!phy || !phy->cfg->ops.enable)
+		return -EINVAL;
+
+	dev = &phy->pdev->dev;
+
+	/*
+	 * 3.10 mdss_dsi_phy_init while mmss_clamp: rewrite PHY
+	 * digital after MDSS GDSC collapse. Analog stayed up
+	 * (clamp + regulators). Do not phy_disable / host_reset_phy.
+	 */
+	ret = phy->cfg->ops.enable(phy, clk_req);
+	if (ret) {
+		DRM_DEV_ERROR(dev, "%s: phy restore failed, %d\n",
+			      __func__, ret);
+		return ret;
+	}
+
+	memcpy(shared_timings, &phy->timing.shared_timings,
+	       sizeof(*shared_timings));
+
+	if (phy->usecase != MSM_DSI_PHY_SLAVE) {
+		ret = msm_dsi_phy_pll_restore_state(phy);
+		if (ret)
+			DRM_DEV_ERROR(dev, "%s: pll restore failed, %d\n",
+				      __func__, ret);
+	}
+
+	return ret;
+}
+
+int msm_dsi_phy_idle_pc_put(struct msm_dsi_phy *phy)
+{
+	if (!phy || phy->idle_pc_put)
+		return 0;
+
+	pm_runtime_put_sync(&phy->pdev->dev);
+	phy->idle_pc_put = true;
+	return 0;
+}
+
+int msm_dsi_phy_idle_pc_get(struct msm_dsi_phy *phy)
+{
+	int ret;
+
+	if (!phy || !phy->idle_pc_put)
+		return 0;
+
+	ret = pm_runtime_resume_and_get(&phy->pdev->dev);
+	if (ret < 0)
+		return ret;
+
+	phy->idle_pc_put = false;
+	return 0;
+}
+
+bool msm_dsi_phy_keep_on_blank(const struct msm_dsi_phy *phy)
+{
+	return phy && phy->cfg && phy->cfg->keep_phy_on_blank;
 }
 
 void msm_dsi_phy_disable(struct msm_dsi_phy *phy)

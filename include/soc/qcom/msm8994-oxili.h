@@ -9,6 +9,7 @@
 int msm8994_oxili_pre_gpu_power(void);
 int msm8994_oxili_pre_gpu_power_if_live(void);
 void msm8994_oxili_mark_gpu_live(void);
+bool msm8994_oxili_gpu_is_live(void);
 bool msm8994_oxili_pre_gpu_voted(void);
 
 #endif

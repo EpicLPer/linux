@@ -756,6 +756,12 @@ static void mdp5_hwpipe_mode_set(struct mdp5_kms *mdp5_kms,
 	const struct msm_format *format =
 			msm_framebuffer_format(fb);
 
+	/*
+	 * 3.10 msm8994-mdss.dtsi pipe-dma-clk-ctrl 0x2AC bit 8.
+	 * Auto-gate after GDSC leaves the fetch clock off.
+	 */
+	mdp5_sspp_clk_force_on(mdp5_kms, pipe);
+
 	mdp5_write(mdp5_kms, REG_MDP5_PIPE_SRC_IMG_SIZE(pipe),
 			MDP5_PIPE_SRC_IMG_SIZE_WIDTH(src_img_w) |
 			MDP5_PIPE_SRC_IMG_SIZE_HEIGHT(src_img_h));
@@ -803,6 +809,13 @@ static void mdp5_hwpipe_mode_set(struct mdp5_kms *mdp5_kms,
 
 	/* not using secure mode: */
 	mdp5_write(mdp5_kms, REG_MDP5_PIPE_SRC_ADDR_SW_STATUS(pipe), 0);
+
+	/*
+	 * 3.10 MDSS_MDP_FETCH_CONFIG_RESET_VALUE 0x87 (also DPU).
+	 * Written for tiled there; lk programs it for linear too.
+	 * After POWER_OFF GDSC the reg is 0; first boot kept lk.
+	 */
+	mdp5_write(mdp5_kms, REG_MDP5_PIPE_FETCH_CONFIG(pipe), 0x87);
 
 	if (hwpipe->caps & MDP_PIPE_CAP_SW_PIX_EXT)
 		mdp5_write_pixel_ext(mdp5_kms, pipe, format,

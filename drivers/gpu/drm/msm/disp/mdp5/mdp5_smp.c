@@ -5,6 +5,7 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/string.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_util.h>
 
@@ -26,6 +27,8 @@ struct mdp5_smp {
 	u32 pipe_reqprio_fifo_wm0[SSPP_MAX];
 	u32 pipe_reqprio_fifo_wm1[SSPP_MAX];
 	u32 pipe_reqprio_fifo_wm2[SSPP_MAX];
+
+	bool restore_after_pc;
 };
 
 static inline
@@ -279,11 +282,51 @@ static void write_smp_fifo_regs(struct mdp5_smp *smp)
 	}
 }
 
-void mdp5_smp_prepare_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state)
+/*
+ * SMP_ALLOC / FIFO WM caches are not double-buffered. Release never
+ * clears alloc_w; after GDSC the hardware is 0 but the cache still
+ * has first-boot client IDs. prepare_commit then RMW from that
+ * stale cache. First boot started from kzalloc zeros.
+ */
+void mdp5_smp_reset_cache(struct mdp5_smp *smp)
+{
+	if (!smp)
+		return;
+	memset(smp->alloc_w, 0, sizeof(smp->alloc_w));
+	memset(smp->alloc_r, 0, sizeof(smp->alloc_r));
+	memset(smp->pipe_reqprio_fifo_wm0, 0, sizeof(smp->pipe_reqprio_fifo_wm0));
+	memset(smp->pipe_reqprio_fifo_wm1, 0, sizeof(smp->pipe_reqprio_fifo_wm1));
+	memset(smp->pipe_reqprio_fifo_wm2, 0, sizeof(smp->pipe_reqprio_fifo_wm2));
+	smp->restore_after_pc = true;
+	pr_info("talkman-mdss: smp cache reset after gdsc\n");
+}
+
+void mdp5_smp_prepare_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state,
+			     unsigned long staged_pipes)
 {
 	enum mdp5_pipe pipe;
+	unsigned long pipes = state->assigned | staged_pipes;
 
-	for_each_set_bit(pipe, &state->assigned, sizeof(state->assigned) * 8) {
+	/*
+	 * 3.10 mdss_mdp_smp_alloc (mdss_mdp_pipe.c ~589): every
+	 * overlay_queue_pipes kickoff rewrites MMBs + WM from that
+	 * staged pipe's allocated bitmap. Comment: hw reset can wipe
+	 * SMP without a new reservation.
+	 *
+	 * Mainline clears assigned at the end of prepare_commit, so
+	 * overlay_start reset_cache would write the zeroed caches
+	 * unless the staged drm planes are OR'd in. Do not walk every
+	 * hwpipe's client_state (testHE leftover RGB smpr0=00111010).
+	 * Do not write LM_OUT_SIZE (testHD).
+	 */
+	if (smp->restore_after_pc) {
+		smp->restore_after_pc = false;
+		if (staged_pipes && !state->assigned)
+			pr_info("talkman-mdss: smp_alloc staged pipes=%lx\n",
+				staged_pipes);
+	}
+
+	for_each_set_bit(pipe, &pipes, sizeof(pipes) * 8) {
 		unsigned i, nblks = 0;
 
 		for (i = 0; i < pipe2nclients(pipe); i++) {

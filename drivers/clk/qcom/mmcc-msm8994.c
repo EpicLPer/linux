@@ -2325,6 +2325,23 @@ static struct gdsc mdss_gdsc = {
 	.pwrsts = PWRSTS_OFF_ON,
 };
 
+/*
+ * 3.10 clamps 20nm PHY (mmss_misc 0xfd828000, ulp-clamp 0x14,
+ * phyreset 0x108) before MDSS GDSC off. Cityman idle PC does
+ * that on LP2 blank. Leave GDSC off-capable; core_power_ctrl
+ * keeps it on only if clamp failed (driver skip of clk-off).
+ */
+static struct gdsc mdss_gdsc_8994 = {
+	.gdscr = 0x2304,
+	.cxcs = (unsigned int []){ 0x2310, 0x231c },
+	.cxc_count = 2,
+	.pd = {
+		.name = "mdss_gdsc",
+		.flags = GENPD_FLAG_NO_STAY_ON,
+	},
+	.pwrsts = PWRSTS_OFF_ON,
+};
+
 static struct gdsc camss_top_gdsc = {
 	.gdscr = 0x34a0,
 	.cxcs = (unsigned int []){ 0x3704, 0x3714, 0x3494 },
@@ -2386,6 +2403,23 @@ static struct gdsc oxili_cx_gdsc = {
 	.flags = VOTABLE,
 };
 
+/*
+ * 8994 GX is a sibling of CX, not a genpd child. GPU + GPU SMMU
+ * both sit on OXILI_CX_GDSC. Driver s2idle skip (GX held) only
+ * covers .suspend; genpd_suspend_noirq still powered CX off and
+ * resume hung in genpd_sync_power_on (testFR). Living path keeps
+ * GX voted; do not collapse CX either. Same VOTABLE|ALWAYS_ON
+ * pattern as 8996 mmcc GDSCs.
+ */
+static struct gdsc oxili_cx_gdsc_8994 = {
+	.gdscr = 0x4034,
+	.pd = {
+		.name = "oxili_cx_gdsc",
+	},
+	.pwrsts = PWRSTS_OFF_ON,
+	.flags = VOTABLE | ALWAYS_ON,
+};
+
 static struct gdsc oxili_gx_gdsc = {
 	.gdscr = 0x4024,
 	.cxcs = (unsigned int []){ 0x4028 },
@@ -2416,6 +2450,7 @@ static struct gdsc oxili_gx_gdsc_8994 = {
 };
 
 static struct gdsc *oxili_gx;
+static struct gdsc *oxili_cx = &oxili_cx_gdsc;
 
 static struct clk_regmap *mmcc_msm8994_clocks[] = {
 	[MMPLL0_EARLY] = &mmpll0_early.clkr,
@@ -2638,6 +2673,12 @@ void msm8994_oxili_mark_gpu_live(void)
 }
 EXPORT_SYMBOL_GPL(msm8994_oxili_mark_gpu_live);
 
+bool msm8994_oxili_gpu_is_live(void)
+{
+	return oxili_gpu_live;
+}
+EXPORT_SYMBOL_GPL(msm8994_oxili_gpu_is_live);
+
 bool msm8994_oxili_pre_gpu_voted(void)
 {
 	return oxili_pre_gpu_voted;
@@ -2648,14 +2689,15 @@ int msm8994_oxili_pre_gpu_power(void)
 {
 	int ret;
 
-	if (!oxili_gx || !oxili_gx->pd.power_on || !oxili_cx_gdsc.pd.power_on)
+	if (!oxili_gx || !oxili_gx->pd.power_on ||
+	    !oxili_cx || !oxili_cx->pd.power_on)
 		return -ENODEV;
 
 	ret = oxili_gx->pd.power_on(&oxili_gx->pd);
 	if (ret)
 		return ret;
 
-	ret = oxili_cx_gdsc.pd.power_on(&oxili_cx_gdsc.pd);
+	ret = oxili_cx->pd.power_on(&oxili_cx->pd);
 	if (!ret)
 		oxili_pre_gpu_voted = true;
 	return ret;
@@ -2678,9 +2720,14 @@ static int mmcc_msm8994_probe(struct platform_device *pdev)
 
 	if (of_device_is_compatible(pdev->dev.of_node, "qcom,mmcc-msm8994")) {
 		oxili_gx = &oxili_gx_gdsc_8994;
+		oxili_cx = &oxili_cx_gdsc_8994;
 		mmcc_msm8994_gdscs[OXILI_GX_GDSC] = oxili_gx;
+		mmcc_msm8994_gdscs[OXILI_CX_GDSC] = oxili_cx;
+		mmcc_msm8994_gdscs[MDSS_GDSC] = &mdss_gdsc_8994;
+		pr_info("talkman-mdss: MDSS_GDSC idle-PC (clamp then off)\n");
 	} else {
 		oxili_gx = &oxili_gx_gdsc;
+		oxili_cx = &oxili_cx_gdsc;
 	}
 
 	if (of_device_is_compatible(pdev->dev.of_node, "qcom,mmcc-msm8992")) {
@@ -2735,6 +2782,7 @@ static int mmcc_msm8994_probe(struct platform_device *pdev)
 		oxili_gx_hw_power_on = oxili_gx->pd.power_on;
 		if (oxili_gx_hw_power_on)
 			oxili_gx->pd.power_on = oxili_gx_pd_power_on;
+		pr_info("talkman-gpu: OXILI_CX always-on (GX held)\n");
 	}
 	return 0;
 }

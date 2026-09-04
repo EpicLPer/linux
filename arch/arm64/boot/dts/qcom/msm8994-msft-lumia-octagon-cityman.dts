@@ -191,6 +191,16 @@
 	qcom,sync-dual-dsi;
 	qcom,master-dsi;
 
+	/*
+	 * 3.10 msm8994-mdss.dtsi: mmss_misc_phys 0xfd828000,
+	 * ulp-clamp 0x14, phyreset 0x108. CAF listed size 0x108;
+	 * map 0x110 so the phyreset write is inside the window.
+	 */
+	reg = <0xfd998000 0x260>, <0xfd828000 0x110>;
+	reg-names = "dsi_ctrl", "mmss_misc";
+	qcom,mmss-ulp-clamp-ctrl-offset = <0x14>;
+	qcom,mmss-phyreset-ctrl-offset = <0x108>;
+
 	panel@0 {
 		compatible = "microsoft,sergej-wqhd-cmd";
 		reg = <0>;
@@ -247,6 +257,11 @@
 
 	qcom,dual-dsi-mode;
 	qcom,sync-dual-dsi;
+
+	reg = <0xfd9a0000 0x260>, <0xfd828000 0x110>;
+	reg-names = "dsi_ctrl", "mmss_misc";
+	qcom,mmss-ulp-clamp-ctrl-offset = <0x14>;
+	qcom,mmss-phyreset-ctrl-offset = <0x108>;
 
 	/*
 	 * CAF 8994 clock_mmss and 3.10 mdss_dsi@fd9a0000 parent

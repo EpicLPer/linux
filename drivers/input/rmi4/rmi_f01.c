@@ -668,8 +668,13 @@ static int rmi_f01_resume(struct rmi_function *fn)
 	f01->device_control.ctrl0 &= ~RMI_F01_CTRL0_SLEEP_MODE_MASK;
 	f01->device_control.ctrl0 |= RMI_SLEEP_MODE_NORMAL;
 
+	if (of_machine_is_compatible("qcom,msm8994"))
+		dev_info(&fn->dev, "talkman-rmi: f01 write 0x%02x\n",
+			 f01->device_control.ctrl0);
 	error = rmi_write(fn->rmi_dev, fn->fd.control_base_addr,
 			  f01->device_control.ctrl0);
+	if (of_machine_is_compatible("qcom,msm8994"))
+		dev_info(&fn->dev, "talkman-rmi: f01 write ret=%d\n", error);
 	if (error) {
 		dev_err(&fn->dev,
 			"Failed to restore normal operation: %d.\n", error);

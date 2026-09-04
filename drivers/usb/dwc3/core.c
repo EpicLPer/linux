@@ -2858,11 +2858,24 @@ EXPORT_SYMBOL_GPL(dwc3_pm_prepare);
 
 static int dwc3_plat_suspend(struct device *dev)
 {
+	/*
+	 * 3.10 core.c dwc3_suspend: if glue registered
+	 * notify_event, dwc3_notify_event() returns 0 and
+	 * the child does nothing. dwc3_msm_notify_event has
+	 * no CORE_PM_SUSPEND case. SYSTEM_SLEEP only.
+	 */
+	if (of_machine_is_compatible("qcom,msm8994")) {
+		dev_info(dev,
+			 "talkman-usb: skip child s2idle (3.10 glue notify)\n");
+		return 0;
+	}
 	return dwc3_pm_suspend(dev_get_drvdata(dev));
 }
 
 static int dwc3_plat_resume(struct device *dev)
 {
+	if (of_machine_is_compatible("qcom,msm8994"))
+		return 0;
 	return dwc3_pm_resume(dev_get_drvdata(dev));
 }
 

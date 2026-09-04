@@ -398,6 +398,18 @@ static int adreno_system_suspend(struct device *dev)
 	if (!gpu)
 		return 0;
 
+	/*
+	 * testDX pstore: force_suspend collapsed GX; GPU SMMU
+	 * resume then pre_gpu_power -EINVAL and lk1st. Living
+	 * testCJ keeps the hw_init runtime get. Do not collapse
+	 * GX on s2idle (idle-PC experiments stay parked).
+	 */
+	if (adreno_is_a430(to_adreno_gpu(gpu)) &&
+	    of_machine_is_compatible("qcom,msm8994")) {
+		dev_info(dev, "talkman-gpu: skip s2idle (GX held)\n");
+		return 0;
+	}
+
 	suspend_scheduler(gpu);
 
 	remaining = wait_event_timeout(gpu->retire_event,
@@ -422,6 +434,10 @@ static int adreno_system_resume(struct device *dev)
 	struct msm_gpu *gpu = dev_to_gpu(dev);
 
 	if (!gpu)
+		return 0;
+
+	if (adreno_is_a430(to_adreno_gpu(gpu)) &&
+	    of_machine_is_compatible("qcom,msm8994"))
 		return 0;
 
 	resume_scheduler(gpu);

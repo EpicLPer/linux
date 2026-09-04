@@ -22,6 +22,7 @@
 #include <linux/iopoll.h>
 #include <linux/usb/hcd.h>
 #include <linux/usb.h>
+#include <linux/delay.h>
 #include "core.h"
 
 /* USB QSCRATCH Hardware registers */
@@ -427,14 +428,33 @@ static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
 {
 	u32 val;
 	int i, ret;
+	bool phy_in_l2 = true;
 
 	if (qcom->is_suspended)
 		return 0;
 
 	for (i = 0; i < qcom->num_ports; i++) {
 		val = readl(qcom->qscratch_base + pwr_evnt_irq_stat_reg[i]);
-		if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
+		if (!(val & PWR_EVNT_LPM_IN_L2_MASK)) {
 			dev_err(qcom->dev, "port-%d HS-PHY not in L2\n", i + 1);
+			phy_in_l2 = false;
+		}
+	}
+
+	/*
+	 * 3.10 dwc3_msm_prepare_suspend writes
+	 * ENBLSLPM|SUSPHY, waits 5 ms, returns -EBUSY if
+	 * PWR_EVNT L2 never sets ("LPM is not performed").
+	 * No clk_disable / power-collapse. testFV wrote
+	 * SUSPHY then leave-clks after the child had already
+	 * gadget_suspend+core_exit; both USB nodes resumed
+	 * ok; host never saw the gadget. Do not attempt
+	 * SUSPHY when not already in L2.
+	 */
+	if (!phy_in_l2) {
+		dev_info(qcom->dev,
+			 "talkman-usb: leave clks (PHY not L2, 3.10 -EBUSY)\n");
+		return 0;
 	}
 
 	for (i = qcom->num_clocks - 1; i >= 0; i--)
@@ -867,13 +887,41 @@ static int __maybe_unused dwc3_qcom_pm_suspend(struct device *dev)
 {
 	struct dwc3_qcom *qcom = dev_get_drvdata(dev);
 	bool wakeup = device_may_wakeup(dev);
-	int ret;
+	bool phy_in_l2 = true;
+	u32 val;
+	int i, ret;
+
+	/*
+	 * 3.10 dwc3_msm_pm_suspend: if (!in_lpm) {
+	 *   "Abort PM suspend!! (USB is outside LPM)"
+	 *   return -EBUSY;
+	 * }
+	 * It does not write SUSPHY here. L2/LPM is runtime.
+	 * A connected gadget is not in LPM. Returning 0
+	 * (testFA–FX leave-clks) lets s2idle continue,
+	 * noirq masks the gadget IRQ, host drops the port.
+	 * SYSTEM_SLEEP only.
+	 */
+	if (of_machine_is_compatible("qcom,msm8994")) {
+		for (i = 0; i < qcom->num_ports; i++) {
+			val = readl(qcom->qscratch_base +
+				    pwr_evnt_irq_stat_reg[i]);
+			if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
+				phy_in_l2 = false;
+		}
+		if (!phy_in_l2) {
+			dev_err(dev,
+				"talkman-usb: Abort PM suspend!! (USB is outside LPM)\n");
+			return -EBUSY;
+		}
+	}
 
 	ret = dwc3_qcom_suspend(qcom, wakeup);
 	if (ret)
 		return ret;
 
-	qcom->pm_suspended = true;
+	if (qcom->is_suspended)
+		qcom->pm_suspended = true;
 
 	return 0;
 }

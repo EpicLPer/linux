@@ -5,6 +5,7 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/io.h>
 #include <linux/sort.h>
 
 #include <drm/drm_atomic.h>
@@ -19,6 +20,9 @@
 
 #include "mdp5_kms.h"
 #include "msm_gem.h"
+#ifdef CONFIG_DRM_MSM_DSI
+#include "dsi/dsi.h"
+#endif
 
 #define CURSOR_WIDTH	64
 #define CURSOR_HEIGHT	64
@@ -50,6 +54,7 @@ struct mdp5_crtc {
 	struct mdp_irq pp_done;
 
 	struct completion pp_completion;
+	u32 pp_done_seen;
 
 	bool lm_cursor_enabled;
 
@@ -85,6 +90,8 @@ static void request_pending(struct drm_crtc *crtc, uint32_t pending)
 static void request_pp_done_pending(struct drm_crtc *crtc)
 {
 	struct mdp5_crtc *mdp5_crtc = to_mdp5_crtc(crtc);
+
+	mdp5_crtc->pp_done_seen = 0;
 	reinit_completion(&mdp5_crtc->pp_completion);
 }
 
@@ -545,6 +552,11 @@ static void mdp5_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	pm_runtime_get_sync(dev);
 
+	/*
+	 * 3.10 overlay_start (hw_init + INTF_SEL + tearcheck
+	 * setup) is mdp5_overlay_start_before_planes, before
+	 * pipes. Do not replay it here after the plane flush.
+	 */
 	if (mdp5_crtc->lm_cursor_enabled && !mdp5_cstate->pipeline.r_mixer) {
 		/*
 		 * Restore LM cursor state, as it might have been lost
@@ -635,7 +647,17 @@ static int mdp5_crtc_setup_pipeline(struct drm_crtc *crtc,
 
 	if ((intf->type == INTF_DSI) &&
 	    (intf->mode == MDP5_INTF_DSI_MODE_COMMAND)) {
+		/*
+		 * 3.10 mdss_mdp_cmd_kickoff enables PING_PONG_COMP
+		 * on both mixers; mdss_mdp_display_wait4pingpong
+		 * waits on master then slave. Waiting on the left
+		 * pingpong alone lets the next CTL_START run while
+		 * the right mixer is still in flight.
+		 */
 		mdp5_cstate->pp_done_irqmask = lm2ppdone(pipeline->mixer);
+		if (pipeline->r_mixer)
+			mdp5_cstate->pp_done_irqmask |=
+				lm2ppdone(pipeline->r_mixer);
 		mdp5_cstate->cmd_mode = true;
 	} else {
 		mdp5_cstate->pp_done_irqmask = 0;
@@ -829,20 +851,18 @@ static void mdp5_crtc_atomic_flush(struct drm_crtc *crtc,
 	blend_setup(crtc);
 
 	/* PP_DONE irq is only used by command mode for now.
-	 * It is better to request pending before FLUSH and START trigger
-	 * to make sure no pp_done irq missed.
-	 * This is safe because no pp_done will happen before SW trigger
-	 * in command mode.
+	 * 3.10 enables both PING_PONG_COMP irqs before
+	 * CTL_START. Program the mask and INTR_EN first.
 	 */
-	if (mdp5_cstate->cmd_mode)
-		request_pp_done_pending(crtc);
-
-	mdp5_crtc->flushed_mask = crtc_flush_all(crtc);
-
-	/* XXX are we leaking out state here? */
 	mdp5_crtc->vblank.irqmask = mdp5_cstate->vblank_irqmask;
 	mdp5_crtc->err.irqmask = mdp5_cstate->err_irqmask;
 	mdp5_crtc->pp_done.irqmask = mdp5_cstate->pp_done_irqmask;
+	if (mdp5_cstate->cmd_mode)
+		request_pp_done_pending(crtc);
+	if (mdp5_crtc->pp_done.registered || mdp5_crtc->err.registered)
+		mdp_irq_update(&get_kms(crtc)->base);
+
+	mdp5_crtc->flushed_mask = crtc_flush_all(crtc);
 
 	request_pending(crtc, PENDING_FLIP);
 }
@@ -1217,8 +1237,11 @@ static void mdp5_crtc_pp_done_irq(struct mdp_irq *irq, uint32_t irqstatus)
 {
 	struct mdp5_crtc *mdp5_crtc = container_of(irq, struct mdp5_crtc,
 								pp_done);
+	u32 mask = irq->irqmask;
 
-	complete_all(&mdp5_crtc->pp_completion);
+	mdp5_crtc->pp_done_seen |= irqstatus;
+	if (mask && (mdp5_crtc->pp_done_seen & mask) == mask)
+		complete_all(&mdp5_crtc->pp_completion);
 }
 
 static void mdp5_crtc_wait_for_pp_done(struct drm_crtc *crtc)
@@ -1226,13 +1249,80 @@ static void mdp5_crtc_wait_for_pp_done(struct drm_crtc *crtc)
 	struct drm_device *dev = crtc->dev;
 	struct mdp5_crtc *mdp5_crtc = to_mdp5_crtc(crtc);
 	struct mdp5_crtc_state *mdp5_cstate = to_mdp5_crtc_state(crtc->state);
+	struct mdp5_kms *mdp5_kms = get_kms(crtc);
+	struct mdp5_hw_mixer *r_mixer = mdp5_cstate->pipeline.r_mixer;
+	u32 mask = mdp5_cstate->pp_done_irqmask;
 	int ret;
 
 	ret = wait_for_completion_timeout(&mdp5_crtc->pp_completion,
 						msecs_to_jiffies(50));
-	if (ret == 0)
-		dev_warn_ratelimited(dev->dev, "pp done time out, lm=%d\n",
-				     mdp5_cstate->pipeline.mixer->lm);
+	if (ret == 0) {
+		u32 status, pending;
+
+		/*
+		 * 3.10 mdss_mdp_cmd_wait4pingpong: "pp done but
+		 * irq not triggered" — bit latched in INTR_STATUS
+		 * with EN clear.
+		 */
+		status = mdp5_read(mdp5_kms, REG_MDP5_INTR_STATUS);
+		pending = status & mask;
+		if (pending) {
+			pr_warn_ratelimited(
+				"talkman-mdss: pp done but irq not triggered lm=%d/%d status=%08x\n",
+				mdp5_cstate->pipeline.mixer->lm,
+				r_mixer ? r_mixer->lm : -1, status);
+			mdp5_write(mdp5_kms, REG_MDP5_INTR_CLEAR, pending);
+			mdp5_crtc->pp_done_seen |= pending;
+			if (mask && (mdp5_crtc->pp_done_seen & mask) == mask)
+				return;
+		}
+		dev_warn_ratelimited(dev->dev,
+			"pp done time out, lm=%d/%d seen=%08x mask=%08x status=%08x\n",
+			mdp5_cstate->pipeline.mixer->lm,
+			r_mixer ? r_mixer->lm : -1,
+			mdp5_crtc->pp_done_seen, mask, status);
+		if (status) {
+
+			pr_info("talkman-mdss: hang smp0=%08x lyr0_2=%08x lyr1_5=%08x pp2_te=%08x pp2_h=%08x vbif_rd=%08x vbif_wr=%08x\n",
+				mdp5_read(mdp5_kms, REG_MDP5_SMP_ALLOC_W_REG(0)),
+				mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(0, 2)),
+				mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(1, 5)),
+				mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(2)),
+				mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(2)),
+				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0xb0) : 0,
+				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0xc0) : 0);
+			pr_info("talkman-mdss: hang dma0 sz=%08x addr=%08x cur=%08x fmt=%08x fetch=%08x lm2=%08x lm5=%08x intf=%08x\n",
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_SIZE(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC0_ADDR(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_CURRENT_SRC0_ADDR(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_FORMAT(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_FETCH_CONFIG(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_LM_OUT_SIZE(2)),
+				mdp5_read(mdp5_kms, REG_MDP5_LM_OUT_SIZE(5)),
+				mdp5_read(mdp5_kms, REG_MDP5_DISP_INTF_SEL));
+			pr_info("talkman-mdss: hang clk0=%08x halt0=%08x halt1=%08x\n",
+				mdp5_read(mdp5_kms, 0x2ac),
+				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0x200) : 0,
+				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0x204) : 0);
+			pr_info("talkman-mdss: hang dma0 stride=%08x op=%08x qos=%08x wm0=%08x panic=%08x smpr0=%08x\n",
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_STRIDE_A(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_OP_MODE(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_FETCH_CONFIG(SSPP_DMA0) + 0x24),
+				mdp5_read(mdp5_kms, REG_MDP5_PIPE_REQPRIO_FIFO_WM_0(SSPP_DMA0)),
+				mdp5_read(mdp5_kms, 0x178),
+				mdp5_read(mdp5_kms, REG_MDP5_SMP_ALLOC_R_REG(0)));
+#ifdef CONFIG_DRM_MSM_DSI
+			{
+				struct msm_kms *kms = &mdp5_kms->base.base;
+				int dsi;
+
+				for (dsi = 0; dsi < MSM_DSI_CONTROLLER_COUNT; dsi++)
+					if (kms->dsi[dsi] && kms->dsi[dsi]->host)
+						msm_dsi_host_dump_hang(kms->dsi[dsi]->host);
+			}
+#endif
+		}
+	}
 }
 
 static void mdp5_crtc_wait_for_flush_done(struct drm_crtc *crtc)

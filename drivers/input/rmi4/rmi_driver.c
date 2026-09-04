@@ -1005,12 +1005,25 @@ int rmi_driver_resume(struct rmi_device *rmi_dev, bool clear_wake)
 {
 	int retval;
 
-	rmi_enable_irq(rmi_dev, clear_wake);
-
+	/*
+	 * 3.10 synaptics_rmi4_resume: sensor_wake, then irq_enable.
+	 * Enabling the edge IRQ first runs rmi_process_interrupt_requests
+	 * (EDGE_FALLING) while F01 is still in SENSOR_SLEEP. That I2C
+	 * path is what follows keep-L22 on Octagon s2idle resume.
+	 */
+	if (of_machine_is_compatible("qcom,msm8994"))
+		dev_info(&rmi_dev->dev, "talkman-rmi: resume_functions\n");
 	retval = rmi_resume_functions(rmi_dev);
+	if (of_machine_is_compatible("qcom,msm8994"))
+		dev_info(&rmi_dev->dev,
+			 "talkman-rmi: resume_functions ret=%d irq\n", retval);
 	if (retval)
-		dev_warn(&rmi_dev->dev, "Failed to suspend functions: %d\n",
+		dev_warn(&rmi_dev->dev, "Failed to resume functions: %d\n",
 			retval);
+
+	rmi_enable_irq(rmi_dev, clear_wake);
+	if (of_machine_is_compatible("qcom,msm8994"))
+		dev_info(&rmi_dev->dev, "talkman-rmi: enable_irq done\n");
 
 	return retval;
 }

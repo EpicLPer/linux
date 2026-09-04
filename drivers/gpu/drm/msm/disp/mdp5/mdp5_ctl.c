@@ -132,9 +132,14 @@ static void set_display_intf(struct mdp5_kms *mdp5_kms,
  * !ppb_ctl: MSM8994 dual-LM. 3.10 mmo msm8994-mdss.dtsi has
  * no has-dst-split; nppb==0 BUG()s in pp_split_display_enable.
  * CMD split is BIT(1)|BIT(8) only, no PPB.
+ *
+ * 3.10 mdss_mdp_ctl_stop writes SPLIT_DISPLAY_EN=0 (and PPB 0 for
+ * dest-split) before GDSC collapse. mdss_mdp_ctl_restore writes it
+ * back on the next update. Mainline previously only programmed enable.
  */
 static bool mdp5_cmd_split_display(struct mdp5_kms *mdp5_kms,
-				   struct mdp5_interface *intf)
+				   struct mdp5_interface *intf,
+				   bool enable)
 {
 	const struct mdp5_cfg_hw *hw;
 	struct mdp5_interface slave = { };
@@ -153,6 +158,19 @@ static bool mdp5_cmd_split_display(struct mdp5_kms *mdp5_kms,
 	if (hw->intf.connect[intf->num + 1] != INTF_DSI)
 		return false;
 
+	dest_split = hw->pp_split.ppb_ctl != 0;
+
+	if (!enable) {
+		if (dest_split) {
+			mdp5_write(mdp5_kms, hw->pp_split.ppb_cfg, 0);
+			mdp5_write(mdp5_kms, hw->pp_split.ppb_ctl, 0);
+		}
+		mdp5_write(mdp5_kms, hw->pp_split.split_display_upper, 0);
+		mdp5_write(mdp5_kms, hw->pp_split.split_display_lower, 0);
+		mdp5_write(mdp5_kms, hw->pp_split.split_display_en, 0);
+		return true;
+	}
+
 	slave.num = intf->num + 1;
 	slave.type = INTF_DSI;
 	slave.mode = MDP5_INTF_DSI_MODE_COMMAND;
@@ -164,7 +182,6 @@ static bool mdp5_cmd_split_display(struct mdp5_kms *mdp5_kms,
 	else
 		lower |= BIT(8);
 
-	dest_split = hw->pp_split.ppb_ctl != 0;
 	if (dest_split)
 		lower |= BIT(2);
 
@@ -238,7 +255,11 @@ int mdp5_ctl_set_pipeline(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline)
 	if (!mdp5_cfg_intf_is_virtual(intf->type))
 		set_display_intf(mdp5_kms, intf);
 
-	mdp5_cmd_split_display(mdp5_kms, intf);
+	if (pipeline->sintf &&
+	    !mdp5_cfg_intf_is_virtual(pipeline->sintf->type))
+		set_display_intf(mdp5_kms, pipeline->sintf);
+
+	mdp5_cmd_split_display(mdp5_kms, intf, true);
 
 	set_ctl_op(ctl, pipeline);
 
@@ -251,7 +272,51 @@ int mdp5_ctl_set_pipeline(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline)
 		set_ctl_op(pipeline->sctl, &slave);
 	}
 
+	if (mdp5_cmd_dual_lm(
+		    mdp5_cfg_get_hw_config(mdp5_kms->cfg), intf)) {
+		const struct mdp5_cfg_hw *hw =
+			mdp5_cfg_get_hw_config(mdp5_kms->cfg);
+		u32 intf_sel = mdp5_read(mdp5_kms, REG_MDP5_DISP_INTF_SEL);
+		u32 split = hw ? mdp5_read(mdp5_kms,
+					   hw->pp_split.split_display_en) : 0;
+		u32 cop = ctl_read(ctl, REG_MDP5_CTL_OP(ctl->id));
+		u32 sop = 0;
+		int sid = -1;
+
+		if (pipeline->sctl) {
+			sid = pipeline->sctl->id;
+			sop = ctl_read(pipeline->sctl,
+				       REG_MDP5_CTL_OP(pipeline->sctl->id));
+		}
+		pr_info("talkman-mdss: overlay_start intf_sel=%08x split=%08x ctl%d_op=%08x sctl%d_op=%08x lm=%d/%d\n",
+			intf_sel, split, ctl->id, cop, sid, sop,
+			pipeline->mixer ? pipeline->mixer->lm : -1,
+			pipeline->r_mixer ? pipeline->r_mixer->lm : -1);
+	}
+
 	return 0;
+}
+
+void mdp5_ctl_cmd_split_display(struct mdp5_ctl *ctl,
+				struct mdp5_pipeline *pipeline,
+				bool enable)
+{
+	if (!ctl || !pipeline || !pipeline->intf)
+		return;
+
+	mdp5_cmd_split_display(get_kms(ctl->ctlm), pipeline->intf, enable);
+}
+
+void mdp5_ctl_clear_op(struct mdp5_ctl *ctl)
+{
+	unsigned long flags;
+
+	if (!ctl)
+		return;
+
+	spin_lock_irqsave(&ctl->hw_lock, flags);
+	ctl_write(ctl, REG_MDP5_CTL_OP(ctl->id), 0);
+	spin_unlock_irqrestore(&ctl->hw_lock, flags);
 }
 
 static bool start_signal_needed(struct mdp5_ctl *ctl,
@@ -288,6 +353,23 @@ static void send_start_signal(struct mdp5_ctl *ctl)
 	spin_unlock_irqrestore(&ctl->hw_lock, flags);
 }
 
+static void kickoff_start(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline)
+{
+	if (start_signal_needed(ctl, pipeline))
+		send_start_signal(ctl);
+	/*
+	 * 3.10 mdss_mdp_cmd_kickoff writes CTL_START on the
+	 * master only (intf_cmd.c ~1045). SPLIT_DISPLAY_EN
+	 * starts the slave. Starting sctl too fires INTF2
+	 * on its own; after POWER_OFF that leaves
+	 * CMD_MODE_MDP_BUSY set and PP_DONE never latches.
+	 */
+	if (pipeline->sctl &&
+	    pipeline->intf->mode != MDP5_INTF_DSI_MODE_COMMAND &&
+	    start_signal_needed(pipeline->sctl, pipeline))
+		send_start_signal(pipeline->sctl);
+}
+
 /**
  * mdp5_ctl_set_encoder_state() - set the encoder state
  *
@@ -313,10 +395,7 @@ int mdp5_ctl_set_encoder_state(struct mdp5_ctl *ctl,
 	if (pipeline->sctl)
 		pipeline->sctl->encoder_enabled = enabled;
 
-	if (start_signal_needed(ctl, pipeline))
-		send_start_signal(ctl);
-	if (pipeline->sctl && start_signal_needed(pipeline->sctl, pipeline))
-		send_start_signal(pipeline->sctl);
+	kickoff_start(ctl, pipeline);
 
 	return 0;
 }
@@ -655,10 +734,7 @@ u32 mdp5_ctl_commit(struct mdp5_ctl *ctl,
 		}
 	}
 
-	if (start_signal_needed(ctl, pipeline))
-		send_start_signal(ctl);
-	if (pipeline->sctl && start_signal_needed(pipeline->sctl, pipeline))
-		send_start_signal(pipeline->sctl);
+	kickoff_start(ctl, pipeline);
 
 	return curr_ctl_flush_mask;
 }
