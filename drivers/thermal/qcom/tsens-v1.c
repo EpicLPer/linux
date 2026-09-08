@@ -256,3 +256,107 @@ const struct tsens_plat_data data_ipq5018 = {
 	.feat		= &tsens_v1_no_rpm_feat,
 	.fields		= tsens_v1_regfields,
 };
+
+/*
+ * MSM8994 is TSENS v1 with 16 sensors. 3.10 (msm8974-tsens,
+ * qcom,msm8994-tsens) used 10-bit ADC + VALID@bit14, TM_Sn_STATUS
+ * at TM+0x44, and never waited on TRDY. The 11-sensor v1 table
+ * stops at cpu3 and drops gpu + A57.
+ *
+ * Two-point fuses are in QFPROM (3.10 tsens_calib_8994_sensors).
+ * The old eeprom window at 0xfc4bc000 is not a safe qfprom node
+ * on this SoC, so use the 3.10 calibrationless constants.
+ * MSM8992 has a different 13-sensor packing — do not bind this
+ * plat data there.
+ */
+static int calibrate_8994(struct tsens_priv *priv)
+{
+	u32 p1[16];
+	int i;
+
+	for (i = 0; i < priv->num_sensors; i++)
+		p1[i] = 532;
+
+	compute_intercept_slope(priv, p1, NULL, NO_PT_CALIB);
+	return 0;
+}
+
+static struct tsens_features tsens_8994_feat = {
+	.ver_major	= VER_1_X,
+	.crit_int	= 0,
+	.combo_int	= 0,
+	.adc		= 1,
+	.srot_split	= 1,
+	.max_sensors	= 16,
+	.trip_min_temp	= -40000,
+	.trip_max_temp	= 120000,
+};
+
+static const struct reg_field tsens_8994_regfields[MAX_REGFIELDS] = {
+	[VER_MAJOR] = REG_FIELD(SROT_HW_VER_OFF, 28, 31),
+	[VER_MINOR] = REG_FIELD(SROT_HW_VER_OFF, 16, 27),
+	[VER_STEP]  = REG_FIELD(SROT_HW_VER_OFF,  0, 15),
+	[TSENS_EN]     = REG_FIELD(SROT_CTRL_OFF, 0,  0),
+	[TSENS_SW_RST] = REG_FIELD(SROT_CTRL_OFF, 1,  1),
+	[SENSOR_EN]    = REG_FIELD(SROT_CTRL_OFF, 3, 18),
+
+	[INT_EN]     = REG_FIELD(TM_INT_EN_OFF, 0, 0),
+
+	REG_FIELD_FOR_EACH_SENSOR16(LOW_THRESH,    TM_Sn_UPPER_LOWER_STATUS_CTRL_OFF,  0,  9),
+	REG_FIELD_FOR_EACH_SENSOR16(UP_THRESH,     TM_Sn_UPPER_LOWER_STATUS_CTRL_OFF, 10, 19),
+	REG_FIELD_FOR_EACH_SENSOR16(LOW_INT_CLEAR, TM_Sn_UPPER_LOWER_STATUS_CTRL_OFF, 20, 20),
+	REG_FIELD_FOR_EACH_SENSOR16(UP_INT_CLEAR,  TM_Sn_UPPER_LOWER_STATUS_CTRL_OFF, 21, 21),
+	[LOW_INT_STATUS_0] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  0,  0),
+	[LOW_INT_STATUS_1] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  1,  1),
+	[LOW_INT_STATUS_2] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  2,  2),
+	[LOW_INT_STATUS_3] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  3,  3),
+	[LOW_INT_STATUS_4] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  4,  4),
+	[LOW_INT_STATUS_5] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  5,  5),
+	[LOW_INT_STATUS_6] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  6,  6),
+	[LOW_INT_STATUS_7] = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  7,  7),
+	[UP_INT_STATUS_0]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  8,  8),
+	[UP_INT_STATUS_1]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF,  9,  9),
+	[UP_INT_STATUS_2]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF, 10, 10),
+	[UP_INT_STATUS_3]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF, 11, 11),
+	[UP_INT_STATUS_4]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF, 12, 12),
+	[UP_INT_STATUS_5]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF, 13, 13),
+	[UP_INT_STATUS_6]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF, 14, 14),
+	[UP_INT_STATUS_7]  = REG_FIELD(TM_HIGH_LOW_INT_STATUS_OFF, 15, 15),
+
+	REG_FIELD_FOR_EACH_SENSOR16(LAST_TEMP,    TM_Sn_STATUS_OFF,  0,  9),
+	REG_FIELD_FOR_EACH_SENSOR16(VALID,        TM_Sn_STATUS_OFF, 14, 14),
+	REG_FIELD_FOR_EACH_SENSOR16(MIN_STATUS,   TM_Sn_STATUS_OFF, 10, 10),
+	REG_FIELD_FOR_EACH_SENSOR16(LOWER_STATUS, TM_Sn_STATUS_OFF, 11, 11),
+	REG_FIELD_FOR_EACH_SENSOR16(UPPER_STATUS, TM_Sn_STATUS_OFF, 12, 12),
+	REG_FIELD_FOR_EACH_SENSOR16(MAX_STATUS,   TM_Sn_STATUS_OFF, 13, 13),
+
+	[TRDY] = REG_FIELD(TM_TRDY_OFF, 0, 0),
+};
+
+static int __init init_8994(struct tsens_priv *priv)
+{
+	/* 3.10 msm8994.dtsi qcom,slope. Used if the fuse is not two-point. */
+	static const int slope[] = {
+		2901, 2846, 3200, 3200, 3200, 3200, 3200, 3200,
+		3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200,
+	};
+	int i;
+
+	for (i = 0; i < priv->num_sensors; i++)
+		priv->sensor[i].slope = slope[i];
+
+	return init_common(priv);
+}
+
+static const struct tsens_ops ops_8994 = {
+	.init		= init_8994,
+	.calibrate	= calibrate_8994,
+	.get_temp	= get_temp_tsens_valid,
+};
+
+struct tsens_plat_data data_8994 = {
+	.num_sensors	= 16,
+	.ops		= &ops_8994,
+	.feat		= &tsens_8994_feat,
+	.fields		= tsens_8994_regfields,
+};
