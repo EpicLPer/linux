@@ -9,6 +9,7 @@
 #include <linux/kthread.h>
 #include <linux/of.h>
 #include <linux/sched/mm.h>
+#include <linux/sizes.h>
 #include <uapi/linux/sched/types.h>
 
 #include <drm/drm_drv.h>
@@ -186,6 +187,8 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 	struct msm_drm_private *priv = dev->dev_private;
 	struct msm_kms *kms = priv->kms;
 	struct device *iommu_dev;
+	u64 va_start = 0x1000;
+	u64 va_size = 0x100000000ULL - 0x1000;
 
 	/*
 	 * IOMMUs can be a part of MDSS device tree binding, or the
@@ -204,8 +207,24 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 	if (IS_ERR(mmu))
 		return ERR_CAST(mmu);
 
+	/*
+	 * 3.10 mdss_iommu_map UNSECURE (mdss_mdp.c ~105):
+	 * start = SZ_128K, size = SZ_1G - SZ_128K.
+	 * Generic MDP started at 0x1000; after POWER_OFF GDSC
+	 * the next scanout IOVA was 0x3000 and DMA CURRENT
+	 * stayed 0 (first boot had been 0x01e13000).
+	 */
+	if (of_machine_is_compatible("qcom,msm8994") ||
+	    of_machine_is_compatible("qcom,msm8992")) {
+		va_start = SZ_128K;
+		va_size = SZ_1G - SZ_128K;
+	}
+
+	pr_info("talkman-mdss: mdp iova start=0x%llx size=0x%llx\n",
+		va_start, va_size);
+
 	vm = msm_gem_vm_create(dev, mmu, "mdp_kms",
-			       0x1000, 0x100000000 - 0x1000, true);
+			       va_start, va_size, true);
 	if (IS_ERR(vm)) {
 		dev_err(mdp_dev, "vm create, error %pe\n", vm);
 		mmu->funcs->destroy(mmu);

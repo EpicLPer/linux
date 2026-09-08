@@ -20,6 +20,8 @@
 
 #include "mdp5_kms.h"
 #include "msm_gem.h"
+
+void qcom_iommu_dump_mdp_hang(struct device *master);
 #ifdef CONFIG_DRM_MSM_DSI
 #include "dsi/dsi.h"
 #endif
@@ -236,7 +238,6 @@ static void blend_setup(struct drm_crtc *crtc)
 	int i, plane_cnt = 0;
 	bool bg_alpha_enabled = false;
 	u32 mixer_op_mode = 0;
-	u32 val;
 #define blender(stage)	((stage) - STAGE0)
 
 	spin_lock_irqsave(&mdp5_crtc->lm_lock, flags);
@@ -350,14 +351,11 @@ static void blend_setup(struct drm_crtc *crtc)
 		}
 	}
 
-	val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(lm));
-	mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(lm),
-		   val | mixer_op_mode);
-	if (r_mixer) {
-		val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm));
-		mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm),
-			   val | mixer_op_mode);
-	}
+	/*
+	 * 3.10 mdss_mdp_mixer_setup before CTL_FLUSH. Also
+	 * ctl_start_sub (overlay_start_before_planes).
+	 */
+	mdp5_crtc_mixer_geometry(crtc, mixer_op_mode);
 
 	mdp5_ctl_blend(ctl, pipeline, stage, r_stage, plane_cnt,
 		       ctl_blend_flags);
@@ -365,15 +363,58 @@ out:
 	spin_unlock_irqrestore(&mdp5_crtc->lm_lock, flags);
 }
 
+/*
+ * 3.10 mdss_mdp_ctl_start_sub OUT_SIZE (~2621) and
+ * mdss_mdp_mixer_setup (~2977 / ~3161 src_split BIT(31) on the
+ * right mixer only). GDSC zeros both; AHB still reads the
+ * programmed copy after a too-late mode_set_nofb.
+ */
+void mdp5_crtc_mixer_geometry(struct drm_crtc *crtc, u32 mixer_op_mode)
+{
+	struct mdp5_crtc_state *mdp5_cstate;
+	struct mdp5_kms *mdp5_kms;
+	struct mdp5_hw_mixer *mixer, *r_mixer;
+	struct drm_display_mode *mode;
+	u32 mixer_width, outsize, val;
+	uint32_t lm;
+
+	if (WARN_ON(!crtc->state))
+		return;
+
+	mdp5_cstate = to_mdp5_crtc_state(crtc->state);
+	mixer = mdp5_cstate->pipeline.mixer;
+	if (!mixer)
+		return;
+
+	mdp5_kms = get_kms(crtc);
+	r_mixer = mdp5_cstate->pipeline.r_mixer;
+	lm = mixer->lm;
+	mode = &crtc->state->adjusted_mode;
+	mixer_width = mode->hdisplay;
+	if (r_mixer)
+		mixer_width /= 2;
+	outsize = MDP5_LM_OUT_SIZE_WIDTH(mixer_width) |
+		  MDP5_LM_OUT_SIZE_HEIGHT(mode->vdisplay);
+
+	mdp5_write(mdp5_kms, REG_MDP5_LM_OUT_SIZE(lm), outsize);
+	val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(lm));
+	val &= ~MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
+	mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(lm),
+		   val | mixer_op_mode);
+	if (r_mixer) {
+		u32 r_lm = r_mixer->lm;
+
+		mdp5_write(mdp5_kms, REG_MDP5_LM_OUT_SIZE(r_lm), outsize);
+		val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm));
+		val |= MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
+		mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm),
+			   val | mixer_op_mode);
+	}
+}
+
 static void mdp5_crtc_mode_set_nofb(struct drm_crtc *crtc)
 {
 	struct mdp5_crtc *mdp5_crtc = to_mdp5_crtc(crtc);
-	struct mdp5_crtc_state *mdp5_cstate = to_mdp5_crtc_state(crtc->state);
-	struct mdp5_kms *mdp5_kms = get_kms(crtc);
-	struct mdp5_hw_mixer *mixer = mdp5_cstate->pipeline.mixer;
-	struct mdp5_hw_mixer *r_mixer = mdp5_cstate->pipeline.r_mixer;
-	uint32_t lm = mixer->lm;
-	u32 mixer_width, val;
 	unsigned long flags;
 	struct drm_display_mode *mode;
 
@@ -381,36 +422,10 @@ static void mdp5_crtc_mode_set_nofb(struct drm_crtc *crtc)
 		return;
 
 	mode = &crtc->state->adjusted_mode;
-
 	DBG("%s: set mode: " DRM_MODE_FMT, crtc->name, DRM_MODE_ARG(mode));
 
-	mixer_width = mode->hdisplay;
-	if (r_mixer)
-		mixer_width /= 2;
-
 	spin_lock_irqsave(&mdp5_crtc->lm_lock, flags);
-	mdp5_write(mdp5_kms, REG_MDP5_LM_OUT_SIZE(lm),
-			MDP5_LM_OUT_SIZE_WIDTH(mixer_width) |
-			MDP5_LM_OUT_SIZE_HEIGHT(mode->vdisplay));
-
-	/* Assign mixer to LEFT side in source split mode */
-	val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(lm));
-	val &= ~MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
-	mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(lm), val);
-
-	if (r_mixer) {
-		u32 r_lm = r_mixer->lm;
-
-		mdp5_write(mdp5_kms, REG_MDP5_LM_OUT_SIZE(r_lm),
-			   MDP5_LM_OUT_SIZE_WIDTH(mixer_width) |
-			   MDP5_LM_OUT_SIZE_HEIGHT(mode->vdisplay));
-
-		/* Assign mixer to RIGHT side in source split mode */
-		val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm));
-		val |= MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
-		mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm), val);
-	}
-
+	mdp5_crtc_mixer_geometry(crtc, 0);
 	spin_unlock_irqrestore(&mdp5_crtc->lm_lock, flags);
 }
 
@@ -1256,7 +1271,10 @@ static void mdp5_crtc_wait_for_pp_done(struct drm_crtc *crtc)
 
 	ret = wait_for_completion_timeout(&mdp5_crtc->pp_completion,
 						msecs_to_jiffies(50));
-	if (ret == 0) {
+	if (ret != 0)
+		return;
+
+	{
 		u32 status, pending;
 
 		/*
@@ -1268,7 +1286,7 @@ static void mdp5_crtc_wait_for_pp_done(struct drm_crtc *crtc)
 		pending = status & mask;
 		if (pending) {
 			pr_warn_ratelimited(
-				"talkman-mdss: pp done but irq not triggered lm=%d/%d status=%08x\n",
+				"pp done but irq not triggered lm=%d/%d status=%08x\n",
 				mdp5_cstate->pipeline.mixer->lm,
 				r_mixer ? r_mixer->lm : -1, status);
 			mdp5_write(mdp5_kms, REG_MDP5_INTR_CLEAR, pending);
@@ -1281,47 +1299,6 @@ static void mdp5_crtc_wait_for_pp_done(struct drm_crtc *crtc)
 			mdp5_cstate->pipeline.mixer->lm,
 			r_mixer ? r_mixer->lm : -1,
 			mdp5_crtc->pp_done_seen, mask, status);
-		if (status) {
-
-			pr_info("talkman-mdss: hang smp0=%08x lyr0_2=%08x lyr1_5=%08x pp2_te=%08x pp2_h=%08x vbif_rd=%08x vbif_wr=%08x\n",
-				mdp5_read(mdp5_kms, REG_MDP5_SMP_ALLOC_W_REG(0)),
-				mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(0, 2)),
-				mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(1, 5)),
-				mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(2)),
-				mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(2)),
-				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0xb0) : 0,
-				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0xc0) : 0);
-			pr_info("talkman-mdss: hang dma0 sz=%08x addr=%08x cur=%08x fmt=%08x fetch=%08x lm2=%08x lm5=%08x intf=%08x\n",
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_SIZE(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC0_ADDR(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_CURRENT_SRC0_ADDR(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_FORMAT(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_FETCH_CONFIG(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_LM_OUT_SIZE(2)),
-				mdp5_read(mdp5_kms, REG_MDP5_LM_OUT_SIZE(5)),
-				mdp5_read(mdp5_kms, REG_MDP5_DISP_INTF_SEL));
-			pr_info("talkman-mdss: hang clk0=%08x halt0=%08x halt1=%08x\n",
-				mdp5_read(mdp5_kms, 0x2ac),
-				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0x200) : 0,
-				mdp5_kms->vbif ? readl_relaxed(mdp5_kms->vbif + 0x204) : 0);
-			pr_info("talkman-mdss: hang dma0 stride=%08x op=%08x qos=%08x wm0=%08x panic=%08x smpr0=%08x\n",
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_STRIDE_A(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_SRC_OP_MODE(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_FETCH_CONFIG(SSPP_DMA0) + 0x24),
-				mdp5_read(mdp5_kms, REG_MDP5_PIPE_REQPRIO_FIFO_WM_0(SSPP_DMA0)),
-				mdp5_read(mdp5_kms, 0x178),
-				mdp5_read(mdp5_kms, REG_MDP5_SMP_ALLOC_R_REG(0)));
-#ifdef CONFIG_DRM_MSM_DSI
-			{
-				struct msm_kms *kms = &mdp5_kms->base.base;
-				int dsi;
-
-				for (dsi = 0; dsi < MSM_DSI_CONTROLLER_COUNT; dsi++)
-					if (kms->dsi[dsi] && kms->dsi[dsi]->host)
-						msm_dsi_host_dump_hang(kms->dsi[dsi]->host);
-			}
-#endif
-		}
 	}
 }
 

@@ -910,6 +910,45 @@ static int dsi_mmss_clamp_ctrl(struct msm_dsi_host *msm_host, bool enable)
 	return 0;
 }
 
+/*
+ * 3.10 mdss_dsi_clamp_ctrl(0) after GDSC on. Full POWER_OFF
+ * never sets mmss_clamp, but GDSC collapse can still leave
+ * mmss phyrst/clamp asserted. Software-flag-only unclamp then
+ * never runs, clock lane stays STOP after phy_enable.
+ */
+static void dsi_mmss_clamp_hw_release(struct msm_dsi_host *msm_host)
+{
+	u32 clamp_reg, clamp_val, phyrst, mask;
+
+	if (!msm_host->mmss_misc)
+		return;
+
+	clamp_reg = dsi_mmss_clamp_mask(msm_host);
+	mask = (msm_host->id == DSI_0) ?
+		(clamp_reg | BIT(15)) :
+		((clamp_reg << 16) | BIT(31));
+	clamp_val = readl(msm_host->mmss_misc + msm_host->ulps_clamp_off);
+	phyrst = readl(msm_host->mmss_misc + msm_host->ulps_phyrst_off);
+	pr_info("talkman-mdss: mmss dsi%d clamp=%08x phyrst=%08x flag=%d mask=%08x\n",
+		msm_host->id, clamp_val, phyrst, msm_host->mmss_clamp, mask);
+	if (!phyrst && !(clamp_val & mask))
+		return;
+
+	writel_relaxed(0x0, msm_host->mmss_misc + msm_host->ulps_phyrst_off);
+	if (msm_host->id == DSI_0)
+		writel_relaxed(clamp_val & ~mask,
+			       msm_host->mmss_misc + msm_host->ulps_clamp_off);
+	else
+		writel_relaxed(clamp_val & ~mask,
+			       msm_host->mmss_misc + msm_host->ulps_clamp_off);
+	wmb();
+	msm_host->mmss_clamp = false;
+	pr_info("talkman-mdss: mmss dsi%d released clamp=%08x phyrst=%08x\n",
+		msm_host->id,
+		readl(msm_host->mmss_misc + msm_host->ulps_clamp_off),
+		readl(msm_host->mmss_misc + msm_host->ulps_phyrst_off));
+}
+
 static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi);
 static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 			struct msm_dsi_phy_shared_timings *phy_shared_timings,
@@ -1135,10 +1174,27 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 
 	data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(phy_shared_timings->clk_post) |
 		DSI_CLKOUT_TIMING_CTRL_T_CLK_PRE(phy_shared_timings->clk_pre);
+	/*
+	 * 3.10 mdss_dsi_ctrl_setup: t_clk_post/pre from panel DT
+	 * (Sergej qcom,mdss-dsi-t-clk-post=<0x5> t-clk-pre=<0x5e>),
+	 * masked to 6 bits, no T_CLK_PRE_EXTEND. Mainline calculated
+	 * CLKOUT is what first boot keeps after lk already put the
+	 * clock lane in HS; unlock after phy_disable must re-enter HS.
+	 */
+	if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G &&
+	    cfg_hnd->minor == MSM_DSI_6G_VER_MINOR_V1_3) {
+		pr_info("talkman-mdss: clkout calc=%08x pre=%u post=%u inc2=%d\n",
+			data, phy_shared_timings->clk_pre,
+			phy_shared_timings->clk_post,
+			phy_shared_timings->clk_pre_inc_by_2);
+		data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(0x5) |
+		       DSI_CLKOUT_TIMING_CTRL_T_CLK_PRE(0x5e);
+	}
 	dsi_write(msm_host, REG_DSI_CLKOUT_TIMING_CTRL, data);
 
 	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
 	    (cfg_hnd->minor > MSM_DSI_6G_VER_MINOR_V1_0) &&
+	    cfg_hnd->minor != MSM_DSI_6G_VER_MINOR_V1_3 &&
 	    phy_shared_timings->clk_pre_inc_by_2)
 		dsi_write(msm_host, REG_DSI_T_CLK_PRE_EXTEND,
 			  DSI_T_CLK_PRE_EXTEND_INC_BY_2_BYTECLK);
@@ -1183,6 +1239,18 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		dsi_read(msm_host, REG_DSI_CMD_MODE_MDP_CTRL2),
 		dsi_read(msm_host, REG_DSI_CTRL),
 		dsi_read(msm_host, REG_DSI_STATUS0));
+
+	/*
+	 * 3.10 mdss_dsi_ctrl_setup ends with mdss_dsi_lp_cd_rx:
+	 * Strength ctrl 1 after DSI_CTRL enable. phy_enable wrote
+	 * it before CTRL_0; POWER_OFF re-init needs the 3.10 order.
+	 */
+	if (phy)
+		msm_dsi_phy_lp_cd_rx(phy);
+
+	if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G &&
+	    cfg_hnd->minor == MSM_DSI_6G_VER_MINOR_V1_3)
+		dsi_mmss_clamp_hw_release(msm_host);
 
 	if (msm_host->cphy_mode)
 		dsi_write(msm_host, REG_DSI_CPHY_MODE_CTRL, BIT(0));
@@ -1457,34 +1525,42 @@ static void dsi_op_mode_config(struct msm_dsi_host *msm_host,
 	dsi_write(msm_host, REG_DSI_CTRL, dsi_ctrl);
 }
 
-void msm_dsi_host_dump_hang(struct mipi_dsi_host *host)
+/*
+ * 3.10 qcom,dsi-clk-ln-recovery on msm8994-mdss.dtsi (both
+ * controllers, HW_REV_103 / 6G v1.3). mdss_dsi_cmdlist_kickoff
+ * from_mdp calls mdss_dsi_start_hs_clk_lane before CTL_START:
+ * LANE_CTRL bit 28 (CLKLN_HS_FORCE_REQUEST). dsi_ctrl_enable
+ * only sets that bit when the panel is continuous-clock.
+ * Sergej is MIPI_DSI_CLOCK_NON_CONTINUOUS, so unlock after
+ * phy_disable left lnctl=0. DSI sat CMD_MDP_BUSY with HS
+ * FIFOs full while TE (GPIO) still ran.
+ */
+void msm_dsi_host_cmd_hs_clk_lane(struct mipi_dsi_host *host, bool enable)
 {
 	struct msm_dsi_host *msm_host;
+	u32 lane_ctrl;
 
 	if (!host)
 		return;
 	msm_host = to_msm_dsi_host(host);
-	if (!msm_host->ctrl_base)
+	if (!msm_host->ctrl_base || !msm_host->cfg_hnd)
+		return;
+	if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)
+		return;
+	if (msm_host->cfg_hnd->major != MSM_DSI_VER_MAJOR_6G ||
+	    msm_host->cfg_hnd->minor != MSM_DSI_6G_VER_MINOR_V1_3)
 		return;
 
-	pr_info("talkman-mdss: hang dsi%d ctrl=%08x st=%08x fifo=%08x lane=%08x lnctl=%08x trig=%08x intr=%08x\n",
-		msm_host->id,
-		dsi_read(msm_host, REG_DSI_CTRL),
-		dsi_read(msm_host, REG_DSI_STATUS0),
-		dsi_read(msm_host, REG_DSI_FIFO_STATUS),
-		dsi_read(msm_host, REG_DSI_LANE_STATUS),
-		dsi_read(msm_host, REG_DSI_LANE_CTRL),
-		dsi_read(msm_host, REG_DSI_TRIG_CTRL),
-		dsi_read(msm_host, REG_DSI_INTR_CTRL));
-	pr_info("talkman-mdss: hang dsi%d s0c=%08x s0t=%08x s1c=%08x s1t=%08x dma=%08x mdp2=%08x cfg0=%08x\n",
-		msm_host->id,
-		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL),
-		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL),
-		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL),
-		dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_TOTAL),
-		dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL),
-		dsi_read(msm_host, REG_DSI_CMD_MODE_MDP_CTRL2),
-		dsi_read(msm_host, REG_DSI_CMD_CFG0));
+	lane_ctrl = dsi_read(msm_host, REG_DSI_LANE_CTRL);
+	if (enable) {
+		if (lane_ctrl & DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST)
+			return;
+		lane_ctrl |= DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST;
+	} else {
+		lane_ctrl &= ~DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST;
+	}
+	dsi_write(msm_host, REG_DSI_LANE_CTRL, lane_ctrl);
+	wmb();
 }
 
 static void dsi_set_tx_power_mode(int mode, struct msm_dsi_host *msm_host)
@@ -2877,41 +2953,76 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		dev_name(&msm_host->pdev->dev));
 
 	pm_runtime_get_sync(&msm_host->pdev->dev);
-	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
-	if (!ret)
-		ret = cfg_hnd->ops->link_clk_enable(msm_host);
-	if (ret) {
-		pr_err("%s: failed to enable link clocks. ret=%d\n",
-		       __func__, ret);
-		goto fail_disable_reg;
-	}
-	pr_info("talkman-mdss: host_on clks %s\n",
-		dev_name(&msm_host->pdev->dev));
-
-	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
-	if (ret) {
-		pr_err("%s: failed to set pinctrl default state, %d\n",
-			__func__, ret);
-		goto fail_disable_clk;
-	}
-	pr_info("talkman-mdss: host_on pinctrl %s\n",
-		dev_name(&msm_host->pdev->dev));
 
 	/*
-	 * 3.10 mdss_dsi_on: ctrl_setup (mode_setup streams +
-	 * host_init) then sw_reset(restore). DSI_RESET does not
-	 * keep stream 1 if we never wrote it. Reset first, then
-	 * program both streams, then enable.
+	 * 3.10 mdss_dsi_on after POWER_OFF: bus clocks, phy
+	 * init + ctrl_setup, then link clocks, then
+	 * sw_reset(restore). Comment: phy and ctrl setup
+	 * before link clocks.
 	 */
-	dsi_sw_reset(msm_host);
-	pr_info("talkman-mdss: host_on reset %s\n",
-		dev_name(&msm_host->pdev->dev));
-	dsi_timing_setup(msm_host, is_bonded_dsi);
-	pr_info("talkman-mdss: host_on timing %s\n",
-		dev_name(&msm_host->pdev->dev));
-	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
-	pr_info("talkman-mdss: host_on ctrl %s\n",
-		dev_name(&msm_host->pdev->dev));
+	if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G &&
+	    cfg_hnd->minor == MSM_DSI_6G_VER_MINOR_V1_3) {
+		ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
+		if (ret) {
+			pr_err("%s: failed to set pinctrl default state, %d\n",
+			       __func__, ret);
+			goto fail_disable_reg;
+		}
+		pr_info("talkman-mdss: host_on pinctrl %s\n",
+			dev_name(&msm_host->pdev->dev));
+		pr_info("talkman-mdss: host_on 3.10 ctrl_before_link %s\n",
+			dev_name(&msm_host->pdev->dev));
+		dsi_timing_setup(msm_host, is_bonded_dsi);
+		pr_info("talkman-mdss: host_on timing %s\n",
+			dev_name(&msm_host->pdev->dev));
+		dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+		pr_info("talkman-mdss: host_on ctrl %s\n",
+			dev_name(&msm_host->pdev->dev));
+		ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+		if (!ret)
+			ret = cfg_hnd->ops->link_clk_enable(msm_host);
+		if (ret) {
+			pr_err("%s: failed to enable link clocks. ret=%d\n",
+			       __func__, ret);
+			pm_runtime_put(&msm_host->pdev->dev);
+			goto fail_disable_reg;
+		}
+		pr_info("talkman-mdss: host_on clks %s\n",
+			dev_name(&msm_host->pdev->dev));
+		dsi_sw_reset(msm_host);
+		pr_info("talkman-mdss: host_on reset %s\n",
+			dev_name(&msm_host->pdev->dev));
+	} else {
+		ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+		if (!ret)
+			ret = cfg_hnd->ops->link_clk_enable(msm_host);
+		if (ret) {
+			pr_err("%s: failed to enable link clocks. ret=%d\n",
+			       __func__, ret);
+			goto fail_disable_reg;
+		}
+		pr_info("talkman-mdss: host_on clks %s\n",
+			dev_name(&msm_host->pdev->dev));
+
+		ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
+		if (ret) {
+			pr_err("%s: failed to set pinctrl default state, %d\n",
+				__func__, ret);
+			goto fail_disable_clk;
+		}
+		pr_info("talkman-mdss: host_on pinctrl %s\n",
+			dev_name(&msm_host->pdev->dev));
+
+		dsi_sw_reset(msm_host);
+		pr_info("talkman-mdss: host_on reset %s\n",
+			dev_name(&msm_host->pdev->dev));
+		dsi_timing_setup(msm_host, is_bonded_dsi);
+		pr_info("talkman-mdss: host_on timing %s\n",
+			dev_name(&msm_host->pdev->dev));
+		dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+		pr_info("talkman-mdss: host_on ctrl %s\n",
+			dev_name(&msm_host->pdev->dev));
+	}
 
 	msm_host->power_on = true;
 	mutex_unlock(&msm_host->dev_mutex);

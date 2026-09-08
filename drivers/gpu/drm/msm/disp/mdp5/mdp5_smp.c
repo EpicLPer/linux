@@ -5,6 +5,8 @@
  * Author: Rob Clark <robdclark@gmail.com>
  */
 
+#include <linux/bitmap.h>
+#include <linux/bits.h>
 #include <linux/string.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_util.h>
@@ -27,8 +29,6 @@ struct mdp5_smp {
 	u32 pipe_reqprio_fifo_wm0[SSPP_MAX];
 	u32 pipe_reqprio_fifo_wm1[SSPP_MAX];
 	u32 pipe_reqprio_fifo_wm2[SSPP_MAX];
-
-	bool restore_after_pc;
 };
 
 static inline
@@ -249,6 +249,69 @@ static unsigned update_smp_state(struct mdp5_smp *smp,
 	return nblks;
 }
 
+/*
+ * 3.10 msm8994-mdss.dtsi qcom,mdss-pipe-*-fixed-mmb. RGB/VIG
+ * MMBs are tied to fetch IDs; DMA allocates from 28-43.
+ * mdss_mdp_smp_alloc writes those ties every commit so a
+ * GDSC wipe without a new reservation still programs ALLOC.
+ */
+static const struct {
+	u8 cid;
+	u8 n;
+	u8 mmb[5];
+} msm8994_fixed_mmb[] = {
+	{ 16, 5, { 0, 1, 8,  9, 10 } },
+	{ 17, 5, { 2, 3, 11, 12, 13 } },
+	{ 18, 5, { 4, 5, 14, 15, 16 } },
+	{ 22, 5, { 6, 7, 17, 18, 19 } },
+	{  1, 2, { 20, 24 } },
+	{  4, 2, { 21, 25 } },
+	{  7, 2, { 22, 26 } },
+	{ 19, 2, { 23, 27 } },
+};
+
+static void smp_set_mmb_client(struct mdp5_smp *smp, unsigned int blk, u32 cid)
+{
+	int idx = blk / 3;
+	int fld = blk % 3;
+	u32 val;
+
+	if (blk >= smp->blk_cnt || idx >= ARRAY_SIZE(smp->alloc_w))
+		return;
+
+	val = smp->alloc_w[idx];
+	switch (fld) {
+	case 0:
+		val &= ~MDP5_SMP_ALLOC_W_REG_CLIENT0__MASK;
+		val |= MDP5_SMP_ALLOC_W_REG_CLIENT0(cid);
+		break;
+	case 1:
+		val &= ~MDP5_SMP_ALLOC_W_REG_CLIENT1__MASK;
+		val |= MDP5_SMP_ALLOC_W_REG_CLIENT1(cid);
+		break;
+	case 2:
+		val &= ~MDP5_SMP_ALLOC_W_REG_CLIENT2__MASK;
+		val |= MDP5_SMP_ALLOC_W_REG_CLIENT2(cid);
+		break;
+	}
+	smp->alloc_w[idx] = val;
+	smp->alloc_r[idx] = val;
+}
+
+static void smp_program_fixed_8994(struct mdp5_smp *smp)
+{
+	int i, j;
+
+	if (smp->blk_cnt < 28)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(msm8994_fixed_mmb); i++) {
+		for (j = 0; j < msm8994_fixed_mmb[i].n; j++)
+			smp_set_mmb_client(smp, msm8994_fixed_mmb[i].mmb[j],
+					   msm8994_fixed_mmb[i].cid);
+	}
+}
+
 static void write_smp_alloc_regs(struct mdp5_smp *smp)
 {
 	struct mdp5_kms *mdp5_kms = get_kms(smp);
@@ -297,37 +360,41 @@ void mdp5_smp_reset_cache(struct mdp5_smp *smp)
 	memset(smp->pipe_reqprio_fifo_wm0, 0, sizeof(smp->pipe_reqprio_fifo_wm0));
 	memset(smp->pipe_reqprio_fifo_wm1, 0, sizeof(smp->pipe_reqprio_fifo_wm1));
 	memset(smp->pipe_reqprio_fifo_wm2, 0, sizeof(smp->pipe_reqprio_fifo_wm2));
-	smp->restore_after_pc = true;
 	pr_info("talkman-mdss: smp cache reset after gdsc\n");
 }
 
-void mdp5_smp_prepare_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state,
-			     unsigned long staged_pipes)
+void mdp5_smp_prepare_commit(struct mdp5_smp *smp, struct mdp5_smp_state *state)
 {
 	enum mdp5_pipe pipe;
-	unsigned long pipes = state->assigned | staged_pipes;
+	unsigned long in_use = state->assigned;
+	int i;
 
 	/*
-	 * 3.10 mdss_mdp_smp_alloc (mdss_mdp_pipe.c ~589): every
-	 * overlay_queue_pipes kickoff rewrites MMBs + WM from that
-	 * staged pipe's allocated bitmap. Comment: hw reset can wipe
-	 * SMP without a new reservation.
-	 *
-	 * Mainline clears assigned at the end of prepare_commit, so
-	 * overlay_start reset_cache would write the zeroed caches
-	 * unless the staged drm planes are OR'd in. Do not walk every
-	 * hwpipe's client_state (testHE leftover RGB smpr0=00111010).
-	 * Do not write LM_OUT_SIZE (testHD).
+	 * 3.10 smp_alloc: rewrite fixed MMBs and staged-pipe
+	 * allocated bitmaps every commit. assigned-only skipped
+	 * the rewrite after GDSC when reservation did not change.
 	 */
-	if (smp->restore_after_pc) {
-		smp->restore_after_pc = false;
-		if (staged_pipes && !state->assigned)
-			pr_info("talkman-mdss: smp_alloc staged pipes=%lx\n",
-				staged_pipes);
+	smp_program_fixed_8994(smp);
+
+	for (pipe = 0; pipe < SSPP_MAX; pipe++) {
+		if (!mdp5_cfg->smp.clients[pipe])
+			continue;
+		for (i = 0; i < pipe2nclients(pipe); i++) {
+			u32 cid = pipe2client(pipe, i);
+
+			if (!cid)
+				continue;
+			if (!bitmap_empty(state->client_state[cid],
+					  smp->blk_cnt))
+				in_use |= BIT(pipe);
+		}
 	}
 
-	for_each_set_bit(pipe, &pipes, sizeof(pipes) * 8) {
-		unsigned i, nblks = 0;
+	for_each_set_bit(pipe, &in_use, sizeof(in_use) * 8) {
+		unsigned nblks = 0;
+
+		if (pipe >= SSPP_MAX)
+			break;
 
 		for (i = 0; i < pipe2nclients(pipe); i++) {
 			u32 cid = pipe2client(pipe, i);

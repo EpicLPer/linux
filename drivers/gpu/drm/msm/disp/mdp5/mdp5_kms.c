@@ -8,8 +8,11 @@
 #include <linux/delay.h>
 #include <linux/interconnect.h>
 #include <linux/iopoll.h>
+#include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/of_platform.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/soc/qcom/smd-rpm.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_crtc.h>
@@ -24,6 +27,11 @@
 #include "mdp5_kms.h"
 
 void qcom_iommu_restore_ctx_after_pc(struct device *master);
+void qcom_iommu_dump_mdp_hang(struct device *master);
+void qcom_iommu_mdp_hold(struct device *master);
+void qcom_iommu_mdp_release(struct device *master);
+void qcom_iommu_mdp_kickoff_attach(struct device *master);
+void qcom_iommu_mdp_kickoff_done(struct device *master);
 
 /*
  * 3.10 SEC_DEVICE_MDSS. GDSC notifier and overlay_start both
@@ -84,6 +92,55 @@ static void mdp5_restore_vbif_qos(struct mdp5_kms *mdp5_kms)
 	 */
 	writel_relaxed(1, mdp5_kms->vbif + 0x004);
 
+	/*
+	 * 3.10 mdss_mdp_vbif_axi_halt is power-off drain (never
+	 * called on 8994 restore). After GDSC CTRL0 can stay 1
+	 * while CTRL1 already looks idle, so that drain would
+	 * skip the clear. Always release AXI halt before OT.
+	 */
+	{
+		u32 a0 = readl_relaxed(mdp5_kms->vbif + 0x208);
+		u32 a1 = readl_relaxed(mdp5_kms->vbif + 0x20C);
+
+		writel_relaxed(0, mdp5_kms->vbif + 0x208);
+		pr_info("talkman-mdss: vbif axi halt was %08x/%08x now %08x\n",
+			a0, a1, readl_relaxed(mdp5_kms->vbif + 0x208));
+	}
+
+	/*
+	 * 3.10 msm8974-mdss.dtsi qcom,vbif-settings. 8994 DT
+	 * omitted them, so mdss_hw_init never replayed AMEMTYPE
+	 * / round-robin after POWER_OFF GDSC. First boot kept
+	 * lk splash (CURRENT moved); unlock POR 0 left the DMA
+	 * xin idle with DSI CMD_MDP_BUSY. Same offsets as DPU
+	 * VBIF_OUT_AXI_AMEMTYPE_CONF0/1 (0x160/0x164).
+	 */
+	{
+		static const struct {
+			u32 off;
+			u32 val;
+		} vbif_settings[] = {
+			{ 0x0d8, 0x00000707 },
+			{ 0x0f0, 0x00000030 },
+			{ 0x124, 0x00000001 },
+			{ 0x178, 0x00000fff },
+			{ 0x17c, 0x0fff0fff },
+			{ 0x160, 0x22222222 },
+			{ 0x164, 0x00002222 },
+		};
+		unsigned int s;
+
+		for (s = 0; s < ARRAY_SIZE(vbif_settings); s++)
+			writel_relaxed(vbif_settings[s].val,
+				       mdp5_kms->vbif + vbif_settings[s].off);
+		wmb();
+		pr_info("talkman-mdss: vbif splash amem0=%08x amem1=%08x rr=%08x d8=%08x\n",
+			readl_relaxed(mdp5_kms->vbif + 0x160),
+			readl_relaxed(mdp5_kms->vbif + 0x164),
+			readl_relaxed(mdp5_kms->vbif + 0x124),
+			readl_relaxed(mdp5_kms->vbif + 0x0d8));
+	}
+
 	for (i = 0; i < ARRAY_SIZE(msm8994_vbif_rt_qos); i++) {
 		val = readl_relaxed(mdp5_kms->vbif + 0x20 + i * 4);
 		qos = msm8994_vbif_rt_qos[i];
@@ -136,45 +193,150 @@ static void mdp5_restore_vbif_qos(struct mdp5_kms *mdp5_kms)
 	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL1, clk1 | MDP5_DMA_CLK_FORCE_ON);
 }
 
+/*
+ * 3.10 mdss_mdp_set_ot_limit in pipe_queue, after image_setup
+ * and immediately before smp_alloc / kickoff. Restore already
+ * wrote OT=16; this re-cycles the DMA xins on live pipes.
+ */
+void mdp5_vbif_ot_kickoff(struct mdp5_kms *mdp5_kms)
+{
+	u32 clk0, clk1, rd0;
+
+	if (!mdp5_kms->vbif)
+		return;
+
+	/*
+	 * 3.10 get_ot_limit: if RD_LIM already matches, return 0
+	 * and skip the xin halt. Restore wrote OT=16; a second
+	 * halt on the live DMA xins at START is not 3.10.
+	 */
+	rd0 = readl_relaxed(mdp5_kms->vbif + 0xb0);
+	if (rd0 == 0x10101010)
+		return;
+
+	clk0 = mdp5_read(mdp5_kms, MDP5_SSPP_CLK_CTRL0);
+	clk1 = mdp5_read(mdp5_kms, MDP5_SSPP_CLK_CTRL1);
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL0, clk0 | MDP5_DMA_CLK_FORCE_ON);
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL1, clk1 | MDP5_DMA_CLK_FORCE_ON);
+	wmb();
+	mdp5_vbif_xin_halt_cycle(mdp5_kms, 2);
+	mdp5_vbif_xin_halt_cycle(mdp5_kms, 10);
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL0, clk0 | MDP5_DMA_CLK_FORCE_ON);
+	mdp5_write(mdp5_kms, MDP5_SSPP_CLK_CTRL1, clk1 | MDP5_DMA_CLK_FORCE_ON);
+}
+
 void mdp5_sspp_clk_force_on(struct mdp5_kms *mdp5_kms, enum mdp5_pipe pipe)
 {
-	u32 off, bit, val;
+	u32 off, bit, st_bit, val, st;
+	int rc;
 
 	switch (pipe) {
 	case SSPP_DMA0:
 		off = MDP5_SSPP_CLK_CTRL0;
 		bit = MDP5_DMA_CLK_FORCE_ON;
+		st_bit = BIT(12);
 		break;
 	case SSPP_DMA1:
 		off = MDP5_SSPP_CLK_CTRL1;
 		bit = MDP5_DMA_CLK_FORCE_ON;
+		st_bit = BIT(12);
 		break;
 	case SSPP_VIG0:
 		off = MDP5_SSPP_CLK_CTRL0;
 		bit = BIT(0);
+		st_bit = BIT(0);
 		break;
 	case SSPP_VIG1:
 		off = MDP5_SSPP_CLK_CTRL1;
 		bit = BIT(0);
+		st_bit = BIT(0);
 		break;
 	case SSPP_RGB0:
 		off = MDP5_SSPP_CLK_CTRL0;
 		bit = BIT(4);
+		st_bit = BIT(8);
 		break;
 	case SSPP_RGB1:
 		off = MDP5_SSPP_CLK_CTRL1;
 		bit = BIT(4);
+		st_bit = BIT(8);
 		break;
 	default:
 		return;
 	}
 
+	/*
+	 * 3.10 pipe-*-clk-ctrl-offsets: status is ctrl+4.
+	 * DMA <0x2AC 8 12>. After GDSC FORCE_ON can be set
+	 * while CGC status stays 0 and fetch never starts.
+	 * Do not skip the wait just because the force bit
+	 * already reads back.
+	 */
 	val = mdp5_read(mdp5_kms, off);
-	if (val & bit)
+	if (!(val & bit)) {
+		mdp5_write(mdp5_kms, off, val | bit);
+		wmb();
+		pr_info("talkman-mdss: sspp clk force-on pipe=%d %03x=%08x\n",
+			pipe, off, val | bit);
+	}
+	rc = readl_poll_timeout(mdp5_kms->mmio + off + 4, st, st & st_bit,
+				1, 1000);
+	if (rc)
+		pr_info("talkman-mdss: sspp clk status pipe=%d ctrl=%08x stat=%08x\n",
+			pipe, mdp5_read(mdp5_kms, off), st);
+}
+
+
+/*
+ * 3.10 mdss_mdp_config_cx_voltage: RPM misc "svs+" on
+ * footswitch enable (qcom,mdss-en-svs-high). rpmpd CX/MX
+ * corners are a different vote; this flag is the 8994 extra.
+ */
+#define MDP5_RPM_MISC		0x6373696d
+#define MDP5_RPM_SVS_PLUS	0x2B737673
+
+static void mdp5_vote_svs_plus(bool enable)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct qcom_smd_rpm *rpm;
+	struct {
+		__le32 key;
+		__le32 nbytes;
+		__le32 value;
+	} req = {
+		.key = cpu_to_le32(MDP5_RPM_SVS_PLUS),
+		.nbytes = cpu_to_le32(sizeof(u32)),
+		.value = cpu_to_le32(enable),
+	};
+	int ret;
+
+	np = of_find_compatible_node(NULL, NULL, "qcom,rpmcc-msm8994");
+	if (!np) {
+		pr_info("talkman-mdss: svs+ skip (no rpmcc)\n");
 		return;
-	mdp5_write(mdp5_kms, off, val | bit);
-	pr_info("talkman-mdss: sspp clk force-on pipe=%d %03x=%08x\n",
-		pipe, off, val | bit);
+	}
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev) {
+		pr_info("talkman-mdss: svs+ skip (no rpmcc pdev)\n");
+		return;
+	}
+	rpm = dev_get_drvdata(pdev->dev.parent);
+	put_device(&pdev->dev);
+	if (!rpm) {
+		pr_info("talkman-mdss: svs+ skip (no rpm drvdata)\n");
+		return;
+	}
+
+	ret = qcom_rpm_smd_write(rpm, QCOM_SMD_RPM_ACTIVE_STATE,
+				 MDP5_RPM_MISC, 0, &req, sizeof(req));
+	if (ret)
+		pr_info("talkman-mdss: svs+ active en=%u ret=%d\n",
+			enable, ret);
+	ret = qcom_rpm_smd_write(rpm, QCOM_SMD_RPM_SLEEP_STATE,
+				 MDP5_RPM_MISC, 0, &req, sizeof(req));
+	pr_info("talkman-mdss: svs+ en=%u sleep=%d\n", enable, ret);
 }
 
 /*
@@ -195,6 +357,18 @@ void mdp5_hw_reset_after_pc(struct mdp5_kms *mdp5_kms)
 	 */
 	if (!mdp5_kms->ctlm)
 		return;
+
+	mdp5_vote_svs_plus(true);
+
+	/*
+	 * 3.10 mdss_bus_bandwidth_ctrl is on before mdss_hw_init.
+	 * Vote both MDP ports before VBIF / mdp-settings so the
+	 * writes actually reach the fetch path after GDSC.
+	 */
+	if (mdp5_kms->path_mdp0)
+		icc_set_bw(mdp5_kms->path_mdp0, 0, MBps_to_icc(6400));
+	if (mdp5_kms->path_mdp1)
+		icc_set_bw(mdp5_kms->path_mdp1, 0, MBps_to_icc(6400));
 
 	hw = mdp5_cfg_get_hw_config(mdp5_kms->cfg);
 
@@ -267,6 +441,11 @@ void mdp5_hw_reset_after_pc(struct mdp5_kms *mdp5_kms)
 		pr_info("talkman-mdss: mdss_hw_init hist dspp=%u vig=%u\n",
 			hw->dspp.count, hw->pipe_vig.count);
 	}
+
+	if (mdp5_kms->path_mdp0)
+		icc_set_bw(mdp5_kms->path_mdp0, 0, MBps_to_icc(6400));
+	if (mdp5_kms->path_mdp1)
+		icc_set_bw(mdp5_kms->path_mdp1, 0, MBps_to_icc(6400));
 }
 
 static int mdp5_hw_init(struct msm_kms *kms)
@@ -442,39 +621,35 @@ static void mdp5_overlay_start_before_planes(struct mdp5_kms *mdp5_kms,
 		if (!cs->ctl || !cs->pipeline.intf)
 			continue;
 		mdp5_ctl_set_pipeline(cs->ctl, &cs->pipeline);
-		if (cs->pipeline.intf->mode == MDP5_INTF_DSI_MODE_COMMAND)
+		if (cs->pipeline.intf->mode == MDP5_INTF_DSI_MODE_COMMAND) {
+			mdp5_cmd_restore_intf_format(mdp5_kms, &cs->pipeline);
 			mdp5_cmd_tearcheck_setup_crtc(crtc);
-		pr_info("talkman-mdss: overlay_start before planes\n");
-		pr_info("talkman-mdss: restore smp0=%08x lyr0_2=%08x lyr1_5=%08x pp2_h=%08x pp3_h=%08x te2=%08x te3=%08x\n",
+		}
+		/*
+		 * 3.10 ctl_start_sub writes LM_OUT_SIZE before
+		 * pipes. blend_setup repeats it every commit.
+		 */
+		mdp5_crtc_mixer_geometry(crtc, 0);
+		pr_info("talkman-mdss: overlay_start before planes lm=%d/%d\n",
+			cs->pipeline.mixer ? cs->pipeline.mixer->lm : -1,
+			cs->pipeline.r_mixer ? cs->pipeline.r_mixer->lm : -1);
+		pr_info("talkman-mdss: restore smp0=%08x lyr0_0=%08x lyr1_1=%08x pp0_h=%08x pp1_h=%08x te0=%08x te1=%08x\n",
 			mdp5_read(mdp5_kms, REG_MDP5_SMP_ALLOC_W_REG(0)),
-			mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(0, 2)),
-			mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(1, 5)),
-			mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(2)),
-			mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(3)),
-			mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(2)),
-			mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(3)));
+			mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(0, 0)),
+			mdp5_read(mdp5_kms, REG_MDP5_CTL_LAYER_REG(1, 1)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(0)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_SYNC_CONFIG_HEIGHT(1)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(0)),
+			mdp5_read(mdp5_kms, REG_MDP5_PP_TEAR_CHECK_EN(1)));
+		pr_info("talkman-mdss: restore intr_en=%08x i1_fmt=%08x i2_fmt=%08x i1_flc=%08x i2_flc=%08x i1_cfg=%08x i1_trig=%08x\n",
+			mdp5_read(mdp5_kms, REG_MDP5_INTR_EN),
+			mdp5_read(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(1)),
+			mdp5_read(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(2)),
+			mdp5_read(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(1)),
+			mdp5_read(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(2)),
+			mdp5_read(mdp5_kms, REG_MDP5_INTF_CONFIG(1)),
+			mdp5_read(mdp5_kms, REG_MDP5_INTF_DSI_CMD_MODE_TRIGGER_EN(1)));
 	}
-}
-
-static unsigned long mdp5_smp_staged_pipes(struct drm_atomic_commit *state)
-{
-	struct drm_plane *plane;
-	struct drm_plane_state *new_s;
-	unsigned long pipes = 0;
-	int i;
-
-	for_each_new_plane_in_state(state, plane, new_s, i) {
-		struct mdp5_plane_state *ps;
-
-		if (!new_s || !new_s->crtc || !new_s->fb)
-			continue;
-		ps = to_mdp5_plane_state(new_s);
-		if (ps->hwpipe)
-			pipes |= BIT(ps->hwpipe->pipe);
-		if (ps->r_hwpipe)
-			pipes |= BIT(ps->r_hwpipe->pipe);
-	}
-	return pipes;
 }
 
 static void mdp5_prepare_commit(struct msm_kms *kms, struct drm_atomic_commit *state)
@@ -487,8 +662,7 @@ static void mdp5_prepare_commit(struct msm_kms *kms, struct drm_atomic_commit *s
 	global_state = mdp5_get_existing_global_state(mdp5_kms);
 
 	if (mdp5_kms->smp)
-		mdp5_smp_prepare_commit(mdp5_kms->smp, &global_state->smp,
-					mdp5_smp_staged_pipes(state));
+		mdp5_smp_prepare_commit(mdp5_kms->smp, &global_state->smp);
 }
 
 static void mdp5_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
@@ -560,6 +734,9 @@ static int mdp5_disable(struct mdp5_kms *mdp5_kms)
 	mdp5_kms->enable_count--;
 	WARN_ON(mdp5_kms->enable_count < 0);
 
+	if (mdp5_kms->enable_count == 0)
+		qcom_iommu_mdp_release(&mdp5_kms->pdev->dev);
+
 	clk_disable_unprepare(mdp5_kms->tbu_rt_clk);
 	clk_disable_unprepare(mdp5_kms->tbu_clk);
 	clk_disable_unprepare(mdp5_kms->ahb_clk);
@@ -582,6 +759,9 @@ static int mdp5_enable(struct mdp5_kms *mdp5_kms)
 	clk_prepare_enable(mdp5_kms->lut_clk);
 	clk_prepare_enable(mdp5_kms->tbu_clk);
 	clk_prepare_enable(mdp5_kms->tbu_rt_clk);
+
+	if (mdp5_kms->enable_count == 1)
+		qcom_iommu_mdp_hold(&mdp5_kms->pdev->dev);
 
 	return 0;
 }
@@ -898,6 +1078,7 @@ static void mdp5_destroy(struct mdp5_kms *mdp5_kms)
 {
 	if (mdp5_kms->rpm_enabled)
 		pm_runtime_disable(&mdp5_kms->pdev->dev);
+	dev_pm_domain_detach_list(mdp5_kms->pd_list);
 
 	drm_atomic_private_obj_fini(&mdp5_kms->glob_state);
 }
@@ -1050,6 +1231,24 @@ static int mdp5_init(struct platform_device *pdev, struct drm_device *dev)
 	 */
 	clk_set_rate(mdp5_kms->core_clk, 200000000);
 
+	/*
+	 * Two rpmpd cells (CX + MX) skip platform auto-attach.
+	 * 8998 mdp votes MX; 3.10 8994 votes CX / svs-high. Both
+	 * after POWER_OFF or AXI fetch stays CURRENT=0.
+	 */
+	if (of_count_phandle_with_args(pdev->dev.of_node, "power-domains",
+				       "#power-domain-cells") > 1) {
+		static const struct dev_pm_domain_attach_data pd_data = {
+			.pd_flags = PD_FLAG_DEV_LINK_ON,
+		};
+
+		ret = dev_pm_domain_attach_list(&pdev->dev, &pd_data,
+						&mdp5_kms->pd_list);
+		if (ret < 0)
+			goto fail;
+		pr_info("talkman-mdss: attached %d power-domains\n", ret);
+	}
+
 	pm_runtime_enable(&pdev->dev);
 	mdp5_kms->rpm_enabled = true;
 
@@ -1107,8 +1306,9 @@ fail:
 	return ret;
 }
 
-static int mdp5_setup_interconnect(struct platform_device *pdev)
+static int mdp5_setup_interconnect(struct mdp5_kms *mdp5_kms)
 {
+	struct platform_device *pdev = mdp5_kms->pdev;
 	struct icc_path *path0 = msm_icc_get(&pdev->dev, "mdp0-mem");
 	struct icc_path *path1 = msm_icc_get(&pdev->dev, "mdp1-mem");
 	struct icc_path *path_rot = msm_icc_get(&pdev->dev, "rotator-mem");
@@ -1126,6 +1326,10 @@ static int mdp5_setup_interconnect(struct platform_device *pdev)
 		dev_warn(&pdev->dev, "No interconnect support may cause display underflows!\n");
 		return 0;
 	}
+
+	mdp5_kms->path_mdp0 = path0;
+	if (!IS_ERR_OR_NULL(path1))
+		mdp5_kms->path_mdp1 = path1;
 
 	icc_set_bw(path0, 0, MBps_to_icc(6400));
 
@@ -1151,11 +1355,11 @@ static int mdp5_dev_probe(struct platform_device *pdev)
 	if (!mdp5_kms)
 		return -ENOMEM;
 
-	ret = mdp5_setup_interconnect(pdev);
+	mdp5_kms->pdev = pdev;
+
+	ret = mdp5_setup_interconnect(mdp5_kms);
 	if (ret)
 		return ret;
-
-	mdp5_kms->pdev = pdev;
 
 	spin_lock_init(&mdp5_kms->resource_lock);
 

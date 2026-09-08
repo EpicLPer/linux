@@ -23,6 +23,9 @@
 #define DSI_ENCODER_MASTER	DSI_1
 #define DSI_ENCODER_SLAVE	DSI_0
 
+/* 3.10 !lp11_init reset-before-phy after POWER_OFF. */
+static bool sergej_need_reset_before_phy;
+
 struct msm_dsi_manager {
 	struct msm_dsi *dsi[DSI_MAX];
 
@@ -219,6 +222,7 @@ static void dsi_mgr_phy_disable(int id)
 	msm_dsi->phy_enabled = false;
 	if (IS_BONDED_DSI() && mdsi && sdsi) {
 		if (!mdsi->phy_enabled && !sdsi->phy_enabled) {
+			sergej_need_reset_before_phy = true;
 			msm_dsi_phy_disable(sdsi->phy);
 			msm_dsi_phy_disable(mdsi->phy);
 		}
@@ -253,6 +257,11 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 	DBG("id=%d", id);
 	pr_info("talkman-mdss: bridge_power_on id=%d bonded=%d\n",
 		id, is_bonded_dsi);
+
+	if (sergej_need_reset_before_phy) {
+		sergej_reset_before_phy();
+		sergej_need_reset_before_phy = false;
+	}
 
 	ret = dsi_mgr_phy_enable(id, phy_shared_timings);
 	if (ret)

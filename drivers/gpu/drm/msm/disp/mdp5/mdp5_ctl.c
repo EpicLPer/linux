@@ -3,9 +3,13 @@
  * Copyright (c) 2014-2015 The Linux Foundation. All rights reserved.
  */
 
+#include <linux/io.h>
 #include <linux/string_choices.h>
 #include "mdp5_kms.h"
 #include "mdp5_ctl.h"
+#ifdef CONFIG_DRM_MSM_DSI
+#include "dsi/dsi.h"
+#endif
 
 /*
  * CTL - MDP Control Pool Manager
@@ -355,6 +359,24 @@ static void send_start_signal(struct mdp5_ctl *ctl)
 
 static void kickoff_start(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline)
 {
+#ifdef CONFIG_DRM_MSM_DSI
+	/*
+	 * 3.10 mdss_dsi_start_hs_clk_lane before CTL_START
+	 * (cmdlist_kickoff from_mdp). Pulse clock-lane HS on
+	 * 8994 command mode; do it before START so the stream
+	 * can drain.
+	 */
+	if (pipeline->intf->type == INTF_DSI &&
+	    pipeline->intf->mode == MDP5_INTF_DSI_MODE_COMMAND) {
+		struct msm_kms *kms = &get_kms(ctl->ctlm)->base.base;
+		int i;
+
+		for (i = 0; i < MSM_DSI_CONTROLLER_COUNT; i++)
+			if (kms->dsi[i] && kms->dsi[i]->host)
+				msm_dsi_host_cmd_hs_clk_lane(
+					kms->dsi[i]->host, true);
+	}
+#endif
 	if (start_signal_needed(ctl, pipeline))
 		send_start_signal(ctl);
 	/*
@@ -371,15 +393,24 @@ static void kickoff_start(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline)
 }
 
 /**
- * mdp5_ctl_set_encoder_state() - set the encoder state
+ * mdp5_ctl_encoder_arm() - allow the next start=true commit to CTL_START
  *
- * @ctl:      the CTL instance
- * @pipeline: the encoder's INTF + MIXER configuration
- * @enabled:  true, when encoder is ready for data streaming; false, otherwise.
- *
- * Note:
- * This encoder state is needed to trigger START signal (data path kickoff).
+ * 3.10 flush_kickoff writes CTL_FLUSH then CTL_START together.
+ * set_encoder_state() STARTs immediately. After GDSC, a commit that
+ * skipped START (encoder_enabled still false) then a later START
+ * with no flush leaves SSPP CURRENT=0 while DSI sits CMD_MDP_BUSY.
  */
+void mdp5_ctl_encoder_arm(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline,
+			  bool enabled)
+{
+	if (WARN_ON(!ctl))
+		return;
+
+	ctl->encoder_enabled = enabled;
+	if (pipeline && pipeline->sctl)
+		pipeline->sctl->encoder_enabled = enabled;
+}
+
 int mdp5_ctl_set_encoder_state(struct mdp5_ctl *ctl,
 			       struct mdp5_pipeline *pipeline,
 			       bool enabled)
@@ -389,11 +420,8 @@ int mdp5_ctl_set_encoder_state(struct mdp5_ctl *ctl,
 	if (WARN_ON(!ctl))
 		return -EINVAL;
 
-	ctl->encoder_enabled = enabled;
+	mdp5_ctl_encoder_arm(ctl, pipeline, enabled);
 	DBG("intf_%d: %s", intf->num, str_on_off(enabled));
-
-	if (pipeline->sctl)
-		pipeline->sctl->encoder_enabled = enabled;
 
 	kickoff_start(ctl, pipeline);
 
@@ -733,6 +761,13 @@ u32 mdp5_ctl_commit(struct mdp5_ctl *ctl,
 			spin_unlock_irqrestore(&sctl->hw_lock, flags);
 		}
 	}
+
+	/*
+	 * 3.10 mdss_mdp_display_commit flush_kickoff: wmb() between
+	 * CTL_FLUSH and display_fnc (CTL_START).
+	 */
+	if (start)
+		wmb();
 
 	kickoff_start(ctl, pipeline);
 

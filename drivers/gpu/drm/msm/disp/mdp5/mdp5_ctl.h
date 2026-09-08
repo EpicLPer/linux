@@ -32,6 +32,8 @@ struct mdp5_pipeline;
 int mdp5_ctl_set_pipeline(struct mdp5_ctl *ctl, struct mdp5_pipeline *p);
 int mdp5_ctl_set_encoder_state(struct mdp5_ctl *ctl, struct mdp5_pipeline *p,
 			       bool enabled);
+void mdp5_ctl_encoder_arm(struct mdp5_ctl *ctl, struct mdp5_pipeline *p,
+			  bool enabled);
 void mdp5_ctl_cmd_split_display(struct mdp5_ctl *ctl, struct mdp5_pipeline *p,
 				bool enable);
 void mdp5_ctl_clear_op(struct mdp5_ctl *ctl);

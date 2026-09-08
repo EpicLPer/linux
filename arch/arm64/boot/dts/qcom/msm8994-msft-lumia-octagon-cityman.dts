@@ -107,6 +107,18 @@
  */
 &mdp {
 	reg = <0xfd901000 0x8f000>;
+	/*
+	 * 3.10 qcom,mdss-en-svs-high + footswitch vdd-cx at
+	 * SVS_SOC. Parent MDSS_GDSC does not vote CX; after
+	 * POWER_OFF the SoC rail can sit at SVS_KRAIT while
+	 * AHB still programs SSPP and AXI never fetches
+	 * (CURRENT=0, DSI CMD_MDP_BUSY). 8998 mdp votes
+	 * rpmpd the same way. NOM is above SVS+ for 400 MHz
+	 * dual-LM. Released when MDP runtime-suspends.
+	 */
+	power-domains = <&rpmpd MSM8994_VDDCX>, <&rpmpd MSM8994_VDDMX>;
+	power-domain-names = "cx", "mx";
+	required-opps = <&rpmpd_opp_nom>, <&rpmpd_opp_nom>;
 };
 
 /*

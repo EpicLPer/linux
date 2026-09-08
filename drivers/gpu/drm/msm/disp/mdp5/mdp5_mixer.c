@@ -77,25 +77,30 @@ int mdp5_mixer_assign(struct drm_atomic_commit *s, struct drm_crtc *crtc,
 
 			if (new_state->hwmixer_to_crtc[pair_idx])
 				continue;
-
-			*r_mixer = mdp5_kms->hwmixers[pair_idx];
 		}
 
 		/*
-		 * prefer a pair-able LM over an unpairable one. We can
-		 * switch the CRTC from Normal mode to Source Split mode
-		 * without requiring a full modeset if we had already
-		 * assigned this CRTC a pair-able LM.
+		 * Prefer a pair-able LM so a CRTC can enter source-split
+		 * without a full modeset. Keep the first pair: the old
+		 * "any PAIR overwrites" pick took LM2/LM5 on 8994 (last
+		 * PAIR in the catalog).
 		 *
-		 * TODO: There will be assignment sequences which would
-		 * result in the CRTC requiring a full modeset, even
-		 * if we have the LM resources to prevent it. For a platform
-		 * with a few displays, we don't run out of pair-able LMs
-		 * so easily. For now, ignore the possibility of requiring
-		 * a full modeset.
+		 * 3.10 mdss_mdp_mixer_alloc takes the first free INTF
+		 * mixer. ctl_setup errors on MIPI_CMD if mixer_left->num
+		 * >= 1 ("use only DSPP0 and DSPP1 with cmd split").
+		 * Cityman dual-DSI is that path: mixer 0 + mixer 1.
 		 */
-		if (!(*mixer) || cur->caps & MDP_LM_CAP_PAIR)
+		if (!(*mixer) ||
+		    ((cur->caps & MDP_LM_CAP_PAIR) &&
+		     !((*mixer)->caps & MDP_LM_CAP_PAIR))) {
 			*mixer = cur;
+			if (r_mixer) {
+				int pair_idx = get_right_pair_idx(mdp5_kms,
+								  cur->lm);
+
+				*r_mixer = mdp5_kms->hwmixers[pair_idx];
+			}
+		}
 	}
 
 	if (!(*mixer))
@@ -104,7 +109,8 @@ int mdp5_mixer_assign(struct drm_atomic_commit *s, struct drm_crtc *crtc,
 	if (r_mixer && !(*r_mixer))
 		return -ENOMEM;
 
-	DBG("assigning Layer Mixer %d to crtc %s", (*mixer)->lm, crtc->name);
+	pr_info("talkman-mdss: assigning LM%d/%d to %s\n",
+		(*mixer)->lm, r_mixer ? (*r_mixer)->lm : -1, crtc->name);
 
 	new_state->hwmixer_to_crtc[(*mixer)->idx] = crtc;
 	if (r_mixer) {

@@ -471,9 +471,17 @@ static const struct mdp5_cfg_hw msm8x94_config = {
 			[SSPP_RGB0] = 16, [SSPP_RGB1] = 17,
 			[SSPP_RGB2] = 18, [SSPP_RGB3] = 22,
 		},
-		.reserved_state[0] = GENMASK(23, 0),	/* first 24 MMBs */
+		/*
+		 * 3.10 msm8994-mdss.dtsi pipe-*-fixed-mmb (not
+		 * contiguous 0-19): RGB 0/1/8-10, 2/3/11-13,
+		 * 4/5/14-16, 6/7/17-19; VIG 20/24, 21/25, 22/26,
+		 * 23/27. Mainline GENMASK(23,0) left VIG's second
+		 * blocks (24-27) in the dynamic pool, so DMA0 took
+		 * MMB 24.
+		 */
+		.reserved_state[0] = GENMASK(27, 0),
 		.reserved = {
-			 [1] = 1,  [4] = 1,  [7] = 1, [19] = 1,
+			 [1] = 2,  [4] = 2,  [7] = 2, [19] = 2,
 			[16] = 5, [17] = 5, [18] = 5, [22] = 5,
 		},
 	},

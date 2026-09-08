@@ -70,7 +70,7 @@ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host,
 					u32 dma_base, u32 len);
 int msm_dsi_host_enable(struct mipi_dsi_host *host);
 int msm_dsi_host_disable(struct mipi_dsi_host *host);
-void msm_dsi_host_dump_hang(struct mipi_dsi_host *host);
+void msm_dsi_host_cmd_hs_clk_lane(struct mipi_dsi_host *host, bool enable);
 void msm_dsi_host_enable_irq(struct mipi_dsi_host *host);
 void msm_dsi_host_disable_irq(struct mipi_dsi_host *host);
 int msm_dsi_host_power_on(struct mipi_dsi_host *host,
@@ -156,7 +156,9 @@ int msm_dsi_phy_idle_pc_put(struct msm_dsi_phy *phy);
 int msm_dsi_phy_idle_pc_get(struct msm_dsi_phy *phy);
 void msm_dsi_phy_disable(struct msm_dsi_phy *phy);
 bool msm_dsi_phy_keep_on_blank(const struct msm_dsi_phy *phy);
+void msm_dsi_phy_lp_cd_rx(struct msm_dsi_phy *phy);
 bool msm_dsi_keep_phy_on_blank(struct msm_dsi *msm_dsi);
+void sergej_reset_before_phy(void);
 bool msm_dsi_idle_pc_blocks_gdsc(void);
 void msm_dsi_phy_set_usecase(struct msm_dsi_phy *phy,
 			     enum msm_dsi_phy_usecase uc);

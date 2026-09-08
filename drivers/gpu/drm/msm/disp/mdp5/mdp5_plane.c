@@ -811,11 +811,32 @@ static void mdp5_hwpipe_mode_set(struct mdp5_kms *mdp5_kms,
 	mdp5_write(mdp5_kms, REG_MDP5_PIPE_SRC_ADDR_SW_STATUS(pipe), 0);
 
 	/*
+	 * 3.10 image_setup / format_setup never program these for
+	 * linear DMA. After GDSC POR is not always 0 (lk leftover
+	 * hid that on first boot). Force the 3.10 unused values.
+	 */
+	mdp5_write(mdp5_kms, REG_MDP5_PIPE_STILE_FRAME_SIZE(pipe), 0);
+	mdp5_write(mdp5_kms, REG_MDP5_PIPE_SRC_CONSTANT_COLOR(pipe), 0);
+	mdp5_write(mdp5_kms, REG_MDP5_PIPE_VC1_RANGE(pipe), 0);
+	/* 3.10 SSPP_QOS_CTRL 0x06c; 8994 panic is COMMON 0x178. */
+	mdp5_write(mdp5_kms, REG_MDP5_PIPE_SRC_SIZE(pipe) + 0x06c, 0);
+
+	/*
 	 * 3.10 MDSS_MDP_FETCH_CONFIG_RESET_VALUE 0x87 (also DPU).
 	 * Written for tiled there; lk programs it for linear too.
 	 * After POWER_OFF GDSC the reg is 0; first boot kept lk.
 	 */
 	mdp5_write(mdp5_kms, REG_MDP5_PIPE_FETCH_CONFIG(pipe), 0x87);
+
+	/*
+	 * 3.10 mdss_mdp_image_setup always writes
+	 * SSPP_DECIMATION_CONFIG (pipe.c ~1540), including 0
+	 * for DMA. MDP5 only wrote it with CAP_SCALE, so after
+	 * GDSC DMA kept POR junk and CURRENT stayed 0.
+	 */
+	mdp5_write(mdp5_kms, REG_MDP5_PIPE_DECIMATION(pipe),
+		   MDP5_PIPE_DECIMATION_VERT(vdecm) |
+		   MDP5_PIPE_DECIMATION_HORZ(hdecm));
 
 	if (hwpipe->caps & MDP_PIPE_CAP_SW_PIX_EXT)
 		mdp5_write_pixel_ext(mdp5_kms, pipe, format,
@@ -831,9 +852,6 @@ static void mdp5_hwpipe_mode_set(struct mdp5_kms *mdp5_kms,
 				step->x[COMP_1_2]);
 		mdp5_write(mdp5_kms, REG_MDP5_PIPE_SCALE_CR_PHASE_STEP_Y(pipe),
 				step->y[COMP_1_2]);
-		mdp5_write(mdp5_kms, REG_MDP5_PIPE_DECIMATION(pipe),
-				MDP5_PIPE_DECIMATION_VERT(vdecm) |
-				MDP5_PIPE_DECIMATION_HORZ(hdecm));
 		mdp5_write(mdp5_kms, REG_MDP5_PIPE_SCALE_CONFIG(pipe),
 			   scale_config);
 	}
@@ -999,6 +1017,28 @@ uint32_t mdp5_plane_get_flush(struct drm_plane *plane)
 		mask |= pstate->r_hwpipe->flush_mask;
 
 	return mask;
+}
+
+/*
+ * 3.10 mdss_mdp_pipe_queue_data runs image_setup + src_addr
+ * after mdss_iommu_ctrl(1) and immediately before kickoff
+ * (pipe.c ~1811, overlay.c ~1905). DRM commit_planes writes
+ * SSPP before encoder enable's SMMU restore; after GDSC that
+ * leaves CURRENT=0. Replay the live plane into the pipe now.
+ */
+void mdp5_plane_kickoff_queue(struct drm_plane *plane)
+{
+	struct drm_plane_state *state = plane->state;
+	int ret;
+
+	if (!state || !plane_enabled(state) || !state->crtc || !state->fb)
+		return;
+
+	ret = mdp5_plane_mode_set(plane, state->crtc, state->fb,
+				  &state->src, &state->dst);
+	if (ret)
+		pr_info("talkman-mdss: kickoff queue %s ret=%d\n",
+			plane->name, ret);
 }
 
 static const uint32_t mdp5_plane_formats[] = {

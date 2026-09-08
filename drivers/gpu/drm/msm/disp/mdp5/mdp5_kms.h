@@ -7,6 +7,7 @@
 #ifndef __MDP5_KMS_H__
 #define __MDP5_KMS_H__
 
+#include <linux/pm_domain.h>
 #include "msm_drv.h"
 #include "msm_kms.h"
 #include "disp/mdp_kms.h"
@@ -16,6 +17,8 @@
 #include "mdp5_mixer.h"
 #include "mdp5_ctl.h"
 #include "mdp5_smp.h"
+
+struct icc_path;
 
 struct mdp5_kms {
 	struct mdp_kms base;
@@ -59,12 +62,21 @@ struct mdp5_kms {
 	struct clk *vsync_clk;
 
 	/*
+	 * 3.10 msm-bus num-paths = 2 (masters 22/23). Re-vote after
+	 * GDSC; probe-time icc_set_bw is not enough once RPM drops
+	 * the unused port.
+	 */
+	struct icc_path *path_mdp0;
+	struct icc_path *path_mdp1;
+
+	/*
 	 * lock to protect access to global resources: ie., following register:
 	 *	- REG_MDP5_DISP_INTF_SEL
 	 */
 	spinlock_t resource_lock;
 
 	bool rpm_enabled;
+	struct dev_pm_domain_list *pd_list;
 
 	struct mdp_irq error_handler;
 
@@ -327,6 +339,9 @@ struct mdp5_ctl *mdp5_encoder_get_slave_ctl(struct drm_encoder *encoder);
 struct mdp5_interface *mdp5_encoder_get_slave_intf(struct drm_encoder *encoder);
 void mdp5_hw_reset_after_pc(struct mdp5_kms *mdp5_kms);
 void mdp5_sspp_clk_force_on(struct mdp5_kms *mdp5_kms, enum mdp5_pipe pipe);
+void mdp5_vbif_ot_kickoff(struct mdp5_kms *mdp5_kms);
+void mdp5_crtc_mixer_geometry(struct drm_crtc *crtc, u32 mixer_op_mode);
+void mdp5_plane_kickoff_queue(struct drm_plane *plane);
 void mdp5_encoder_set_intf_mode(struct drm_encoder *encoder, bool cmd_mode);
 int mdp5_encoder_get_linecount(struct drm_encoder *encoder);
 u32 mdp5_encoder_get_framecount(struct drm_encoder *encoder);
@@ -339,6 +354,8 @@ void mdp5_cmd_encoder_disable(struct drm_encoder *encoder);
 void mdp5_cmd_encoder_enable(struct drm_encoder *encoder);
 void mdp5_cmd_encoder_kickoff(struct drm_encoder *encoder);
 void mdp5_cmd_tearcheck_setup_crtc(struct drm_crtc *crtc);
+void mdp5_cmd_restore_intf_format(struct mdp5_kms *mdp5_kms,
+				  struct mdp5_pipeline *pipeline);
 #else
 static inline void mdp5_cmd_encoder_mode_set(struct drm_encoder *encoder,
 					     struct drm_display_mode *mode,
@@ -355,6 +372,10 @@ static inline void mdp5_cmd_encoder_kickoff(struct drm_encoder *encoder)
 {
 }
 static inline void mdp5_cmd_tearcheck_setup_crtc(struct drm_crtc *crtc)
+{
+}
+static inline void mdp5_cmd_restore_intf_format(struct mdp5_kms *mdp5_kms,
+						struct mdp5_pipeline *pipeline)
 {
 }
 #endif

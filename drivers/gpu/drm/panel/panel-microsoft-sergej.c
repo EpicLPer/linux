@@ -29,11 +29,16 @@
 
 #include <video/mipi_display.h>
 
+void sergej_reset_before_phy(void);
+
 struct sergej_panel {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi[2];
 	struct gpio_desc *reset_gpio;
+	bool reset_before_phy_done;
 };
+
+static struct sergej_panel *sergej_singleton;
 
 static inline struct sergej_panel *to_sergej(struct drm_panel *panel)
 {
@@ -59,7 +64,11 @@ static int sergej_dcs_write_buf(struct sergej_panel *ctx, const void *data,
 		if (ret < 0)
 			return ret;
 	}
-	return ret;
+	/*
+	 * dsi_cmds2buf_tx() returns the payload length on success.
+	 * sergej_prepare uses if (ret) as failure. Same as duke.
+	 */
+	return 0;
 }
 
 static int sergej_dcs_write_cmd(struct sergej_panel *ctx, u8 cmd)
@@ -73,7 +82,7 @@ static int sergej_dcs_write_cmd(struct sergej_panel *ctx, u8 cmd)
 		if (ret < 0)
 			return ret;
 	}
-	return ret;
+	return 0;
 }
 
 static int sergej_reset(struct sergej_panel *ctx)
@@ -93,6 +102,21 @@ static int sergej_reset(struct sergej_panel *ctx)
 	return 0;
 }
 
+/*
+ * 3.10 mdss_dsi_panel_power_on: reset before phy when
+ * !lp11_init and !cont_splash. First boot is splash (lk
+ * left HS); POWER_OFF → ON is not. dsi_manager calls this
+ * only after phy_disable.
+ */
+void sergej_reset_before_phy(void)
+{
+	if (!sergej_singleton)
+		return;
+	sergej_reset(sergej_singleton);
+	sergej_singleton->reset_before_phy_done = true;
+	pr_info("talkman-mdss: sergej reset before phy\n");
+}
+
 static int sergej_prepare(struct drm_panel *panel)
 {
 	struct sergej_panel *ctx = to_sergej(panel);
@@ -105,7 +129,12 @@ static int sergej_prepare(struct drm_panel *panel)
 	static const u8 bright[] = { 0x51, 0x80 };
 	static const u8 te[] = { 0x35, 0x00 };
 
-	sergej_reset(ctx);
+	if (ctx->reset_before_phy_done)
+		ctx->reset_before_phy_done = false;
+	else {
+		sergej_reset(ctx);
+		pr_info("talkman-mdss: sergej reset in prepare\n");
+	}
 
 	for (i = 0; i < ARRAY_SIZE(ctx->dsi); i++)
 		if (ctx->dsi[i])
@@ -248,6 +277,7 @@ static int sergej_probe(struct mipi_dsi_device *dsi)
 
 	ctx->dsi[0] = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
+	sergej_singleton = ctx;
 
 	ctx->panel.prepare_prev_first = true;
 	drm_panel_add(&ctx->panel);
@@ -274,6 +304,8 @@ static void sergej_remove(struct mipi_dsi_device *dsi)
 {
 	struct sergej_panel *ctx = mipi_dsi_get_drvdata(dsi);
 
+	if (sergej_singleton == ctx)
+		sergej_singleton = NULL;
 	drm_panel_remove(&ctx->panel);
 }
 

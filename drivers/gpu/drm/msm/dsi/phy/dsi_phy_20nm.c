@@ -129,6 +129,7 @@ struct dsi_pll_20nm {
 	u32 cache_pll_trim_codes[2];
 	u32 ndiv;	/* 3.10 min_div=1 max_div=15 */
 	u32 hr_oclk3;	/* 3.10 min_div=1 max_div=255; HW stores div-1 */
+	u8 mux_index;	/* 3.10 bypass_lp_div: 0=VCO 1=ndiv/2 */
 	int resource_ref_cnt;
 	bool resource_enable;
 	bool is_init_locked;
@@ -537,7 +538,6 @@ static int dsi_pll_20nm_vco_prepare(struct clk_hw *hw)
 	}
 
 	pll->phy->pll_on = true;
-	pr_info("talkman-pll20: locked vco=%lu\n", pll->vco_current_rate);
 	return 0;
 }
 
@@ -596,6 +596,8 @@ static int dsi_20nm_byte_mux_set_parent(struct clk_hw *hw, u8 index)
 	u32 val;
 	int rc;
 
+	pll->mux_index = index;
+
 	/* 3.10 GET skips analog when GDSC is off. Skip analog SET
 	 * at clk_register (clk_registering) the same way.
 	 */
@@ -617,10 +619,26 @@ static int dsi_20nm_byte_mux_set_parent(struct clk_hw *hw, u8 index)
 	return 0;
 }
 
+/*
+ * 3.10 dsi_pll_mux_prepare: rewrite POST_DIVIDER mux bits after
+ * GDSC. CCF skips set_parent when the software parent is unchanged.
+ * Use the cached index; analog get_parent reads 0 after collapse.
+ */
+static int dsi_20nm_byte_mux_prepare(struct clk_hw *hw)
+{
+	struct dsi_pll_20nm *pll = to_pll_20nm_mux(hw);
+	int idx = clk_hw_get_parent_index(hw);
+
+	if (idx < 0)
+		idx = pll->mux_index;
+	return dsi_20nm_byte_mux_set_parent(hw, idx);
+}
+
 static const struct clk_ops clk_ops_dsi_20nm_byte_mux = {
 	.determine_rate = __clk_mux_determine_rate_closest,
 	.set_parent = dsi_20nm_byte_mux_set_parent,
 	.get_parent = dsi_20nm_byte_mux_get_parent,
+	.prepare = dsi_20nm_byte_mux_prepare,
 };
 
 /*
@@ -687,6 +705,30 @@ static int dsi_20nm_ndiv_set_rate(struct clk_hw *hw, unsigned long rate,
 	return 0;
 }
 
+/* 3.10 dsi_pll_div_prepare → ndiv_set_div from cached div. */
+static int dsi_20nm_ndiv_prepare(struct clk_hw *hw)
+{
+	struct dsi_pll_20nm *pll = to_pll_20nm_ndiv(hw);
+	unsigned long flags;
+	u32 val;
+	int rc;
+
+	if (!pll_20nm_analog_writable(pll))
+		return 0;
+
+	rc = pll_20nm_resource_enable(pll, true);
+	if (rc)
+		return rc;
+
+	spin_lock_irqsave(&pll->lock, flags);
+	val = readl(pll->pll_base + MMSS_DSI_PHY_PLL_POST_DIVIDER_CONTROL);
+	writel((val & ~0x0f) | (pll->ndiv & 0x0f),
+	       pll->pll_base + MMSS_DSI_PHY_PLL_POST_DIVIDER_CONTROL);
+	spin_unlock_irqrestore(&pll->lock, flags);
+	pll_20nm_resource_enable(pll, false);
+	return 0;
+}
+
 static int dsi_20nm_ndiv_determine_rate(struct clk_hw *hw,
 					struct clk_rate_request *req)
 {
@@ -697,6 +739,7 @@ static const struct clk_ops clk_ops_dsi_20nm_ndiv = {
 	.recalc_rate = dsi_20nm_ndiv_recalc_rate,
 	.set_rate = dsi_20nm_ndiv_set_rate,
 	.determine_rate = dsi_20nm_ndiv_determine_rate,
+	.prepare = dsi_20nm_ndiv_prepare,
 };
 
 static unsigned long dsi_20nm_hr_oclk3_recalc_rate(struct clk_hw *hw,
@@ -713,7 +756,12 @@ static unsigned long dsi_20nm_hr_oclk3_recalc_rate(struct clk_hw *hw,
 
 	div = readl(pll->pll_base + MMSS_DSI_PHY_PLL_HR_OCLK3_DIVIDER) + 1;
 	pll_20nm_resource_enable(pll, false);
-	if (div)
+	/*
+	 * GDSC reset leaves the field 0 (div-1), which would look
+	 * like programmed div=1 and smash the CCF cache before
+	 * .prepare rewrites analog.
+	 */
+	if (div > 1)
 		pll->hr_oclk3 = div;
 	return pll_20nm_div_rate(parent_rate, pll->hr_oclk3);
 }
@@ -732,10 +780,6 @@ static int dsi_20nm_hr_oclk3_set_rate(struct clk_hw *hw, unsigned long rate,
 		div = 254;
 	pll->hr_oclk3 = div + 1;
 
-	pr_info("talkman-pll20: hr_oclk3 set_rate rate=%lu parent=%lu div=%d phy=%d pll_on=%d\n",
-		rate, parent_rate, pll->hr_oclk3,
-		!!pll->phy, pll->phy && pll->phy->pll_on);
-
 	if (!pll_20nm_analog_writable(pll))
 		return 0;
 
@@ -744,6 +788,25 @@ static int dsi_20nm_hr_oclk3_set_rate(struct clk_hw *hw, unsigned long rate,
 		return rc;
 
 	writel(div, pll->pll_base + MMSS_DSI_PHY_PLL_HR_OCLK3_DIVIDER);
+	pll_20nm_resource_enable(pll, false);
+	return 0;
+}
+
+/* 3.10 dsi_pll_div_prepare → hr_oclk3_set_div from cached div. */
+static int dsi_20nm_hr_oclk3_prepare(struct clk_hw *hw)
+{
+	struct dsi_pll_20nm *pll = to_pll_20nm_hr_oclk3(hw);
+	int rc;
+
+	if (!pll_20nm_analog_writable(pll) || !pll->hr_oclk3)
+		return 0;
+
+	rc = pll_20nm_resource_enable(pll, true);
+	if (rc)
+		return rc;
+
+	writel(pll->hr_oclk3 - 1,
+	       pll->pll_base + MMSS_DSI_PHY_PLL_HR_OCLK3_DIVIDER);
 	pll_20nm_resource_enable(pll, false);
 	return 0;
 }
@@ -758,6 +821,7 @@ static const struct clk_ops clk_ops_dsi_20nm_hr_oclk3 = {
 	.recalc_rate = dsi_20nm_hr_oclk3_recalc_rate,
 	.set_rate = dsi_20nm_hr_oclk3_set_rate,
 	.determine_rate = dsi_20nm_hr_oclk3_determine_rate,
+	.prepare = dsi_20nm_hr_oclk3_prepare,
 };
 
 static int pll_20nm_register(struct dsi_pll_20nm *pll, struct clk_hw **provided_clocks)
@@ -914,6 +978,7 @@ static int dsi_pll_20nm_init(struct msm_dsi_phy *phy)
 	pll->pll_en_90_phase = true;
 	pll->ndiv = 1;
 	pll->hr_oclk3 = 1;
+	pll->mux_index = 1;
 	pll->pll_base = phy->pll_base;
 	spin_lock_init(&pll->lock);
 	mutex_init(&pll->res_lock);
@@ -949,7 +1014,7 @@ static void dsi_20nm_dphy_set_timing(struct msm_dsi_phy *phy,
 	 * TIMING_CTRL_0 + i*4. Those bytes come from the panel DT
 	 * qcom,mdss-dsi-panel-timings (copied in dsi_manager enable_phy),
 	 * not dphy_timing_calc. calc still fills phy->timing for host
-	 * clk_pre/post. STRENGTH_0 stays 0xff (CAF 8992 is 0x77).
+	 * clk_pre/post. STRENGTH_0 is 3.10 platform-strength-ctrl[0].
 	 */
 	if (phy->has_dphy_panel_timings) {
 		const u8 *t = phy->dphy_panel_timings;
@@ -1027,10 +1092,22 @@ static int dsi_20nm_phy_enable(struct msm_dsi_phy *phy,
 			       struct msm_dsi_phy_clk_request *clk_req)
 {
 	struct msm_dsi_dphy_timing *timing = &phy->timing;
-	int i;
+	int i, ln, off;
 	void __iomem *base = phy->base;
-	u32 cfg_4[4] = {0x20, 0x40, 0x20, 0x00};
 	u32 val;
+	/*
+	 * 3.10 mdss_dsi_20nm_phy_config: 9 bytes/lane from
+	 * qcom,platform-lane-config (msm8992-mdss.dtsi). Hai Li
+	 * 20nm skipped CFG_2 / TEST_DATAPATH / DEBUG_SEL. After
+	 * GDSC those three reset; first boot keeps lk leftovers.
+	 */
+	static const u8 lanecfg[5][9] = {
+		{ 0x02, 0xa0, 0x00, 0x00, 0x20, 0x00, 0x00, 0x01, 0x46 },
+		{ 0x02, 0xa0, 0x00, 0x00, 0x40, 0x00, 0x00, 0x01, 0x46 },
+		{ 0x02, 0xa0, 0x00, 0x40, 0x20, 0x00, 0x00, 0x01, 0x46 },
+		{ 0x02, 0xa0, 0x00, 0x40, 0x00, 0x00, 0x00, 0x01, 0x46 },
+		{ 0x00, 0xa0, 0x00, 0x80, 0x00, 0x00, 0x00, 0x01, 0x46 },
+	};
 
 	DBG("");
 
@@ -1042,7 +1119,13 @@ static int dsi_20nm_phy_enable(struct msm_dsi_phy *phy,
 
 	dsi_20nm_phy_regulator_ctrl(phy, true);
 
-	writel(0xff, base + REG_DSI_20nm_PHY_STRENGTH_0);
+	/*
+	 * 3.10 msm8994/8992-mdss.dtsi qcom,platform-strength-ctrl
+	 * = [77 06]. 0xff is the 20nm driver default; after GDSC
+	 * PHY re-init that overwrites lk's 0x77 and leaves analog
+	 * drive wrong on unlock.
+	 */
+	writel(0x77, base + REG_DSI_20nm_PHY_STRENGTH_0);
 
 	val = readl(base + REG_DSI_20nm_PHY_GLBL_TEST_CTRL);
 	if (phy->id == DSI_1 && phy->usecase == MSM_DSI_PHY_STANDALONE)
@@ -1051,22 +1134,14 @@ static int dsi_20nm_phy_enable(struct msm_dsi_phy *phy,
 		val &= ~DSI_20nm_PHY_GLBL_TEST_CTRL_BITCLK_HS_SEL;
 	writel(val, base + REG_DSI_20nm_PHY_GLBL_TEST_CTRL);
 
-	for (i = 0; i < 4; i++) {
-		writel((i >> 1) * 0x40, base + REG_DSI_20nm_PHY_LN_CFG_3(i));
-		writel(0x01, base + REG_DSI_20nm_PHY_LN_TEST_STR_0(i));
-		writel(0x46, base + REG_DSI_20nm_PHY_LN_TEST_STR_1(i));
-		writel(0x02, base + REG_DSI_20nm_PHY_LN_CFG_0(i));
-		writel(0xa0, base + REG_DSI_20nm_PHY_LN_CFG_1(i));
-		writel(cfg_4[i], base + REG_DSI_20nm_PHY_LN_CFG_4(i));
+	for (ln = 0; ln < 5; ln++) {
+		off = ln * 0x40;
+		for (i = 0; i < 9; i++) {
+			writel(lanecfg[ln][i], base + off);
+			off += 4;
+		}
 	}
-
-	writel(0x80, base + REG_DSI_20nm_PHY_LNCK_CFG_3);
-	writel(0x01, base + REG_DSI_20nm_PHY_LNCK_TEST_STR0);
-	writel(0x46, base + REG_DSI_20nm_PHY_LNCK_TEST_STR1);
-	writel(0x00, base + REG_DSI_20nm_PHY_LNCK_CFG_0);
-	writel(0xa0, base + REG_DSI_20nm_PHY_LNCK_CFG_1);
-	writel(0x00, base + REG_DSI_20nm_PHY_LNCK_CFG_2);
-	writel(0x00, base + REG_DSI_20nm_PHY_LNCK_CFG_4);
+	wmb();
 
 	dsi_20nm_dphy_set_timing(phy, timing);
 
@@ -1085,6 +1160,24 @@ static void dsi_20nm_phy_disable(struct msm_dsi_phy *phy)
 {
 	writel(0, phy->base + REG_DSI_20nm_PHY_CTRL_0);
 	dsi_20nm_phy_regulator_ctrl(phy, false);
+}
+
+/*
+ * 3.10 mdss_dsi_lp_cd_rx after mdss_dsi_ctrl_setup: Strength
+ * ctrl 1 (LP Rx + contention detect). platform-strength-ctrl
+ * [77 06]. phy_enable writes it before CTRL_0; 3.10 writes it
+ * after DSI_CTRL enable.
+ */
+void msm_dsi_phy_lp_cd_rx(struct msm_dsi_phy *phy)
+{
+	if (!phy || !phy->base || !phy->cfg)
+		return;
+	if (phy->cfg != &dsi_phy_20nm_cfgs &&
+	    phy->cfg != &dsi_phy_20nm_8992_cfgs)
+		return;
+
+	writel(0x06, phy->base + REG_DSI_20nm_PHY_STRENGTH_1);
+	wmb();
 }
 
 static const struct regulator_bulk_data dsi_phy_20nm_regulators[] = {

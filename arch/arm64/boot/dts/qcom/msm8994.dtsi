@@ -1247,6 +1247,14 @@
 				 <&mmcc MDSS_VSYNC_CLK>;
 			clock-names = "iface", "bus", "vsync";
 
+			/*
+			 * 3.10 msm8994-mdss.dtsi msm-bus num-paths = 2
+			 * (masters 22/23 = MDP PORT0/PORT1).
+			 */
+			interconnects = <&mmssnoc MNOC_MAS_MDP_PORT0 &bimc BIMC_SLV_EBI_CH0>,
+					<&mmssnoc MNOC_MAS_MDP_PORT1 &bimc BIMC_SLV_EBI_CH0>;
+			interconnect-names = "mdp0-mem", "mdp1-mem";
+
 			interrupts = <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH>;
 
 			interrupt-controller;
@@ -1275,8 +1283,9 @@
 					      "core",
 					      "vsync";
 
-				interconnects = <&mmssnoc MNOC_MAS_MDP_PORT0 &bimc BIMC_SLV_EBI_CH0>;
-				interconnect-names = "mdp0-mem";
+				interconnects = <&mmssnoc MNOC_MAS_MDP_PORT0 &bimc BIMC_SLV_EBI_CH0>,
+						<&mmssnoc MNOC_MAS_MDP_PORT1 &bimc BIMC_SLV_EBI_CH0>;
+				interconnect-names = "mdp0-mem", "mdp1-mem";
 
 				iommus = <&mdp_iommu 0>;
 
