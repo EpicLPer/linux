@@ -11,6 +11,7 @@
 #include "pm8994.dtsi"
 #include "pmi8994.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/iio/qcom,spmi-vadc.h>
 #include <dt-bindings/input/gpio-keys.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 
@@ -106,6 +107,10 @@
 		};
 	};
 
+	/*
+	 * Wallet-cover halls. Idle (no magnet) is high; magnet
+	 * present is low.
+	 */
 	gpio-hall-sensor {
 		compatible = "gpio-keys";
 
@@ -116,7 +121,7 @@
 
 		event-hall-front-sensor {
 			label = "Hall Effect Front Sensor";
-			gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 42 GPIO_ACTIVE_LOW>;
 			linux,input-type = <EV_SW>;
 			linux,code = <SW_LID>;
 			linux,can-disable;
@@ -124,10 +129,121 @@
 
 		event-hall-back-sensor {
 			label = "Hall Effect Back Sensor";
-			gpios = <&tlmm 75 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
 			linux,input-type = <EV_SW>;
 			linux,code = <SW_MACHINE_COVER>;
 			linux,can-disable;
+		};
+	};
+
+	/*
+	 * 3.10 mmo/common/adc.dtsi PU1 AMUX thermistors. VADC already
+	 * scales 100 kΩ to millicelsius (SCALE_THERM_100K_PULLUP).
+	 */
+	msm_therm: msm-therm {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8994_vadc VADC_LR_MUX4_PU1_AMUX_THM1>;
+		io-channel-names = "sensor-channel";
+	};
+
+	emmc_therm: emmc-therm {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8994_vadc VADC_LR_MUX5_PU1_AMUX_THM2>;
+		io-channel-names = "sensor-channel";
+	};
+
+	pa_therm0: pa-therm0 {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8994_vadc VADC_LR_MUX6_PU1_AMUX_THM3>;
+		io-channel-names = "sensor-channel";
+	};
+
+	pa_therm1: pa-therm1 {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8994_vadc VADC_LR_MUX8_PU1_AMUX_THM4>;
+		io-channel-names = "sensor-channel";
+	};
+
+	quiet_therm: quiet-therm {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8994_vadc VADC_LR_MUX9_PU1_AMUX_THM5>;
+		io-channel-names = "sensor-channel";
+	};
+
+	thermal-zones {
+		msm-therm {
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			thermal-sensors = <&msm_therm>;
+
+			trips {
+				msm_therm_crit: msm-therm-crit {
+					temperature = <115000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+
+		emmc-therm {
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			thermal-sensors = <&emmc_therm>;
+
+			trips {
+				emmc_therm_crit: emmc-therm-crit {
+					temperature = <115000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+
+		pa-therm0 {
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			thermal-sensors = <&pa_therm0>;
+
+			trips {
+				pa_therm0_crit: pa-therm0-crit {
+					temperature = <115000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+
+		pa-therm1 {
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			thermal-sensors = <&pa_therm1>;
+
+			trips {
+				pa_therm1_crit: pa-therm1-crit {
+					temperature = <115000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+
+		quiet-therm {
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			thermal-sensors = <&quiet_therm>;
+
+			trips {
+				quiet_therm_crit: quiet-therm-crit {
+					temperature = <115000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
 		};
 	};
 
@@ -580,6 +696,43 @@
 			power-source = <PM8994_GPIO_S4>;
 			bias-disable;
 		};
+	};
+};
+
+&pm8994_vadc {
+	channel@73 {
+		reg = <VADC_LR_MUX4_PU1_AMUX_THM1>;
+		label = "msm_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@74 {
+		reg = <VADC_LR_MUX5_PU1_AMUX_THM2>;
+		label = "emmc_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@75 {
+		reg = <VADC_LR_MUX6_PU1_AMUX_THM3>;
+		label = "pa_therm0";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@77 {
+		reg = <VADC_LR_MUX8_PU1_AMUX_THM4>;
+		label = "pa_therm1";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@78 {
+		reg = <VADC_LR_MUX9_PU1_AMUX_THM5>;
+		label = "quiet_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
 	};
 };
 
