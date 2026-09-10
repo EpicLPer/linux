@@ -90,8 +90,10 @@
 #define DECIKELVIN			2730
 
 #define FULL_SOC_RAW			0xff
-#define MEMIF_TIMEOUT_MS		5000
-#define FIRST_EST_TIMEOUT_MS		5000
+#define MEMIF_TIMEOUT_MS		1500
+#define FIRST_EST_TIMEOUT_MS		2000
+#define BATT_ID_TIMEOUT_MS		250
+#define TELEM_CACHE_MS			1000
 #define MAX_SOC_TRIES			5
 
 static const u8 bias_ua[] = {
@@ -121,6 +123,11 @@ struct pmi8994_fg {
 	u32 iterm_ma;
 	u32 chg_iterm_ma;
 	u32 resume_soc;
+	unsigned long telem_jiffies;
+	int voltage_uv;
+	int current_ua;
+	int temp_decidegc;
+	bool telem_valid;
 };
 
 static int fg_read(struct pmi8994_fg *fg, u16 addr, u8 *val, int len)
@@ -169,8 +176,11 @@ static int fg_req_access(struct pmi8994_fg *fg)
 
 	timeout = jiffies + msecs_to_jiffies(MEMIF_TIMEOUT_MS);
 	while (!fg_mem_available(fg)) {
-		if (time_after(jiffies, timeout))
+		if (time_after(jiffies, timeout)) {
+			dev_info_ratelimited(fg->dev,
+					     "MEMIF access timed out\n");
 			return -ETIMEDOUT;
+		}
 		usleep_range(1000, 2000);
 	}
 
@@ -402,7 +412,7 @@ static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
 
 static int fg_wait_batt_ided(struct pmi8994_fg *fg)
 {
-	unsigned long timeout = jiffies + msecs_to_jiffies(FIRST_EST_TIMEOUT_MS);
+	unsigned long timeout = jiffies + msecs_to_jiffies(BATT_ID_TIMEOUT_MS);
 	unsigned int sts;
 	int rc;
 
@@ -413,7 +423,7 @@ static int fg_wait_batt_ided(struct pmi8994_fg *fg)
 			return rc;
 		if (sts & BATT_IDED)
 			return 0;
-		msleep(100);
+		usleep_range(5000, 10000);
 	} while (!time_after(jiffies, timeout));
 
 	return -ETIMEDOUT;
@@ -602,6 +612,74 @@ static int fg_apply_board_settings(struct pmi8994_fg *fg)
 				   PATCH_NEG_CURRENT_BIT, PATCH_NEG_CURRENT_BIT);
 }
 
+static int fg_refresh_telem(struct pmi8994_fg *fg)
+{
+	int rc, uv, ua, temp;
+
+	if (fg->telem_valid &&
+	    time_before(jiffies,
+			fg->telem_jiffies + msecs_to_jiffies(TELEM_CACHE_MS)))
+		return 0;
+
+	/* Keep the last sample if MEMIF is not already open. */
+	if (fg->telem_valid) {
+		unsigned long deadline = jiffies + msecs_to_jiffies(50);
+
+		mutex_lock(&fg->lock);
+		if (!fg_mem_available(fg)) {
+			fg_masked_write(fg, fg->mem_base + MEM_INTF_CFG,
+					RIF_MEM_ACCESS_REQ, RIF_MEM_ACCESS_REQ);
+			while (!fg_mem_available(fg) &&
+			       time_before(jiffies, deadline))
+				usleep_range(1000, 2000);
+			if (!fg_mem_available(fg)) {
+				mutex_unlock(&fg->lock);
+				return 0;
+			}
+		}
+		mutex_unlock(&fg->lock);
+	}
+
+	rc = fg_batt_temp_decidegc(fg, &temp);
+	if (rc)
+		return rc;
+	rc = fg_voltage_uv(fg, &uv);
+	if (rc)
+		return rc;
+	rc = fg_current_ua(fg, &ua);
+	if (rc)
+		return rc;
+
+	fg->temp_decidegc = temp;
+	fg->voltage_uv = uv;
+	fg->current_ua = ua;
+	fg->telem_jiffies = jiffies;
+	fg->telem_valid = true;
+	return 0;
+}
+
+static int fg_get_status(struct pmi8994_fg *fg)
+{
+	struct power_supply *usb;
+	union power_supply_propval val;
+	int rc;
+
+	(void)fg;
+	usb = power_supply_get_by_name("qcom-smbchg-usb");
+	if (!usb)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+	rc = power_supply_get_property(usb, POWER_SUPPLY_PROP_STATUS, &val);
+	power_supply_put(usb);
+	if (rc)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+	return val.intval;
+}
+
+static void fg_external_power_changed(struct power_supply *psy)
+{
+	power_supply_changed(psy);
+}
+
 static int fg_get_property(struct power_supply *psy,
 			   enum power_supply_property psp,
 			   union power_supply_propval *val)
@@ -611,7 +689,7 @@ static int fg_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
+		val->intval = fg_get_status(fg);
 		return 0;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
@@ -623,11 +701,25 @@ static int fg_get_property(struct power_supply *psy,
 		val->intval = rc;
 		return 0;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		return fg_voltage_uv(fg, &val->intval);
+		rc = fg_refresh_telem(fg);
+		if (rc)
+			return rc;
+		val->intval = fg->voltage_uv;
+		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		return fg_current_ua(fg, &val->intval);
+		rc = fg_refresh_telem(fg);
+		if (rc)
+			return rc;
+		/* Magnitude: UPower 1.91 treats current_now < 0 as discharge. */
+		val->intval = fg->current_ua < 0 ? -fg->current_ua
+						 : fg->current_ua;
+		return 0;
 	case POWER_SUPPLY_PROP_TEMP:
-		return fg_batt_temp_decidegc(fg, &val->intval);
+		rc = fg_refresh_telem(fg);
+		if (rc)
+			return rc;
+		val->intval = fg->temp_decidegc;
+		return 0;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
 		if (fg->max_voltage_uv <= 0)
 			return -ENODATA;
@@ -668,6 +760,7 @@ static const struct power_supply_desc fg_desc = {
 	.properties = fg_props,
 	.num_properties = ARRAY_SIZE(fg_props),
 	.get_property = fg_get_property,
+	.external_power_changed = fg_external_power_changed,
 };
 
 static int fg_parse_dt(struct pmi8994_fg *fg)
@@ -724,7 +817,10 @@ static int fg_setup_profile(struct pmi8994_fg *fg)
 	device_property_read_u32(dev, "qcom,batt-id-kohm", &expect_kohm);
 	device_property_read_u32(dev, "qcom,batt-id-range-pct", &range_pct);
 
-	rc = fg_read_batt_id(fg);
+	if (expect_kohm && range_pct)
+		rc = fg_read_batt_id(fg);
+	else
+		rc = -ENODATA;
 	if (rc) {
 		dev_warn(dev, "battery ID unreadable (%d), leaving SRAM profile\n",
 			 rc);
