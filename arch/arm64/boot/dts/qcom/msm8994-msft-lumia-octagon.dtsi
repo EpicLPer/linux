@@ -13,6 +13,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/iio/qcom,spmi-vadc.h>
 #include <dt-bindings/input/gpio-keys.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 
 /*
@@ -610,20 +611,28 @@
 	status = "okay";
 
 	/*
-	 * This device is a Lattice UC120 USB-C PD PHY.
-	 * It is actually a Lattice iCE40 FPGA pre-programmed by
-	 * the device firmware with a specific bitstream
-	 * enabling USB Type C PHY functionality.
-	 * Communication is done via a proprietary protocol over SPI.
-	 *
-	 * TODO: Once a proper driver is available, replace this.
+	 * Lattice UC120 (iCE5LP2K, ACPI MSHW1006). Do not bind
+	 * lattice,ice40-fpga-mgr (holds CRESET_B) or ice40-hcd.
 	 */
-	uc120: ice5lp2k@0 {
-		compatible = "lattice,ice40-fpga-mgr";
+	uc120: typec@0 {
+		compatible = "lattice,uc120";
 		reg = <0>;
 		spi-max-frequency = <5000000>;
-		cdone-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
-		reset-gpios = <&pmi8994_gpios 4 GPIO_ACTIVE_LOW>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <95 IRQ_TYPE_EDGE_FALLING>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&uc120_int_default>;
+		usb-psy-name = "qcom-smbchg-usb";
+		orientation-gpios = <&pmi8994_gpios 8 GPIO_ACTIVE_HIGH>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C";
+			power-role = "dual";
+			try-power-role = "sink";
+			data-role = "dual";
+			typec-power-opmode = "default";
+		};
 	};
 };
 
@@ -754,6 +763,7 @@
 
 /* Both OEM packs use a 330 kΩ ID resistor. Profiles are per-device. */
 &pmi8994_fg {
+	status = "okay";
 	qcom,batt-id-kohm = <330>;
 	qcom,batt-id-range-pct = <15>;
 	qcom,thermal-coefficients = [EC 85 76 4A FC 35];
@@ -765,6 +775,14 @@
 	qcom,fg-iterm-ma = <200>;
 	qcom,fg-chg-iterm-ma = <100>;
 	qcom,fg-cutoff-voltage-mv = <2800>;
+};
+
+&pmi8994_smbchg {
+	status = "okay";
+};
+
+&usb3_dwc3 {
+	usb-psy-name = "qcom-smbchg-usb";
 };
 
 &pmi8994_gpios {
@@ -779,24 +797,13 @@
 		"SS_POL", /* GPIO_8 */
 		"SS_MUX_SEL", /* GPIO_9 */
 		"SS_MUX_EN"; /* GPIO_10 */
-	pinctrl-0 = <&hd3ss460_pol &hd3ss460_amsel &hd3ss460_en>;
+	pinctrl-0 = <&hd3ss460_amsel &hd3ss460_en>;
 	pinctrl-names = "default";
 
 	/*
-	 * This device uses a TI HD3SS460 Type-C MUX
-	 * As this device has no driver currently,
-	 * the configuration for USB Face Up is set-up here.
-	 *
-	 * TODO: remove once a driver is available
-	 * TODO: add VBUS GPIO 5
+	 * HD3SS460 SS mux. Polarity is lattice,uc120
+	 * orientation-gpios (PMI GPIO 8). EN/AMSEL stay USB.
 	 */
-	hd3ss460_pol: pol-low-state {
-		pins = "gpio8";
-		function = PMIC_GPIO_FUNC_NORMAL;
-		qcom,drive-strength = <3>;
-		bias-pull-down;
-	};
-
 	hd3ss460_amsel: amsel-high-state {
 		pins = "gpio9";
 		function = PMIC_GPIO_FUNC_NORMAL;
@@ -1338,6 +1345,14 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-disable;
+	};
+
+	uc120_int_default: uc120-int-default-state {
+		pins = "gpio95";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
 	};
 
 	mdss_dsi_default: mdss-dsi-default-state {
