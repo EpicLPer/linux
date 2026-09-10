@@ -130,6 +130,7 @@
 /* USB_CHGPTH_CFG bits */
 #define USB51AC_CTRL			BIT(1)
 #define USB51_COMMAND_POL		BIT(2)
+#define HVDCP_EN_BIT			BIT(3)
 #define CFG_USB3P0_SEL_BIT		BIT(7)
 
 /* USB_CHGPTH_RT_STS bits */
@@ -255,10 +256,8 @@ struct smbchg_chip {
 	struct mutex lock;
 	struct work_struct otg_reset_work;
 	struct delayed_work src_det_work;
-	struct delayed_work sdp_float_work;
 	bool usb_present;
 	bool sdp_icl_from_host;
-	bool sdp_cfg_stale;
 	unsigned int typec_icl_ua;
 
 	const struct smbchg_data *data;

@@ -19,8 +19,6 @@
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
 #include <linux/power_supply.h>
-#include <linux/usb/ch9.h>
-#include <linux/usb/gadget.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -962,64 +960,9 @@ static irqreturn_t smbchg_handle_batt_presence(int irq, void *data)
 
 #define APSD_SETTLE_MS		300
 #define SRC_DET_DEBOUNCE_MS	150
-#define SDP_FLOAT_MS		8000
 #define SDP_HOST_ICL_UA		500000
 #define DEFAULT_WALL_UA		1800000
 #define DEFAULT_CDP_UA		1500000
-
-static int smbchg_match_snps_dwc3(struct device *dev, const void *data)
-{
-	return dev->of_node && of_device_is_compatible(dev->of_node, "snps,dwc3");
-}
-
-static int smbchg_match_gadget_child(struct device *dev, const void *data)
-{
-	return !strncmp(dev_name(dev), "gadget.", 7);
-}
-
-static struct usb_gadget *smbchg_usb_gadget_get(void)
-{
-	struct device *ctrl, *gdev;
-
-	ctrl = bus_find_device(&platform_bus_type, NULL, NULL,
-			       smbchg_match_snps_dwc3);
-	if (!ctrl)
-		return NULL;
-	gdev = device_find_child(ctrl, NULL, smbchg_match_gadget_child);
-	put_device(ctrl);
-	if (!gdev)
-		return NULL;
-	return container_of(gdev, struct usb_gadget, dev);
-}
-
-static bool smbchg_usb_gadget_configured(void)
-{
-	struct usb_gadget *gadget = smbchg_usb_gadget_get();
-	bool configured;
-
-	if (!gadget)
-		return false;
-	configured = gadget->state == USB_STATE_CONFIGURED;
-	put_device(&gadget->dev);
-	return configured;
-}
-
-/*
- * g_ether stays CONFIGURED after VBUS drops. Pull D+ down on
- * removal so APSD can see DCP. Call with chip->lock dropped.
- */
-static void smbchg_usb_gadget_softconnect(bool connect)
-{
-	struct usb_gadget *gadget = smbchg_usb_gadget_get();
-
-	if (!gadget)
-		return;
-	if (connect)
-		usb_gadget_connect(gadget);
-	else
-		usb_gadget_disconnect(gadget);
-	put_device(&gadget->dev);
-}
 
 static void smbchg_notify(struct smbchg_chip *chip)
 {
@@ -1045,11 +988,10 @@ static int smbchg_apsd_rerun(struct smbchg_chip *chip)
 }
 
 /*
- * 3.10 qpnp-smbcharger: SDP is 100 mA until the USB stack raises it,
- * CDP 1500 mA, else DEFAULT_WALL_CHG_MA 1800 + AICL. PD wall bricks
- * leave D+/D- open so APSD reports SDP; with no host, treat that as
- * wall (AICL from 1800). A configured gadget is still a host (500 mA).
- * Type-C 1.5 A / 3 A Rp (not default USB Rp) wins via typec_icl_ua.
+ * SDP is 100 mA until the USB stack raises INPUT_CURRENT_LIMIT.
+ * CDP is 1500 mA. Anything else is 1800 mA AICL (including an SDP
+ * with no host vote: PD bricks leave D+/D- open). Type-C 1.5 A /
+ * 3 A Rp wins via typec_icl_ua.
  */
 static int smbchg_apply_input_policy(struct smbchg_chip *chip)
 {
@@ -1058,7 +1000,6 @@ static int smbchg_apply_input_policy(struct smbchg_chip *chip)
 
 	if (!chip->usb_present) {
 		chip->sdp_icl_from_host = false;
-		cancel_delayed_work(&chip->sdp_float_work);
 		return smbchg_usb_enable(chip, false);
 	}
 
@@ -1068,7 +1009,6 @@ static int smbchg_apply_input_policy(struct smbchg_chip *chip)
 
 	if (chip->typec_icl_ua) {
 		chip->sdp_icl_from_host = false;
-		cancel_delayed_work(&chip->sdp_float_work);
 		ret = smbchg_usb_set_ilim(chip, chip->typec_icl_ua);
 		if (ret < 0)
 			return ret;
@@ -1080,33 +1020,23 @@ static int smbchg_apply_input_policy(struct smbchg_chip *chip)
 
 	if (usb_type == POWER_SUPPLY_USB_TYPE_SDP ||
 	    usb_type == POWER_SUPPLY_USB_TYPE_UNKNOWN) {
-		if (chip->sdp_icl_from_host ||
-		    (smbchg_usb_gadget_configured() && !chip->sdp_cfg_stale)) {
-			chip->sdp_icl_from_host = true;
-			cancel_delayed_work(&chip->sdp_float_work);
+		if (chip->sdp_icl_from_host) {
 			ret = smbchg_usb_set_ilim(chip, SDP_HOST_ICL_UA);
 			return ret < 0 ? ret : 0;
 		}
 		ret = smbchg_usb_aicl_enable(chip, DEFAULT_WALL_UA);
 		if (ret)
 			return ret;
-		ret = smbchg_usb_enable(chip, true);
-		if (ret)
-			return ret;
-		mod_delayed_work(system_dfl_wq, &chip->sdp_float_work,
-				 msecs_to_jiffies(SDP_FLOAT_MS));
-		return 0;
+		return smbchg_usb_enable(chip, true);
 	}
 
 	chip->sdp_icl_from_host = false;
-	cancel_delayed_work(&chip->sdp_float_work);
 
 	if (usb_type == POWER_SUPPLY_USB_TYPE_CDP) {
 		ret = smbchg_usb_set_ilim(chip, DEFAULT_CDP_UA);
 		return ret < 0 ? ret : 0;
 	}
 
-	/* DCP: AICL, D+ stays down. 3.10 qcom,disable-hvdcp. */
 	ret = smbchg_usb_aicl_enable(chip, DEFAULT_WALL_UA);
 	if (ret)
 		return ret;
@@ -1117,95 +1047,38 @@ static void smbchg_src_det_work(struct work_struct *work)
 {
 	struct smbchg_chip *chip = container_of(work, struct smbchg_chip,
 						src_det_work.work);
-	bool present, changed, connect_now = false;
+	bool present, changed, insert;
 	int ret;
 
 	mutex_lock(&chip->lock);
 	present = smbchg_usb_src_detected(chip);
 	changed = present != chip->usb_present;
-	if (present && !chip->usb_present) {
-		int i;
-
-		/*
-		 * A leftover USB_STATE_CONFIGURED from the PC cable is
-		 * not a host on this insert (PD wall bricks look like
-		 * SDP). Only a configure after this edge is a host.
-		 */
-		chip->sdp_cfg_stale = smbchg_usb_gadget_configured();
-		smbchg_apsd_rerun(chip);
-		for (i = 0; i < 3 &&
-		     smbchg_usb_get_type(chip) == POWER_SUPPLY_USB_TYPE_UNKNOWN;
-		     i++)
-			msleep(APSD_SETTLE_MS);
-	}
+	insert = present && !chip->usb_present;
 	if (!present)
 		chip->sdp_icl_from_host = false;
 	if (changed)
 		dev_info(chip->dev, "USB %s\n", present ? "present" : "gone");
 	chip->usb_present = present;
-	ret = smbchg_apply_input_policy(chip);
-	if (present) {
-		enum power_supply_usb_type t = smbchg_usb_get_type(chip);
 
-		/* SDP/CDP need D+ up to enumerate. Do it after APSD. */
-		if (t == POWER_SUPPLY_USB_TYPE_SDP ||
-		    t == POWER_SUPPLY_USB_TYPE_CDP)
-			connect_now = true;
+	if (insert && present) {
+		int i;
+
+		smbchg_apsd_rerun(chip);
+		for (i = 0; i < 3 &&
+		     smbchg_usb_get_type(chip) ==
+			     POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		     i++)
+			msleep(APSD_SETTLE_MS);
 	}
-	mutex_unlock(&chip->lock);
 
-	/*
-	 * D+ down on the VBUS edge so APSD can see DCP vs SDP.
-	 * SDP/CDP go back up immediately. DCP/unknown: 8 s later
-	 * (USB-C hosts often APSD as DCP with D+ down).
-	 */
-	if (changed)
-		smbchg_usb_gadget_softconnect(false);
-	if (connect_now)
-		smbchg_usb_gadget_softconnect(true);
+	ret = smbchg_apply_input_policy(chip);
+	mutex_unlock(&chip->lock);
 
 	if (ret)
 		dev_err(chip->dev, "Failed to apply input policy: %pe\n",
 			ERR_PTR(ret));
 
 	smbchg_notify(chip);
-}
-
-static void smbchg_sdp_float_work(struct work_struct *work)
-{
-	struct smbchg_chip *chip = container_of(work, struct smbchg_chip,
-						sdp_float_work.work);
-	bool connect = false;
-	int ret = 0;
-
-	mutex_lock(&chip->lock);
-	if (!chip->usb_present || chip->sdp_icl_from_host)
-		goto out;
-	if (chip->typec_icl_ua)
-		goto out;
-	if (smbchg_usb_gadget_configured() && !chip->sdp_cfg_stale) {
-		chip->sdp_icl_from_host = true;
-		ret = smbchg_usb_set_ilim(chip, SDP_HOST_ICL_UA);
-		if (ret > 0)
-			ret = 0;
-		goto out;
-	}
-	/*
-	 * USB-C hosts often APSD as DCP while D+ is down. Pull D+
-	 * up; only a real CONFIGURED gadget is a 500 mA host.
-	 */
-	connect = true;
-out:
-	mutex_unlock(&chip->lock);
-
-	if (connect)
-		smbchg_usb_gadget_softconnect(true);
-
-	if (ret)
-		dev_err(chip->dev, "Failed to apply SDP float policy: %pe\n",
-			ERR_PTR(ret));
-	else
-		smbchg_notify(chip);
 }
 
 static void smbchg_queue_src_det(struct smbchg_chip *chip)
@@ -1579,17 +1452,14 @@ static int smbchg_set_property(struct power_supply *psy,
 			mutex_unlock(&chip->lock);
 			return 0;
 		}
-		/* Ignore unit-load 100 mA until a real host configures. */
+		/* Ignore unit-load 100 mA until the USB stack votes 500. */
 		if (val->intval < SDP_HOST_ICL_UA &&
-		    !chip->sdp_icl_from_host &&
-		    !smbchg_usb_gadget_configured()) {
+		    !chip->sdp_icl_from_host) {
 			mutex_unlock(&chip->lock);
 			return 0;
 		}
-		if (val->intval >= SDP_HOST_ICL_UA) {
+		if (val->intval >= SDP_HOST_ICL_UA)
 			chip->sdp_icl_from_host = true;
-			cancel_delayed_work(&chip->sdp_float_work);
-		}
 		usb_type = smbchg_usb_get_type(chip);
 		if (usb_type == POWER_SUPPLY_USB_TYPE_DCP ||
 		    usb_type == POWER_SUPPLY_USB_TYPE_CDP) {
@@ -1748,7 +1618,7 @@ static int smbchg_init(struct smbchg_chip *chip)
 	 */
 	ret = smbchg_sec_masked_write(chip,
 				      chip->base + SMBCHG_USB_CHGPTH_CFG,
-		USB51AC_CTRL | USB51_COMMAND_POL,
+		USB51AC_CTRL | USB51_COMMAND_POL | HVDCP_EN_BIT,
 		USB51_COMMAND_CONTROL | USB51AC_COMMAND1_500);
 	if (ret)
 		return ret;
@@ -1788,8 +1658,6 @@ static int smbchg_init(struct smbchg_chip *chip)
 	if (ret)
 		return ret;
 	smbchg_notify(chip);
-	if (chip->usb_present)
-		smbchg_usb_gadget_softconnect(false);
 
 	return 0;
 }
@@ -1824,7 +1692,6 @@ static int smbchg_probe(struct platform_device *pdev)
 	mutex_init(&chip->lock);
 	INIT_WORK(&chip->otg_reset_work, smbchg_otg_reset_worker);
 	INIT_DELAYED_WORK(&chip->src_det_work, smbchg_src_det_work);
-	INIT_DELAYED_WORK(&chip->sdp_float_work, smbchg_sdp_float_work);
 
 	/* Initialize OTG regulator */
 	chip->otg_rdesc.id = -1;
@@ -1945,7 +1812,6 @@ static void smbchg_remove(struct platform_device *pdev)
 	struct smbchg_chip *chip = platform_get_drvdata(pdev);
 
 	cancel_delayed_work_sync(&chip->src_det_work);
-	cancel_delayed_work_sync(&chip->sdp_float_work);
 	smbchg_usb_enable(chip, false);
 	smbchg_charging_enable(chip, false);
 	power_supply_put_battery_info(chip->usb_psy, chip->batt_info);
