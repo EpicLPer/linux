@@ -19,6 +19,7 @@
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #define FG_SOC_BASE			0x4000
 #define FG_BATT_BASE			0x4100
@@ -128,6 +129,8 @@ struct pmi8994_fg {
 	int current_ua;
 	int temp_decidegc;
 	bool telem_valid;
+	bool memif_held;
+	struct work_struct sram_work;
 };
 
 static int fg_read(struct pmi8994_fg *fg, u16 addr, u8 *val, int len)
@@ -189,8 +192,29 @@ static int fg_req_access(struct pmi8994_fg *fg)
 
 static int fg_release_access(struct pmi8994_fg *fg)
 {
+	if (fg->memif_held)
+		return 0;
+
 	return fg_masked_write(fg, fg->mem_base + MEM_INTF_CFG,
 			       RIF_MEM_ACCESS_REQ, 0);
+}
+
+static int fg_hold_access(struct pmi8994_fg *fg)
+{
+	int rc;
+
+	guard(mutex)(&fg->lock);
+	rc = fg_req_access(fg);
+	if (!rc)
+		fg->memif_held = true;
+	return rc;
+}
+
+static void fg_unhold_access(struct pmi8994_fg *fg)
+{
+	guard(mutex)(&fg->lock);
+	fg->memif_held = false;
+	fg_release_access(fg);
 }
 
 static int fg_set_ram_addr(struct pmi8994_fg *fg, u16 address)
@@ -559,11 +583,15 @@ static int fg_apply_board_settings(struct pmi8994_fg *fg)
 	u8 jeita[4], data[2];
 	int i, rc;
 
+	rc = fg_hold_access(fg);
+	if (rc)
+		return rc;
+
 	if (fg->has_thermal_coeff) {
 		rc = fg_mem_write(fg, THERMAL_COEFF_ADDR, THERMAL_COEFF_OFF,
 				  fg->thermal_coeff, THERMAL_COEFF_N_BYTES);
 		if (rc)
-			return rc;
+			goto out;
 	}
 
 	if (fg->has_jeita) {
@@ -571,14 +599,14 @@ static int fg_apply_board_settings(struct pmi8994_fg *fg)
 			jeita[i] = (fg->jeita_decidegc[i] / 10) + 30;
 		rc = fg_mem_write(fg, JEITA_ADDR, 0, jeita, 4);
 		if (rc)
-			return rc;
+			goto out;
 	}
 
 	if (fg->cutoff_mv) {
 		fg_uv_to_adc((s64)fg->cutoff_mv * 1000, data);
 		rc = fg_mem_write(fg, CUTOFF_VOLTAGE_ADDR, 0, data, 2);
 		if (rc)
-			return rc;
+			goto out;
 	}
 
 	if (fg->iterm_ma) {
@@ -586,30 +614,43 @@ static int fg_apply_board_settings(struct pmi8994_fg *fg)
 		rc = fg_mem_write(fg, TERM_CURRENT_ADDR, TERM_CURRENT_OFF,
 				  data, 2);
 		if (rc)
-			return rc;
+			goto out;
 	}
 
 	if (fg->chg_iterm_ma) {
 		fg_uv_to_adc((s64)(-(s32)fg->chg_iterm_ma) * 1000, data);
 		rc = fg_mem_write(fg, CHG_TERM_ADDR, CHG_TERM_OFF, data, 2);
 		if (rc)
-			return rc;
+			goto out;
 	}
 
 	if (fg->resume_soc && fg->resume_soc < 100) {
 		data[0] = DIV_ROUND_CLOSEST(fg->resume_soc * FULL_SOC_RAW, 100);
 		rc = fg_mem_write(fg, RESUME_SOC_ADDR, RESUME_SOC_OFF, data, 1);
 		if (rc)
-			return rc;
+			goto out;
 	}
 
 	rc = fg_mem_masked_write(fg, EXTERNAL_SENSE_SELECT, BATT_TEMP_CNTRL_OFF,
 				 BATT_TEMP_CNTRL_MASK, TEMP_SENSE_ALWAYS_BIT);
 	if (rc)
-		return rc;
+		goto out;
 
-	return fg_mem_masked_write(fg, EXTERNAL_SENSE_SELECT, EXTERNAL_SENSE_OFF,
-				   PATCH_NEG_CURRENT_BIT, PATCH_NEG_CURRENT_BIT);
+	rc = fg_mem_masked_write(fg, EXTERNAL_SENSE_SELECT, EXTERNAL_SENSE_OFF,
+				 PATCH_NEG_CURRENT_BIT, PATCH_NEG_CURRENT_BIT);
+out:
+	fg_unhold_access(fg);
+	return rc;
+}
+
+static void fg_sram_work(struct work_struct *work)
+{
+	struct pmi8994_fg *fg = container_of(work, struct pmi8994_fg, sram_work);
+	int rc;
+
+	rc = fg_apply_board_settings(fg);
+	if (rc)
+		dev_err(fg->dev, "board settings failed (%d)\n", rc);
 }
 
 static int fg_refresh_telem(struct pmi8994_fg *fg)
@@ -825,7 +866,7 @@ static int fg_setup_profile(struct pmi8994_fg *fg)
 		dev_warn(dev, "battery ID unreadable (%d), leaving SRAM profile\n",
 			 rc);
 		fg->unknown_battery = true;
-		return fg_apply_board_settings(fg);
+		return 0;
 	}
 
 	dev_info(dev, "battery ID %d kΩ (expect %u ±%u%%)\n",
@@ -835,13 +876,13 @@ static int fg_setup_profile(struct pmi8994_fg *fg)
 	    !fg_id_in_range(fg, expect_kohm, range_pct)) {
 		fg->unknown_battery = true;
 		dev_info(dev, "ID out of range; not loading profile\n");
-		return fg_apply_board_settings(fg);
+		return 0;
 	}
 
 	len = device_property_count_u8(dev, "qcom,fg-profile-data");
 	if (len != FG_PROFILE_LEN) {
 		dev_dbg(dev, "no 128-byte fg-profile-data, using SRAM as-is\n");
-		return fg_apply_board_settings(fg);
+		return 0;
 	}
 
 	profile = kcalloc(FG_PROFILE_LEN, sizeof(*profile), GFP_KERNEL);
@@ -859,7 +900,7 @@ static int fg_setup_profile(struct pmi8994_fg *fg)
 	if (rc)
 		dev_err(dev, "profile load failed (%d)\n", rc);
 
-	return fg_apply_board_settings(fg);
+	return 0;
 }
 
 static int fg_probe(struct platform_device *pdev)
@@ -876,6 +917,7 @@ static int fg_probe(struct platform_device *pdev)
 
 	fg->dev = &pdev->dev;
 	mutex_init(&fg->lock);
+	INIT_WORK(&fg->sram_work, fg_sram_work);
 
 	fg->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!fg->regmap)
@@ -935,7 +977,16 @@ static int fg_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, fg);
+	schedule_work(&fg->sram_work);
 	return 0;
+}
+
+static void fg_remove(struct platform_device *pdev)
+{
+	struct pmi8994_fg *fg = platform_get_drvdata(pdev);
+
+	cancel_work_sync(&fg->sram_work);
+	fg_unhold_access(fg);
 }
 
 static const struct of_device_id fg_of_match[] = {
@@ -950,6 +1001,7 @@ static struct platform_driver fg_driver = {
 		.of_match_table = fg_of_match,
 	},
 	.probe = fg_probe,
+	.remove = fg_remove,
 };
 module_platform_driver(fg_driver);
 
