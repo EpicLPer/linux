@@ -319,9 +319,6 @@ config QCOM_QMI_HELPERS
 	tristate
 	depends on NET
 
-config QCOM_PMIC_SEC_WRITE
-	tristate
-
 config QCOM_UBWC_CONFIG
 	tristate
 	depends on QCOM_SMEM

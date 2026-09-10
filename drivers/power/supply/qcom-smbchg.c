@@ -24,13 +24,43 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/reboot.h>
 #include <linux/regulator/driver.h>
 #include <linux/unaligned.h>
 #include <linux/util_macros.h>
-#include <soc/qcom/pmic-sec-write.h>
 
 #include "qcom-smbchg.h"
+
+#define SMBCHG_SEC_ACCESS	0xd0
+#define SMBCHG_SEC_UNLOCK	0xa5
+
+static int smbchg_sec_write(struct smbchg_chip *chip, u16 addr, u8 val)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&chip->sec_access_lock, flags);
+	ret = regmap_write(chip->regmap, (addr & 0xff00) + SMBCHG_SEC_ACCESS,
+			   SMBCHG_SEC_UNLOCK);
+	if (!ret)
+		ret = regmap_write(chip->regmap, addr, val);
+	spin_unlock_irqrestore(&chip->sec_access_lock, flags);
+	return ret;
+}
+
+static int smbchg_sec_masked_write(struct smbchg_chip *chip, u16 addr,
+				   u8 mask, u8 val)
+{
+	unsigned int reg;
+	int ret;
+
+	ret = regmap_read(chip->regmap, addr, &reg);
+	if (ret)
+		return ret;
+
+	return smbchg_sec_write(chip, addr, (reg & ~mask) | (val & mask));
+}
 
 static int smbchg_closest_below(int target, const int *table, unsigned int len)
 {
@@ -215,7 +245,7 @@ static int smbchg_usb_set_ilim_lc(struct smbchg_chip *chip, int current_ua)
 	full_current = ilim_mask & LC_ILIM_FULL_CURRENT_BIT;
 
 	/* Set USB version */
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_USB_CHGPTH_CFG,
 					 CFG_USB3P0_SEL_BIT,
 					 usb_3 ? USB_3P0_SEL : USB_2P0_SEL);
@@ -286,7 +316,7 @@ static int smbchg_usb_set_ilim_hc(struct smbchg_chip *chip, int current_ua)
 	ilim = chip->data->ilim_table[ilim_index];
 
 	/* Set the current limit index */
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_USB_CHGPTH_IL_CFG,
 					 USBIN_INPUT_MASK, ilim_index);
 	if (ret) {
@@ -314,8 +344,8 @@ static int smbchg_usb_set_ilim_hc(struct smbchg_chip *chip, int current_ua)
 		current_ua);
 
 	/* Disable AICL as it is no longer used */
-	ret = qcom_pmic_sec_masked_write(
-		chip->regmap, chip->base + SMBCHG_USB_CHGPTH_AICL_CFG,
+	ret = smbchg_sec_masked_write(chip,
+				      chip->base + SMBCHG_USB_CHGPTH_AICL_CFG,
 		USB_CHGPTH_AICL_EN, 0);
 	if (ret)
 		/*
@@ -428,7 +458,7 @@ static int smbchg_usb_aicl_enable(struct smbchg_chip *chip, int ceiling_ua)
 		return ret;
 	}
 
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_USB_CHGPTH_IL_CFG,
 					 USBIN_INPUT_MASK, ilim_index);
 	if (ret) {
@@ -438,8 +468,8 @@ static int smbchg_usb_aicl_enable(struct smbchg_chip *chip, int ceiling_ua)
 	}
 
 	/* Enable AICL */
-	return qcom_pmic_sec_masked_write(
-		chip->regmap, chip->base + SMBCHG_USB_CHGPTH_AICL_CFG,
+	return smbchg_sec_masked_write(chip,
+				       chip->base + SMBCHG_USB_CHGPTH_AICL_CFG,
 		USB_CHGPTH_AICL_EN, USB_CHGPTH_AICL_EN);
 }
 
@@ -490,7 +520,7 @@ static int smbchg_charging_set_vfloat(struct smbchg_chip *chip, int voltage_uv)
 	fv_index = 5 + smbchg_closest_below(voltage_uv, smbchg_fv_table,
 					    ARRAY_SIZE(smbchg_fv_table));
 
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_CHGR_FV_CFG,
 					 FV_MASK, fv_index);
 	if (ret) {
@@ -547,7 +577,7 @@ static int smbchg_charging_set_iterm(struct smbchg_chip *chip, int current_ua)
 	iterm_index =
 		find_closest(current_ua, chip->data->iterm_table, iterm_count);
 
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_CHGR_TCC_CFG,
 					 CHG_ITERM_MASK, iterm_index);
 	if (ret)
@@ -613,7 +643,7 @@ static int smbchg_charging_set_ilim(struct smbchg_chip *chip, int current_ua)
 	ilim = chip->data->ilim_table[ilim_index];
 
 	/* Set the current limit index */
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_CHGR_FCC_CFG,
 					 FCC_MASK, ilim_index);
 	if (ret) {
@@ -1642,16 +1672,16 @@ static int smbchg_init(struct smbchg_chip *chip)
 	 * - Set recharge voltage reading source to fuel gauge
 	 * - Set charge termination current reading source to fuel gauge
 	 */
-	ret = qcom_pmic_sec_masked_write(
-		chip->regmap, chip->base + SMBCHG_CHGR_CHGR_CFG1,
+	ret = smbchg_sec_masked_write(chip,
+				      chip->base + SMBCHG_CHGR_CHGR_CFG1,
 		RECHG_THRESHOLD_SRC_BIT | TERM_I_SRC_BIT,
 		RCHG_SRC_FG | TERM_SRC_FG);
 	if (ret)
 		return ret;
 
 	/* Command-path charge enable (3.10 CHGR_CFG2 CHG_EN_COMMAND). */
-	ret = qcom_pmic_sec_masked_write(
-		chip->regmap, chip->base + SMBCHG_CHGR_CHGR_CFG2,
+	ret = smbchg_sec_masked_write(chip,
+				      chip->base + SMBCHG_CHGR_CHGR_CFG2,
 		CHARGER_INHIBIT_BIT | AUTO_RECHG_BIT | I_TERM_BIT |
 			P2F_CHG_TRAN_BIT | CHG_EN_COMMAND_BIT |
 			CHG_EN_SRC_BIT,
@@ -1662,7 +1692,7 @@ static int smbchg_init(struct smbchg_chip *chip)
 		return ret;
 
 	/* Set recharge threshold to 100mV */
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_CHGR_CFG,
 					 RCHG_LVL_BIT, RCHG_THRESH_100MV);
 	if (ret)
@@ -1716,16 +1746,16 @@ static int smbchg_init(struct smbchg_chip *chip)
 	 * - Set command polarity to full current mode (i.e. setting
 	 *   USB_CHGPTH_CMD_IL:USB51_MODE_BIT corresponds to full SDP current)
 	 */
-	ret = qcom_pmic_sec_masked_write(
-		chip->regmap, chip->base + SMBCHG_USB_CHGPTH_CFG,
+	ret = smbchg_sec_masked_write(chip,
+				      chip->base + SMBCHG_USB_CHGPTH_CFG,
 		USB51AC_CTRL | USB51_COMMAND_POL,
 		USB51_COMMAND_CONTROL | USB51AC_COMMAND1_500);
 	if (ret)
 		return ret;
 
 	/* Enable APSD */
-	ret = qcom_pmic_sec_masked_write(
-		chip->regmap, chip->base + SMBCHG_USB_CHGPTH_APSD_CFG,
+	ret = smbchg_sec_masked_write(chip,
+				      chip->base + SMBCHG_USB_CHGPTH_APSD_CFG,
 		USB_CHGPTH_APSD_EN, USB_CHGPTH_APSD_EN);
 	if (ret) {
 		dev_err(chip->dev, "Failed to enable APSD: %pe\n",
@@ -1734,7 +1764,7 @@ static int smbchg_init(struct smbchg_chip *chip)
 	}
 
 	/* Enable periodic AICL rerun on the USB charge path */
-	ret = qcom_pmic_sec_masked_write(chip->regmap,
+	ret = smbchg_sec_masked_write(chip,
 					 chip->base + SMBCHG_MISC_TRIM_OPT_15_8,
 					 AICL_RERUN_MASK, AICL_RERUN_USB_BIT);
 	if (ret) {
