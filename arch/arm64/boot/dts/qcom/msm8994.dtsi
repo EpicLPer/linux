@@ -50,6 +50,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x0>;
 			enable-method = "psci";
+			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			capacity-dmips-mhz = <573>;
 			clocks = <&apcc APCS_CPU_A53_CLK>;
 			cpu-supply = <&pm8994_s8>;
 			operating-points-v2 = <&cluster0_opp>;
@@ -67,6 +69,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x1>;
 			enable-method = "psci";
+			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			capacity-dmips-mhz = <573>;
 			clocks = <&apcc APCS_CPU_A53_CLK>;
 			cpu-supply = <&pm8994_s8>;
 			operating-points-v2 = <&cluster0_opp>;
@@ -79,6 +83,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x2>;
 			enable-method = "psci";
+			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			capacity-dmips-mhz = <573>;
 			clocks = <&apcc APCS_CPU_A53_CLK>;
 			cpu-supply = <&pm8994_s8>;
 			operating-points-v2 = <&cluster0_opp>;
@@ -91,6 +97,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x3>;
 			enable-method = "psci";
+			cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
+			capacity-dmips-mhz = <573>;
 			clocks = <&apcc APCS_CPU_A53_CLK>;
 			cpu-supply = <&pm8994_s8>;
 			operating-points-v2 = <&cluster0_opp>;
@@ -103,6 +111,8 @@
 			compatible = "arm,cortex-a57";
 			reg = <0x0 0x100>;
 			enable-method = "psci";
+			cpu-idle-states = <&big_cpu_sleep_0>;
+			capacity-dmips-mhz = <1024>;
 			clocks = <&apcc APCS_CPU_A57_CLK>;
 			cpu-supply = <&pm8994_s11>;
 			operating-points-v2 = <&cluster1_opp>;
@@ -120,6 +130,8 @@
 			compatible = "arm,cortex-a57";
 			reg = <0x0 0x101>;
 			enable-method = "psci";
+			cpu-idle-states = <&big_cpu_sleep_0>;
+			capacity-dmips-mhz = <1024>;
 			clocks = <&apcc APCS_CPU_A57_CLK>;
 			cpu-supply = <&pm8994_s11>;
 			operating-points-v2 = <&cluster1_opp>;
@@ -132,6 +144,8 @@
 			compatible = "arm,cortex-a57";
 			reg = <0x0 0x102>;
 			enable-method = "psci";
+			cpu-idle-states = <&big_cpu_sleep_0>;
+			capacity-dmips-mhz = <1024>;
 			clocks = <&apcc APCS_CPU_A57_CLK>;
 			cpu-supply = <&pm8994_s11>;
 			operating-points-v2 = <&cluster1_opp>;
@@ -144,6 +158,8 @@
 			compatible = "arm,cortex-a57";
 			reg = <0x0 0x103>;
 			enable-method = "psci";
+			cpu-idle-states = <&big_cpu_sleep_0>;
+			capacity-dmips-mhz = <1024>;
 			clocks = <&apcc APCS_CPU_A57_CLK>;
 			cpu-supply = <&pm8994_s11>;
 			operating-points-v2 = <&cluster1_opp>;
@@ -186,6 +202,40 @@
 				cpu7_map: core3 {
 					cpu = <&cpu7>;
 				};
+			};
+		};
+
+		idle-states {
+			entry-method = "psci";
+
+			little_cpu_sleep_0: cpu-sleep-0-0 {
+				compatible = "arm,idle-state";
+				idle-state-name = "little-retention";
+				arm,psci-suspend-param = <0x00000002>;
+				entry-latency-us = <50>;
+				exit-latency-us = <100>;
+				min-residency-us = <313>;
+				local-timer-stop;
+			};
+
+			little_cpu_sleep_1: cpu-sleep-0-1 {
+				compatible = "arm,idle-state";
+				idle-state-name = "little-spc";
+				arm,psci-suspend-param = <0x00010004>;
+				entry-latency-us = <400>;
+				exit-latency-us = <400>;
+				min-residency-us = <2000>;
+				local-timer-stop;
+			};
+
+			big_cpu_sleep_0: cpu-sleep-1-0 {
+				compatible = "arm,idle-state";
+				idle-state-name = "big-retention";
+				arm,psci-suspend-param = <0x00000002>;
+				entry-latency-us = <80>;
+				exit-latency-us = <120>;
+				min-residency-us = <400>;
+				local-timer-stop;
 			};
 		};
 	};
@@ -316,13 +366,18 @@
 		reg = <0 0x80000000 0 0>;
 		};
 
-	pmu {
+	pmu-a53 {
 		compatible = "arm,cortex-a53-pmu";
-		interrupts = <GIC_PPI 7 (GIC_CPU_MASK_SIMPLE(4)| IRQ_TYPE_LEVEL_HIGH)>;
+		interrupts = <GIC_PPI 7 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>;
+	};
+
+	pmu_a57: pmu-a57 {
+		compatible = "arm,cortex-a57-pmu";
+		interrupts = <GIC_PPI 7 (GIC_CPU_MASK_RAW(0xf0) | IRQ_TYPE_LEVEL_HIGH)>;
 	};
 
 	psci {
-		compatible = "arm,psci-0.2";
+		compatible = "arm,psci-1.0";
 		method = "hvc";
 	};
 
