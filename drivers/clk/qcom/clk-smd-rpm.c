@@ -944,6 +944,7 @@ static struct clk_smd_rpm *msm8994_clks[] = {
 	[RPM_SMD_CE2_A_CLK] = &clk_smd_rpm_ce2_a_clk,
 	[RPM_SMD_CE3_CLK] = &clk_smd_rpm_ce3_clk,
 	[RPM_SMD_CE3_A_CLK] = &clk_smd_rpm_ce3_a_clk,
+	[RPM_SMD_BIMC_A_CLK] = &clk_smd_rpm_bimc_a_clk,
 };
 
 static const struct rpm_smd_clk_desc rpm_clk_msm8994 = {

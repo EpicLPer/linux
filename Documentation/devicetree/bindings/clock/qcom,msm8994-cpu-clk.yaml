@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/qcom,msm8994-cpu-clk.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm MSM8994 / MSM8992 CPU clock controller
+
+maintainers:
+  - Bjorn Andersson <andersson@kernel.org>
+
+description: |
+  CPU cluster clocks on MSM8994 and MSM8992. Clock 0 is the A53 cluster
+  and clock 1 is the A57 cluster.
+
+  The A53 mux lives in the APCS KPSS global region, which is already the
+  mailbox syscon at 0xf900d000. Do not map that window a second time.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: qcom,msm8992-cpu-clk
+          - const: qcom,msm8994-cpu-clk
+      - const: qcom,msm8994-cpu-clk
+
+  reg:
+    items:
+      - description: A53 PLL window (pll0 at +0x00, pll1/PLLA at +0x40)
+      - description: A57 PLL window (pll0 at +0x00, pll1/PLLA at +0x40)
+      - description: A57 mux (c1_mux)
+
+  reg-names:
+    items:
+      - const: c0-pll
+      - const: c1-pll
+      - const: c1-mux
+
+  '#clock-cells':
+    const: 1
+
+  clocks:
+    minItems: 2
+    items:
+      - description: XO source
+      - description: GPLL0 aux (safe parent)
+      - description: BIMC active set (3.10 bimc_a_clk). Optional.
+
+  clock-names:
+    minItems: 2
+    items:
+      - const: xo
+      - const: aux
+      - const: bimc
+
+  qcom,apcs:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: APCS KPSS global syscon that contains the A53 mux
+
+  power-domains:
+    maxItems: 1
+    description: |
+      PM8994 S2 (VDDMX). 3.10 CPU PLL vdd-dig is pm8994_s2_corner_ao
+      (qcom,set = 1, active only), which is MSM8994_VDDMX_AO.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#clock-cells'
+  - clocks
+  - clock-names
+  - qcom,apcs
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/qcom,gcc-msm8994.h>
+
+    clock-controller@f9015000 {
+        compatible = "qcom,msm8994-cpu-clk";
+        reg = <0xf9015000 0x80>,
+              <0xf9016000 0x80>,
+              <0xf900f000 0x1000>;
+        reg-names = "c0-pll", "c1-pll", "c1-mux";
+        qcom,apcs = <&apcs>;
+        power-domains = <&rpmpd 4>;
+        clocks = <&xo_board>, <&gcc GPLL0>;
+        clock-names = "xo", "aux";
+        #clock-cells = <1>;
+    };
