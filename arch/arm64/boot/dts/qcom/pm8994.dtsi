@@ -146,6 +146,19 @@
 
 		pm8994_spmi_regulators: regulators {
 			compatible = "qcom,pm8994-regulators";
+
+			/*
+			 * FTS APC rails. 3.10 qcom,spm-regulator limits.
+			 */
+			pm8994_s8: s8 {
+				regulator-min-microvolt = <700000>;
+				regulator-max-microvolt = <1180000>;
+			};
+
+			pm8994_s11: s11 {
+				regulator-min-microvolt = <700000>;
+				regulator-max-microvolt = <1225000>;
+			};
 		};
 	};
 };

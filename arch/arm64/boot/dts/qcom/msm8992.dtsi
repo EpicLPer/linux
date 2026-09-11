@@ -11,6 +11,99 @@
 /delete-node/ &cpu6_map;
 /delete-node/ &cpu7_map;
 
+&apcc {
+	compatible = "qcom,msm8992-cpu-clk", "qcom,msm8994-cpu-clk";
+	clocks = <&xo_board>, <&gcc GPLL0>;
+	clock-names = "xo", "aux";
+};
+
+/*
+ * 8994 TSENS plat data is 16-sensor. 8992 is 13-sensor with
+ * a different fuse packing — do not bind qcom,msm8994-tsens.
+ */
+/delete-node/ &tsens;
+/delete-node/ &tsens0_thermal;
+/delete-node/ &tsens1_thermal;
+/delete-node/ &pop_mem_thermal;
+/delete-node/ &tsens3_thermal;
+/delete-node/ &tsens4_thermal;
+/delete-node/ &tsens5_thermal;
+/delete-node/ &tsens11_thermal;
+/delete-node/ &gpu_thermal;
+/delete-node/ &cpu0_thermal;
+/delete-node/ &cpu1_thermal;
+/delete-node/ &cpu2_thermal;
+/delete-node/ &cpu3_thermal;
+/delete-node/ &cpu4_thermal;
+/delete-node/ &cpu5_thermal;
+/delete-node/ &cpu6_thermal;
+/delete-node/ &cpu7_thermal;
+
+/* 8992 A53 speedbin0 stops at 1.248 GHz (787.2, not 768). */
+&cluster0_opp {
+	/delete-node/ opp-768000000;
+	/delete-node/ opp-1344000000;
+	/delete-node/ opp-1478400000;
+	/delete-node/ opp-1555200000;
+
+	opp-600000000 {
+		opp-microvolt = <900000>;
+	};
+	opp-672000000 {
+		opp-microvolt = <1000000>;
+	};
+	opp-787200000 {
+		opp-hz = /bits/ 64 <787200000>;
+		opp-microvolt = <1000000>;
+	};
+	opp-864000000 {
+		opp-microvolt = <1115000>;
+	};
+	opp-960000000 {
+		opp-microvolt = <1115000>;
+	};
+};
+
+&cluster1_opp {
+	opp-480000000 {
+		opp-microvolt = <900000>;
+	};
+	opp-633600000 {
+		opp-microvolt = <900000>;
+	};
+	opp-768000000 {
+		opp-microvolt = <1000000>;
+	};
+	opp-864000000 {
+		opp-microvolt = <1000000>;
+	};
+	opp-960000000 {
+		opp-microvolt = <1000000>;
+	};
+	opp-1248000000 {
+		opp-microvolt = <1115000>;
+	};
+	opp-1344000000 {
+		opp-microvolt = <1115000>;
+	};
+	opp-1440000000 {
+		opp-microvolt = <1115000>;
+	};
+	opp-1536000000 {
+		opp-microvolt = <1115000>;
+	};
+	opp-1632000000 {
+		opp-microvolt = <1115000>;
+	};
+	/delete-node/ opp-1728000000;
+	/delete-node/ opp-1824000000;
+	/delete-node/ opp-1958400000;
+	opp-1689600000 {
+		opp-hz = /bits/ 64 <1689600000>;
+		opp-microvolt = <1115000>;
+	};
+};
+
 &gcc {
 	compatible = "qcom,gcc-msm8992";
 };
