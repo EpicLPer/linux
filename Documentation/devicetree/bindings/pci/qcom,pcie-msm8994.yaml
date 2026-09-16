@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/qcom,pcie-msm8994.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm MSM8994 PCI Express Root Complex
+
+maintainers:
+  - Bjorn Andersson <andersson@kernel.org>
+  - Manivannan Sadhasivam <mani@kernel.org>
+
+description:
+  MSM8994 (and MSM8992 RC0) DWC host with 3.10 PARF programming
+  (SYS_CTRL 0x365E, DBI_BASE 0, AXI halt at 0x178). MSI is a single
+  GIC SPI, not the eight MSM8996 MSI SPIs. Do not use 8996 MHI /
+  HALT_V2 PARF offsets.
+
+properties:
+  compatible:
+    const: qcom,pcie-msm8994
+
+  reg:
+    maxItems: 4
+
+  reg-names:
+    items:
+      - const: parf
+      - const: dbi
+      - const: elbi
+      - const: config
+
+  clocks:
+    maxItems: 4
+
+  clock-names:
+    items:
+      - const: aux
+      - const: cfg
+      - const: bus_master
+      - const: bus_slave
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    items:
+      - const: msi
+
+  vdda-supply:
+    description: Analog PHY supply (PM8994 L28)
+
+  vddpe-3v3-supply:
+    description: Endpoint 3.3 V supply
+
+  qcom,scm-dev-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      TZ device id for restore_sec_cfg. 3.10 uses 11 on pcie0 and
+      12 on pcie1.
+
+required:
+  - power-domains
+
+allOf:
+  - $ref: qcom,pcie-common.yaml#
+
+unevaluatedProperties: false

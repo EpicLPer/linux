@@ -562,6 +562,14 @@ struct dw_pcie {
 	u32			version;
 	u32			type;
 	unsigned long		caps;
+	/*
+	 * qcom msm8994: the ATU 'TD' bit is an ECRC override on cores older
+	 * than 5.10A, so dw_pcie_prog_outbound_atu() appends a TLP Digest to
+	 * every translated TLP. The vendor 3.10 stack never sets it
+	 * (msm_pcie_iatu_config() writes the transaction type only). Set from
+	 * the controller's "qcom,no-ecrc" DT property to match stock.
+	 */
+	bool			no_ecrc;
 	int			num_lanes;
 	int			max_link_speed;
 	u8			n_fts[2];

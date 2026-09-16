@@ -75,6 +75,58 @@
 		};
 	};
 
+	/*
+	 * LAB testR6: QCA6174 as a power-sequencing provider (Val Packett's
+	 * suggestion to model the WLAN PMU via pwrseq-qcom-wcn). The discrete
+	 * Rome chip is powered by the PCIe PHY rail (vdda), the module enable
+	 * line (vddpe-3v3 = wlan_en), and clocked by the 32.768 kHz sleep clock
+	 * (divclk4). The provider enables them in order before the RC is trained.
+	 */
+	wcn_pmu: power-sequencer {
+		compatible = "qcom,qca6174-pmu";
+		vdda-supply = <&vreg_l28a_1p0>;
+		vddpe-3v3-supply = <&wlan_en>;
+		clocks = <&divclk4>;
+		#power-domain-cells = <0>;
+	};
+
+	/*
+	 * 3.10 bt_vreg / wlan_vreg share PM8994 GPIO 9
+	 * (WLAN_LDO_3V_CTRL). QCA6174 chip enable is TLMM 113.
+	 */
+	wlan_vreg: wlan-vreg {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vreg";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&pm8994_gpios 9 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <4000>;
+		/*
+		 * This pin is the enable of the module's 3.3 V LDO (vendor name
+		 * `bt-vdd-pa`/`vdd-wlan`). The vendor DT configures PM8994 GPIO 9
+		 * with `vin-sel = PM8994_GPIO_VPH` (it is the only output in that
+		 * node not using vin-sel=<2>); without an explicit pin state
+		 * mainline keeps the firmware's VIN2 (1.8 V) source, which can
+		 * leave the LDO's EN threshold unmet.
+		 */
+		pinctrl-names = "default";
+		pinctrl-0 = <&wlan_vreg_default &wlan_clk_default>;
+	};
+
+	wlan_en: wlan-en {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tlmm 113 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&wlan_vreg>;
+		enable-active-high;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wlan_en_default>;
+		/* testR4: match working msm8996-xiaomi-common QCA6174a wlan_en delay */
+		startup-delay-us = <70000>;
+	};
 
 	gpio-keys {
 		compatible = "gpio-keys";
@@ -678,6 +730,33 @@
 		"PMI_SPON", /* GPIO_20 */
 		"BUA_PMI8994"; /* GPIO_21 */
 
+	wlan_vreg_default: wlan-vreg-state {
+		pinconf {
+			pins = "gpio9";
+			function = PMIC_GPIO_FUNC_NORMAL;
+			power-source = <PM8994_GPIO_VPH>;
+			bias-disable;
+		};
+	};
+
+	/*
+	 * PM8994 GPIO 18 = DIVCLK4 = the 32.768 kHz sleep clock fed to the
+	 * QCA6174. The `divclk4` fixed-clock node declares pinctrl-0 =
+	 * <&divclk4_pin_a>, but `fixed-clock` is registered by
+	 * CLK_OF_DECLARE and clk-fixed-rate.c contains no pinctrl handling at
+	 * all, so that state is never applied and the pin keeps whatever
+	 * firmware left. This group is attached to wlan-vreg (a real platform
+	 * device) so that it actually gets programmed.
+	 */
+	wlan_clk_default: wlan-clk-state {
+		pinconf {
+			pins = "gpio18";
+			function = PMIC_GPIO_FUNC_FUNC2;
+			power-source = <PM8994_GPIO_S4>;
+			bias-disable;
+		};
+	};
+
 	bt_en_gpios: bt-en-gpios-state {
 		pinconf {
 			pins = "gpio19";
@@ -699,10 +778,20 @@
 
 
 	divclk4_pin_a: divclk4-state {
+		/*
+		 * LAB testR16: replicate the vendor's full GPIO18 (DIVCLK4) config
+		 * (mmo/common/gpios.dtsi gpio@d100): mode=digital-out, CMOS,
+		 * invert=0, vin-sel=2 (VIN2), src-sel=3 (FUNC2), out-strength=2
+		 * (medium), master-en=1. Our old state only muxed FUNC2, missing
+		 * master-en + drive-strength, so the PMIC divider may not actually
+		 * generate the 32.768 kHz the QCA6174 (and BT) need.
+		 */
 		pinconf {
 			pins = "gpio18";
 			function = PMIC_GPIO_FUNC_FUNC2;
-			power-source = <PM8994_GPIO_S4>;
+			power-source = <PM8994_GPIO_S4>;	/* vendor vin-sel=2 */
+			qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>; /* vendor out-strength=2 */
+			output-low;
 			bias-disable;
 		};
 	};
@@ -865,6 +954,8 @@
 			regulator-max-microvolt = <1300000>;
 			regulator-allow-set-load;
 			regulator-system-load = <300000>;
+			/* testR4: Required by QCA6174a vdd-core (xiaomi) - force on */
+			regulator-always-on;
 		};
 
 		vreg_s4a_1p8: s4 {
@@ -1382,4 +1473,9 @@
 		drive-strength = <2>;
 		bias-pull-down;
 	};
+};
+
+/* 3.10 vreg-1.8 is PM8994 L12. pciephy1 is 8994-only (cityman). */
+&pciephy0 {
+	vdda-supply = <&vreg_l12a_1p8>;
 };

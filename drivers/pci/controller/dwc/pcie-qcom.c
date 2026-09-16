@@ -12,6 +12,8 @@
 #include <linux/crc8.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/workqueue.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interconnect.h>
 #include <linux/interrupt.h>
@@ -32,6 +34,7 @@
 #include <linux/phy/phy.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
+#include <linux/pwrseq/consumer.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/units.h>
@@ -260,6 +263,12 @@ struct qcom_pcie;
 
 struct qcom_pcie_ops {
 	int (*get_resources)(struct qcom_pcie *pcie);
+	/*
+	 * Runs before PERST# is asserted. msm8994 uses this to power
+	 * vddpe-3v3 (i.e. bring the endpoint up before the RC asserts the
+	 * reset it needs released after the endpoint is powered).
+	 */
+	int (*pre_init)(struct qcom_pcie *pcie);
 	int (*init)(struct qcom_pcie *pcie);
 	int (*post_init)(struct qcom_pcie *pcie);
 	void (*host_post_init)(struct qcom_pcie *pcie);
@@ -308,6 +317,20 @@ struct qcom_pcie {
 	struct gpio_desc *reset;
 	int global_irq;
 	bool use_pm_opp;
+
+	/* msm8994: 3.10 pci-msm `wake-gpio` (endpoint wake line) */
+	struct gpio_desc *ep_wake;
+	/* LAB testR6: QCA6174 power sequencer (pwrseq-qcom-wcn) */
+	struct pwrseq_desc *ep_pwrseq;
+	/* LAB testR5: endpoint WAKE# IRQ (Juliann/snaccy: "add ep wakeirq") */
+	int ep_wake_irq;
+	atomic_t ep_wake_events;
+	/* msm8994: true while running the second, endpoint-powered bring-up */
+	bool second_pass;
+	/* msm8994: whether vddpe-3v3 is currently enabled */
+	bool rail_on;
+	/* LAB testR20: deferred (runtime) re-enumeration, cnss-style */
+	struct delayed_work reenum_work;
 };
 
 #define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
@@ -331,6 +354,17 @@ static void __qcom_pcie_perst_assert(struct qcom_pcie *pcie, bool assert)
 static void qcom_pcie_perst_assert(struct qcom_pcie *pcie)
 {
 	__qcom_pcie_perst_assert(pcie, true);
+}
+
+static irqreturn_t qcom_pcie_ep_wake_irq(int irq, void *data)
+{
+	struct qcom_pcie *pcie = data;
+	int n = atomic_inc_return(&pcie->ep_wake_events);
+
+	dev_info(pcie->pci->dev, "LAB: EP WAKE# asserted (#%d, line=%d)\n",
+		 n, gpiod_get_value_cansleep(pcie->ep_wake));
+
+	return IRQ_HANDLED;
 }
 
 static void qcom_pcie_perst_deassert(struct qcom_pcie *pcie)
@@ -787,6 +821,740 @@ static int qcom_pcie_post_init_2_3_2(struct qcom_pcie *pcie)
 
 	return 0;
 }
+
+/*
+ * msm8994: keep the endpoint-rail refcount and the actual regulator state in
+ * sync by hand, because pre_init/deinit are not paired the way
+ * qcom_pcie_init_2_3_2()/qcom_pcie_deinit_2_3_2() assume (pre_init is not run
+ * on the suspend/resume path's deinit).
+ */
+static int qcom_pcie_msm8994_rail(struct qcom_pcie *pcie, bool on)
+{
+	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
+	int ret = 0;
+
+	if (on == pcie->rail_on)
+		return 0;
+
+	if (on)
+		ret = regulator_bulk_enable(ARRAY_SIZE(res->supplies),
+					    res->supplies);
+	else
+		regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
+	if (ret)
+		return ret;
+
+	pcie->rail_on = on;
+
+	return 0;
+}
+
+/*
+ * MSM8994: the endpoint is the QCA6174 on pcie1, powered by vddpe-3v3 (WLAN_EN).
+ *
+ * The endpoint needs a PERST# cycle while it is *unpowered*, then its power-up,
+ * then a second PERST# cycle - only then does it train a link. That was measured
+ * the hard way: powering the rail up front and running a single bring-up (the
+ * "obvious simplification") leaves the link untrained entirely ("Device not
+ * found", testOY), which is worse than the two-pass, and it is also why the
+ * vendor runs two enables (its first fails because nothing has powered the
+ * endpoint yet; cnss powers it and the second succeeds).
+ *
+ * So the first pass is deliberately left unpowered and simply fails, and
+ * ops->host_post_init redoes the bring-up with the rail on.
+ */
+static int qcom_pcie_pre_init_msm8994(struct qcom_pcie *pcie)
+{
+	/* vddpe-3v3 is left off for the first pass, see ops->host_post_init */
+	return 0;
+}
+
+static int qcom_pcie_get_resources_msm8994(struct qcom_pcie *pcie)
+{
+	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
+	struct device *dev = pcie->pci->dev;
+	int ret;
+
+	res->supplies[0].supply = "vdda";
+	res->supplies[1].supply = "vddpe-3v3";
+	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(res->supplies),
+				      res->supplies);
+	if (ret)
+		return ret;
+
+	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
+	if (res->num_clks < 0) {
+		dev_err(dev, "Failed to get clocks\n");
+		return res->num_clks;
+	}
+
+	/* 3.10 pci-msm `wake-gpio` (endpoint wake line) */
+	pcie->ep_wake = devm_gpiod_get_optional(dev, "wake", GPIOD_IN);
+	if (IS_ERR(pcie->ep_wake)) {
+		dev_err(dev, "Failed to get the endpoint wake gpio\n");
+		return PTR_ERR(pcie->ep_wake);
+	}
+
+	/*
+	 * LAB testR5: vendor monitor_mode registers a falling-edge IRQ on the
+	 * endpoint WAKE# line (tlmm37) and only enumerates "upon WAKE signal
+	 * from Endpoint". Mainline got the gpio but never the IRQ. Request it
+	 * (both edges) and log every assertion so we can see if the QCA6174
+	 * ever raises WAKE# on this board.
+	 */
+	if (pcie->ep_wake) {
+		pcie->ep_wake_irq = gpiod_to_irq(pcie->ep_wake);
+		if (pcie->ep_wake_irq > 0) {
+			int ret2 = devm_request_irq(dev, pcie->ep_wake_irq,
+					qcom_pcie_ep_wake_irq,
+					IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
+					"qcom-pcie-wake", pcie);
+			if (ret2)
+				dev_warn(dev, "LAB: could not request EP wake irq %d: %d\n",
+					 pcie->ep_wake_irq, ret2);
+			else
+				dev_info(dev, "LAB: EP wake irq %d registered (WAKE# tlmm37)\n",
+					 pcie->ep_wake_irq);
+		} else {
+			dev_info(dev, "LAB: EP wake gpio has no irq (%d)\n",
+				 pcie->ep_wake_irq);
+		}
+	}
+
+	/* LAB testR6: endpoint power sequencer (pwrseq-qcom-wcn / qca6174) */
+	pcie->ep_pwrseq = devm_pwrseq_get(dev, "wlan");
+	if (IS_ERR(pcie->ep_pwrseq)) {
+		dev_info(dev, "LAB: no pwrseq (wlan): %ld\n",
+			 PTR_ERR(pcie->ep_pwrseq));
+		pcie->ep_pwrseq = NULL;
+	}
+
+	return 0;
+}
+
+static void qcom_pcie_deinit_msm8994(struct qcom_pcie *pcie)
+{
+	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
+	u32 val;
+
+	/* Force PHY to lowest power state */
+	val = readl(pcie->parf + PARF_PHY_CTRL);
+	val |= PHY_TEST_PWR_DOWN;
+	writel(val, pcie->parf + PARF_PHY_CTRL);
+
+	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+
+	/* 2_3_2 would disable the rail unconditionally; ours is conditional */
+	qcom_pcie_msm8994_rail(pcie, false);
+}
+
+static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
+{
+	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
+	struct device *dev = pcie->pci->dev;
+	u32 scm_dev_id, val;
+	int i, ret;
+
+	/*
+	 * The second pass powers the endpoint here, i.e. while PERST# is still
+	 * asserted and before it is released. The first pass leaves the rail off
+	 * on purpose: that unpowered PERST# cycle is what the endpoint needs
+	 * before it will train (see qcom_pcie_pre_init_msm8994()).
+	 *
+	 * 3.10 sets aux to 1.011 MHz before clk_prepare_enable.
+	 */
+	if (pcie->second_pass) {
+		/*
+		 * QCA6174A power-up order (per the vendor device documentation):
+		 *   (1) VDDIO_AO/XTAL, (2) VDDIO_GPIO0/1/2,
+		 *   (3) all 3.3 V rails LAST.
+		 * Our DT has the VDDIO rails (PM8994 s4/l30, 1.8V) always-on, so
+		 * they are already up before wlan_vreg (3.3V, PM8994 gpio9) ->
+		 * order is VDDIO-first, 3.3V-last as required. Make it explicit:
+		 * wait for the 1.8V I/O rails to settle before raising 3.3V.
+		 */
+		usleep_range(2000, 2500);	/* VDDIO (1.8V) settled */
+
+		ret = qcom_pcie_msm8994_rail(pcie, true);
+		if (ret) {
+			dev_err(dev, "cannot enable the endpoint rail\n");
+			return ret;
+		}
+		dev_info(dev, "LAB: §3.3 VDDIO(1.8V) up, then 3.3V rail up\n");
+
+		/* LAB testR6: explicit QCA6174 power sequence (Val's suggestion) */
+		if (pcie->ep_pwrseq) {
+			ret = pwrseq_enable(pcie->ep_pwrseq);
+			dev_info(dev, "LAB: pwrseq_enable(wlan) = %d\n", ret);
+			if (ret)
+				return ret;
+		}
+
+		/*
+		 * LAB testR10: §3.4 Table 3-3 minimums:
+		 *   Tpwlen  >= 10 us   (power valid -> WLAN_EN active)
+		 *   Tprst   >= 10 ms   (power valid -> PCIE_RST_L asserted)
+		 * PERST# is already asserted here (before this point), and the
+		 * pre-PERST wait elsewhere is >>10 ms, so Tprst/Tpwlen are met.
+		 * We are about to release PERST#; ensure refclk has been stable
+		 * >= Tclkrst (100 us) by waiting, then let the caller deassert.
+		 */
+		usleep_range(2000, 2500);	/* VDDIO (1.8V) settled */
+		usleep_range(2000, 2500);	/* VDDIO (1.8V) settled */
+	}
+
+	for (i = 0; i < res->num_clks; i++) {
+		if (res->clks[i].id && !strcmp(res->clks[i].id, "aux")) {
+			ret = clk_set_rate(res->clks[i].clk, 1011000);
+			if (ret) {
+				dev_err(dev, "cannot set aux rate\n");
+				goto err_disable_regulators;
+			}
+			break;
+		}
+	}
+
+	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
+	if (ret) {
+		dev_err(dev, "cannot prepare/enable clocks\n");
+		goto err_disable_regulators;
+	}
+
+	/* 3.10 pci-msm.c restores TZ sec cfg (scm-dev-id) before PARF. */
+	if (!of_property_read_u32(dev->of_node, "qcom,scm-dev-id",
+				  &scm_dev_id) &&
+	    qcom_scm_restore_sec_cfg_available()) {
+		ret = qcom_scm_restore_sec_cfg(scm_dev_id, 0);
+		if (ret) {
+			dev_err_probe(dev, ret, "restore sec cfg %u\n",
+				      scm_dev_id);
+			goto err_disable_clks;
+		}
+	}
+
+	/* 3.10 PARF: PHY_CTRL bit0 clear, DBI base 0, SYS_CTRL 0x365E. */
+	val = readl(pcie->parf + PARF_PHY_CTRL);
+	val &= ~PHY_TEST_PWR_DOWN;
+	writel(val, pcie->parf + PARF_PHY_CTRL);
+
+	writel(0, pcie->parf + PARF_DBI_BASE_ADDR);
+	writel(0x365e, pcie->parf + PARF_SYS_CTRL);
+
+	return 0;
+
+err_disable_clks:
+	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+err_disable_regulators:
+	qcom_pcie_msm8994_rail(pcie, false);
+
+	return ret;
+}
+
+static int qcom_pcie_post_init_msm8994(struct qcom_pcie *pcie)
+{
+	struct dw_pcie *pci = pcie->pci;
+	u32 val;
+
+	/*
+	 * LAB: the vendor's endpoint is READY the instant PERST# is released
+	 * (PCIE_CRS t=0ms vid=0x003e168c), while ours answers CRS ("not ready")
+	 * indefinitely. The vendor raises WLAN_EN ~30 ms before
+	 * msm_pcie_enable() even starts, so its chip has tens of ms with the
+	 * rail up before PERST# is released; ours has only the ep-latency below.
+	 * Give the chip time to finish its internal power-up while PERST# is
+	 * still asserted (3.10 qcom,ep-latency is 10 ms; try 200 ms).
+	 */
+	usleep_range(200000, 205000);
+
+	/*
+	 * LAB: the vendor's pcie_phy_init() programs TX amplitude / de-emphasis /
+	 * RX equalisation / TX termination offset via PCIe20 PHY registers that
+	 * are named PCIE20_PARF_* and written at dev->phy == the PARF base:
+	 *   0x3c PHY_STTS, 0x44 PHY_RESET_CTRL, 0x74/0x78/0x7c PCS_DEEMPH1/2/3,
+	 *   0x80 PCS_CTRL, 0x84 CONFIGBITS, 0x88/0x8c PCS_SWING_CTRL1/2,
+	 *   0x94 PHY_CTRL3, 0xa0/0xa4 PHY_REFCLK_CTRL2/3.
+	 * Vendor targets: TX_AMP=127, DEEMPH1=0x22, DEEMPH2=0x18, DEEMPH3=0x18,
+	 * TX0_TERM_OFFST=0, RX0_EQ=0. Mainline writes NONE of these.
+	 */
+	dev_info(pci->dev, "LAB PHYREG: 3c=%#010x 44=%#010x 74=%#010x 78=%#010x 7c=%#010x 80=%#010x 84=%#010x 88=%#010x 8c=%#010x 94=%#010x a0=%#010x a4=%#010x\n",
+		 readl(pcie->parf + 0x3c), readl(pcie->parf + 0x44),
+		 readl(pcie->parf + 0x74), readl(pcie->parf + 0x78),
+		 readl(pcie->parf + 0x7c), readl(pcie->parf + 0x80),
+		 readl(pcie->parf + 0x84), readl(pcie->parf + 0x88),
+		 readl(pcie->parf + 0x8c), readl(pcie->parf + 0x94),
+		 readl(pcie->parf + 0xa0), readl(pcie->parf + 0xa4));
+
+	/*
+	 * LAB: full PARF/PHY dump so it can be diffed against the working 3.10
+	 * (notes/wifi-octagon.md golden dump): PM_STTS/PCS_DEEMPH/PCS_SWING/
+	 * CONFIG_BITS/TEST_BUS are the settings the mainline driver never
+	 * programmes, and PCS_SWING/PCS_DEEMPH are the TX electrical knobs.
+	 */
+	val = readl(pcie->parf + PARF_SYS_CTRL);
+	dev_info(pci->dev, "PARF SYS_CTRL=%#010x PM_STTS=%#010x PCS_DEEMPH=%#010x PCS_SWING=%#010x PHY_CTRL=%#010x PHY_REFCLK=%#010x CONFIG_BITS=%#010x TEST_BUS=%#010x DBI_BASE=%#010x SLV_SIZE=%#010x AXI_HALT=%#010x LTSSM=%#010x\n",
+		 val,
+		 readl(pcie->parf + PARF_PM_CTRL),
+		 readl(pcie->parf + PARF_PCS_DEEMPH),
+		 readl(pcie->parf + PARF_PCS_SWING),
+		 readl(pcie->parf + PARF_PHY_CTRL),
+		 readl(pcie->parf + PARF_PHY_REFCLK),
+		 readl(pcie->parf + PARF_CONFIG_BITS),
+		 readl(pcie->parf + 0xe4),
+		 readl(pcie->parf + PARF_DBI_BASE_ADDR),
+		 readl(pcie->parf + PARF_SLV_ADDR_SPACE_SIZE),
+		 readl(pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT),
+		 readl(pcie->parf + PARF_LTSSM));
+
+	if (pcie->ep_wake)
+		dev_info(pci->dev, "endpoint wake line is %s\n",
+			 gpiod_get_value_cansleep(pcie->ep_wake) ? "asserted" : "idle");
+
+
+	return 0;
+}
+
+static int qcom_pcie_host_init(struct dw_pcie_rp *pp);
+static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp);
+
+/*
+ * Second pass, reproducing the vendor's two-enable shape on msm8994.
+ *
+ * msm_pcie_enable() runs once during boot before anything powers the QCA6174
+ * and fails ("link initialization failed"); cnss_wlan_get_resources() then
+ * powers WLAN_EN and the second msm_pcie_enable() redoes assert-PERST# ->
+ * clocks/PARF/PHY -> release-PERST# with the endpoint already powered, which is
+ * what makes 168c:003e answer config space.
+ *
+ * This runs from qcom_pcie_host_post_init(), i.e. after dw_pcie_host_init()
+ * has already run the first link attempt and pci_host_probe(), so the failed
+ * state is observable here and the scanned-but-empty bus 1 can be rescanned.
+ *
+ * A PERST# pulse here is only safe because the first pass really did fail to
+ * train a link (vddpe-3v3 was never enabled): re-pulsing PERST# on a live link
+ * resets QCA9xxx silicon on this unit (see notes/wifi-octagon.md).
+ */
+/*
+ * 3.10 msm_pcie_config_controller()'s two error-reporting *enables*, applied
+ * once the link is up and the bus has been scanned - the point where 3.10 runs
+ * them inline in msm_pcie_enable(). msm_pcie_write_mask(reg, 0, val) ORs val
+ * in, so both are enables:
+ *
+ *   PCIE20_ACK_F_ASPM_CTRL_REG (0x70C) BIT(15)  - no qcom,n-fts
+ *   PCIE20_CAP_DEVCTRLSTATUS   (0x78)  BIT(3..0) - CERE|NFERE|FERE|URRE
+ *
+ * The third 3.10 write there, PCIE20_BRIDGE_CTRL (0x3C) BIT(16|17), is Bridge
+ * Control Parity Error Response Enable + **SERR# Enable**; enabling SERR# on a
+ * mainline ARM kernel with no SERR# handler escalates any downstream error to
+ * SError and resets this SoC (measured, testOO), so it is deliberately omitted.
+ *
+ * DevCtl reporting matters: with it clear an Unsupported-Request completion is
+ * silently discarded, which is exactly the signature before this change
+ * (rv=0, all-1s data, no AER record).
+ */
+/*
+ * LAB testQX: the working vendor re-does the ENTIRE bring-up a second time
+ * (its first enable fails to reach link-up, then a disable+re-enable with the
+ * same register sequence succeeds and the EP answers). Our first pass does
+ * reach link-up, so the guarded second pass never runs. ath10k similarly notes
+ * "QCA6174 requires cold + warm reset to work". Force the full reset cycle
+ * regardless of first-pass link state. Default 0 = unchanged behavior.
+ */
+static unsigned int always_second_pass;
+module_param(always_second_pass, uint, 0644);
+
+/*
+ * LAB testR20 (vector #1: replicate the vendor's RUNTIME on-demand context).
+ * 3.10 does not enumerate at probe: the RC init fails, and cnss later powers the
+ * EP and calls msm_pcie_enumerate() at runtime (~0.7s) - a *deferred* powered
+ * bring-up with the rails/EN already stable. Mainline's probe-time second pass is
+ * close, but let us ALSO run one more identical powered bring-up ~2.5s after boot
+ * from a workqueue, exactly like cnss, and rescan. If the EP answers here but not
+ * in host_post, the differentiator is the runtime context/ordering.
+ */
+static void qcom_pcie_reenum_work(struct work_struct *work)
+{
+	struct qcom_pcie *pcie = container_of(to_delayed_work(work),
+					      struct qcom_pcie, reenum_work);
+	struct dw_pcie *pci = pcie->pci;
+	struct dw_pcie_rp *pp = &pci->pp;
+	struct pci_dev *ep;
+	int ret;
+
+	pr_emerg("\n##### WIFI: [R20] deferred (cnss-style) re-enumeration now #####\n");
+
+	/* ensure endpoint powered + settled, exactly like cnss before enumerate */
+	qcom_pcie_msm8994_rail(pcie, true);
+	usleep_range(70000, 71000);
+
+	qcom_pcie_host_deinit(pp);
+	qcom_pcie_msm8994_rail(pcie, false);
+	usleep_range(20000, 21000);
+	pcie->second_pass = true;
+
+	ret = qcom_pcie_host_init(pp);
+	if (!ret) {
+		ret = dw_pcie_setup_rc(pp);
+		if (!ret) {
+			qcom_pcie_start_link(pci);
+			ret = dw_pcie_wait_for_link(pci);
+		}
+	}
+	if (ret) {
+		pr_emerg("##### WIFI: [R20] link not up (%d) #####\n", ret);
+		return;
+	}
+
+	pci_rescan_bus(pp->bridge->bus);
+	ep = pci_get_domain_bus_and_slot(1, 1, 0);
+	if (!ep)
+		ep = pci_get_domain_bus_and_slot(1, 1, PCI_DEVFN(0, 0));
+	pr_emerg("##### WIFI: [R20] deferred result: %s #####\n",
+		 ep ? "EP PRESENT (QCA answers in runtime context!)"
+		    : "still no EP");
+	if (ep)
+		pci_dev_put(ep);
+}
+
+static void qcom_pcie_host_post_msm8994(struct qcom_pcie *pcie)
+{
+	struct dw_pcie *pci = pcie->pci;
+	struct dw_pcie_rp *pp = &pci->pp;
+	u32 val;
+	int ret;
+
+	/*
+	 * Second pass. The probe-time attempt ran with the endpoint unpowered and
+	 * therefore did not train a link; that unpowered PERST# cycle is required
+	 * (see qcom_pcie_pre_init_msm8994()). Power the rail and redo the whole
+	 * bring-up, then rescan the bus that pass 1 left empty.
+	 *
+	 * Re-pulsing PERST# here is only safe because pass 1 genuinely failed to
+	 * train: a PERST# pulse on a live link resets QCA9xxx silicon on this unit.
+	 */
+	if (!dw_pcie_link_up(pci) || always_second_pass) {
+		dev_info(pci->dev, "first pass trained no link, redoing it powered (link_up=%d force=%u)\n",
+			 dw_pcie_link_up(pci), always_second_pass);
+
+		qcom_pcie_host_deinit(pp);
+
+		/*
+		 * LAB: give the endpoint a clean power-cycle - force the rail off
+		 * (in case it was already on, which would mean pass 1 never gave
+		 * the chip a reset edge), then let init() power it back up. The
+		 * vendor's disable/enable pair power-cycles the rails too
+		 * (msm_pcie_vreg_deinit() then msm_pcie_vreg_init()).
+		 */
+		qcom_pcie_msm8994_rail(pcie, false);
+		usleep_range(20000, 21000);
+
+		pcie->second_pass = true;
+
+		ret = qcom_pcie_host_init(pp);
+		if (ret) {
+			dev_err(pci->dev, "second bring-up failed (%d)\n", ret);
+			pr_emerg("\n##### WIFI: FAIL (host_init %d) #####\n\n", ret);
+			return;
+		}
+
+		ret = dw_pcie_setup_rc(pp);
+		if (ret) {
+			pr_emerg("\n##### WIFI: FAIL (setup_rc %d) #####\n\n", ret);
+			return;
+		}
+
+		qcom_pcie_start_link(pci);
+
+		ret = dw_pcie_wait_for_link(pci);
+		if (ret) {
+			dev_err(pci->dev, "endpoint did not answer (%d)\n", ret);
+			pr_emerg("\n##### WIFI: FAIL (link wait %d) #####\n\n", ret);
+			return;
+		}
+
+		/*
+		 * LAB (decisive): replicate the vendor's EXACT manual outbound
+		 * region-0 program and read the endpoint straight out of the
+		 * config window, bypassing the DWC abstraction entirely.
+		 *
+		 * 3.10 msm_pcie_cfg_bdf() -> msm_pcie_iatu_config(dev, 0, CFG0,
+		 *   axi_conf->start, axi_conf->start + SZ_4K - 1, 0x01000000)
+		 * writes, in this order: viewport 0, CTRL2=0 (disable), CTRL1=type,
+		 * LBAR, UBAR, LAR, LTAR, UTAR, then CTRL2=BIT(31).
+		 * Its live dump reads CTRL1=00000004 LAR=f8801fff LTAR=01000000 -
+		 * i.e. a 4 KiB window, where the DWC code programs 0x7f000.
+		 *
+		 * If this returns 003e168c the endpoint IS answering and the
+		 * difference is in the DWC path/window size; if it returns all-1s
+		 * the hardware genuinely is not responding even to the vendor's
+		 * own sequence.
+		 */
+		{
+			void __iomem *atu = pci->atu_base;
+
+			/* clear AER first, so we can tell whether the READ causes it */
+			writel(0xffffffff, pci->dbi_base + 0x104);
+			writel(0xffffffff, pci->dbi_base + 0x110);
+			wmb();
+			dev_info(pci->dev, "LAB AER0: before read uncorr=%#010x corr=%#010x\n",
+				 readl(pci->dbi_base + 0x104),
+				 readl(pci->dbi_base + 0x110));
+
+			writel(0, pci->dbi_base + PCIE_ATU_VIEWPORT);
+			wmb();
+			writel(0, atu + PCIE_ATU_REGION_CTRL2);
+			wmb();
+			writel(PCIE_TLP_TYPE_CFG0_RDWR, atu + PCIE_ATU_REGION_CTRL1);
+			writel(pp->cfg0_base, atu + PCIE_ATU_LOWER_BASE);
+			writel(0, atu + PCIE_ATU_UPPER_BASE);
+			writel(pp->cfg0_base + SZ_4K - 1, atu + PCIE_ATU_LIMIT);
+			writel(0x01000000, atu + PCIE_ATU_LOWER_TARGET);
+			writel(0, atu + PCIE_ATU_UPPER_TARGET);
+			wmb();
+			writel(PCIE_ATU_ENABLE, atu + PCIE_ATU_REGION_CTRL2);
+			wmb();
+
+			/* LNKSTA lives at cap 0x12 -> DBI 0x82 (0x80 is LNKCTL) */
+			val = readw(pci->dbi_base + 0x82);
+			dev_info(pci->dev, "LAB MANUAL: pre-read LNKSTA=%#06x DLLLA=%u PARF_LTSSM=%#x SecSta=%#06x BridgeCtl=%#06x\n",
+				 val, !!(val & PCI_EXP_LNKSTA_DLLLA),
+				 readl(pcie->parf + PARF_LTSSM),
+				 readw(pci->dbi_base + 0x1e),
+				 readw(pci->dbi_base + 0x3e));
+
+			/*
+			 * LAB testR21: the "low-power link" clue. If the link/EP is
+			 * gated in L1/L1SS, config reads can come back all-1s. Force
+			 * FULL L0 before reading: clear ASPM (LNKCTL bits0-1), set the
+			 * link-retrain bit (LNKCTL bit5), clear the RC + EP L1SS
+			 * control registers, wait for retrain, then read config.
+			 */
+			{
+				u32 lc = readl(pci->dbi_base + 0x80);
+				u32 l1s1 = readl(pci->dbi_base + 0x158);
+				u32 l1s2 = readl(pci->dbi_base + 0x15c);
+				u32 l1cap = readl(pci->dbi_base + 0x154);
+
+				dev_info(pci->dev, "LAB R21: pre LNKCTL=%#010x L1SScap=%#010x L1S1=%#010x L1S2=%#010x\n",
+					 lc, l1cap, l1s1, l1s2);
+				/* disable ASPM + set retrain + clear L1SS */
+				writel(lc & ~0x3, pci->dbi_base + 0x80);
+				writel(0, pci->dbi_base + 0x158);
+				writel(0, pci->dbi_base + 0x15c);
+				wmb();
+				/* trigger link retrain */
+				writel((lc & ~0x3) | BIT(5), pci->dbi_base + 0x80);
+				usleep_range(20000, 21000);
+				dev_info(pci->dev, "LAB R21: post LNKCTL=%#010x LNKSTA=%#06x\n",
+					 readl(pci->dbi_base + 0x80),
+					 readw(pci->dbi_base + 0x82));
+				dev_info(pci->dev, "LAB R21: forced-L0 config read vid_did=%#010x\n",
+					 readl(pp->va_cfg0_base + 0x00));
+			}
+
+			dev_info(pci->dev, "LAB MANUAL: entered, cfg0_base=%#llx va_cfg0=%px\n",
+				 (u64)pp->cfg0_base, pp->va_cfg0_base);
+
+			val = readl(pp->va_cfg0_base + 0x00);
+			dev_info(pci->dev, "LAB MANUAL: vid_did=%#010x\n", val);
+			val = readl(pp->va_cfg0_base + 0x04);
+			dev_info(pci->dev, "LAB MANUAL: cmd_stat=%#010x\n", val);
+			val = readl(pp->va_cfg0_base + 0x08);
+			dev_info(pci->dev, "LAB MANUAL: class=%#010x\n", val);
+			val = readl(pp->va_cfg0_base + 0x0c);
+			dev_info(pci->dev, "LAB MANUAL: hdr=%#010x\n", val);
+
+			/*
+			 * The vendor reads dev->conf, obtained with a plain
+			 * ioremap/devm_ioremap_resource on the same "conf"
+			 * resource. Mainline reads pp->va_cfg0_base, obtained with
+			 * devm_pci_remap_cfg_resource(). Compare the two mappings
+			 * directly - if the plain mapping answers, the "PCI config"
+			 * remap is the difference.
+			 */
+			{
+				void __iomem *plain;
+
+				plain = ioremap(pp->cfg0_base, SZ_4K);
+				if (plain) {
+					dev_info(pci->dev, "LAB MAP: plain ioremap vid_did=%#010x cmd=%#010x class=%#010x\n",
+						 readl(plain + 0x00),
+						 readl(plain + 0x04),
+						 readl(plain + 0x08));
+					iounmap(plain);
+				} else {
+					dev_info(pci->dev, "LAB MAP: ioremap failed\n");
+				}
+				dev_info(pci->dev, "LAB MAP: cfg0_base=%pa va_cfg0_base=%px dbi=%px\n",
+					 &pp->cfg0_base, pp->va_cfg0_base, pci->dbi_base);
+			}
+
+			/*
+				* LAB testR19 (decisive, untried): we have ONLY EVER done
+				* config READS. Do a config WRITE to the EP's Command
+				* register (offset 0x04) and watch:
+				*  - does it complete, raise UR, or master-abort?
+				*  - does the DW TX TLP counter advance (did the TLP
+				*    physically egress the RC)?
+				* Plus dump the DW link-debug + vendor-specific TLP/ERR
+				* counters around the access, and the RC DevSta completion-
+				* timeout bit. This discriminates "CFG0 TLP never sent" vs
+				* "EP receives and stays silent".
+				*/
+			{
+				u32 pre = readl(pp->va_cfg0_base + 0x04);
+				u32 tx0 = readl(pci->dbi_base + 0x78c);
+				u32 ldbg0 = readl(pci->dbi_base + 0x72c);
+				u32 c0 = readl(pci->dbi_base + 0x710);
+
+				dev_info(pci->dev, "LAB R19: pre cmd=%#010x TX0=%#010x DBG(0x72c)=%#010x CTRL0(0x710)=%#010x\n",
+					 pre, tx0, ldbg0, c0);
+
+				/* write EP Command: keep existing, set MEM+BM bits */
+				writel(pre | 0x6, pp->va_cfg0_base + 0x04);
+				wmb();
+				dev_info(pci->dev, "LAB R19: post cmd=%#010x TX=%#010x\n",
+					 readl(pp->va_cfg0_base + 0x04),
+					 readl(pci->dbi_base + 0x78c));
+				dev_info(pci->dev, "LAB R19: RCBAR=%#010x 0x73c(link dbg)=%#010x 0x74c=%#010x\n",
+					 readl(pp->va_cfg0_base + 0x10),
+					 readl(pci->dbi_base + 0x73c),
+					 readl(pci->dbi_base + 0x74c));
+				dev_info(pci->dev, "LAB R19: RC DevSta(0x0a)=%#06x (CmplTimeout=bit15)\n",
+					 readw(pci->dbi_base + 0x0a));
+				dev_info(pci->dev, "LAB R19: SecSta(0x1e)=%#06x Cert=%u\?\n",
+					 readw(pci->dbi_base + 0x1e));
+			}
+
+			val = readw(pci->dbi_base + 0x82);
+			dev_info(pci->dev, "LAB MANUAL: post-read LNKSTA=%#06x DLLLA=%u PARF_LTSSM=%#x SecSta=%#06x (MasterAbort=%u UR=%u)\n",
+				 val, !!(val & PCI_EXP_LNKSTA_DLLLA),
+				 readl(pcie->parf + PARF_LTSSM),
+				 readw(pci->dbi_base + 0x1e),
+				 !!(readw(pci->dbi_base + 0x1e) & BIT(13)),
+				 !!(readw(pci->dbi_base + 0x1e) & BIT(12)));
+			val = readl(pci->dbi_base + 0x104);
+			dev_info(pci->dev, "LAB AER1: after read uncorr=%#010x corr=%#010x\n",
+				 val, readl(pci->dbi_base + 0x110));
+			/* read the config window a second time, no ATU change */
+			val = readl(pp->va_cfg0_base + 0x00);
+			dev_info(pci->dev, "LAB AER2: re-read vid=%#010x uncorr=%#010x corr=%#010x\n",
+				 val, readl(pci->dbi_base + 0x104),
+				 readl(pci->dbi_base + 0x110));
+		}
+
+		pci_rescan_bus(pp->bridge->bus);
+	}
+
+	val = readl(pci->dbi_base + 0x70c);
+	val |= BIT(15);
+	writel(val, pci->dbi_base + 0x70c);
+
+	val = readl(pci->dbi_base + 0x78);
+	val |= BIT(3) | BIT(2) | BIT(1) | BIT(0);
+	writel(val, pci->dbi_base + 0x78);
+
+	/*
+	 * The full RC-core (DBI) dump showed exactly one writable difference
+	 * mainline does not already match: Bridge Control bit 0, "Parity Error
+	 * Response Enable". 3.10 reads 0x0003 at 0x3c, mainline 0x0002 - note
+	 * SERR# (bit 1) is *already* set on mainline, so the earlier testOO crash
+	 * was from this parity bit, not SERR#.  Set it and see.
+	 */
+	val = readl(pci->dbi_base + 0x3c);
+	dev_info(pci->dev, "LAB BRIDGECTL was %#010x\n", val);
+	val |= BIT(16);
+	writel(val, pci->dbi_base + 0x3c);
+	dev_info(pci->dev, "LAB BRIDGECTL now %#010x\n",
+		 readl(pci->dbi_base + 0x3c));
+
+	/*
+	 * LAB: the vendor's working RC reads LNKCTL (0x80) = 0x0002, i.e. ASPM
+	 * **L1 Enable** (bit 1), while mainline reads 0x0000. Only the L0s
+	 * *capability* bit was tested before (testOA - negative); the L1 enable
+	 * itself never was. Match it.
+	 */
+	val = readl(pci->dbi_base + 0x80);
+	dev_info(pci->dev, "LAB LNKCTL was %#010x\n", val);
+	val |= BIT(1);
+	writel(val, pci->dbi_base + 0x80);
+	dev_info(pci->dev, "LAB LNKCTL now %#010x\n",
+		 readl(pci->dbi_base + 0x80));
+
+
+	/*
+	 * LAB testQC: print the WiFi result BIG on the console so it can be
+	 * read on the device screen without telnet/USB.
+	 *
+	 * WATERPROOF LOGIC (rev 2): do NOT assume the endpoint is at bus1/devfn0.
+	 * Scan the entire domain for a QCA Atheros endpoint (vendor 0x168c) and
+	 * also record any device found on the root bus's secondary bus. This way
+	 * we only print FAIL when there really is no QCA endpoint anywhere.
+	 */
+	{
+		struct pci_dev *ep = NULL, *tmp;
+		u32 lnk = readw(pci->dbi_base + 0x82);
+		struct pci_bus *bus;
+		int found_any = 0;
+		unsigned int found_bus = 0, found_devfn = 0;
+		u32 found_id = 0;
+
+		/* Prefer a 168c (QCA Atheros) function; else any non-bridge EP. */
+		for (bus = pci_find_bus(1, 0); bus; bus = pci_find_next_bus(bus)) {
+			list_for_each_entry(tmp, &bus->devices, bus_list) {
+				found_any++;
+				if (!ep && (tmp->vendor == PCI_VENDOR_ID_ATHEROS ||
+					    !tmp->hdr_type)) {
+					ep = tmp;
+					found_bus = tmp->bus->number;
+					found_devfn = tmp->devfn;
+					found_id = (tmp->vendor << 16) | tmp->device;
+				}
+			}
+		}
+
+		pr_emerg("\n");
+		pr_emerg("############################################\n");
+		if (ep) {
+			pr_emerg("#####  WIFI: SUCCESS - EP %04x:%04x @ %u:%02x.%u  #####\n",
+				 ep->vendor, ep->device, found_bus,
+				 PCI_SLOT(found_devfn), PCI_FUNC(found_devfn));
+		} else if (found_any) {
+			pr_emerg("#####  WIFI: BUS OK but no QCA EP (%d devs)  #####\n",
+				 found_any);
+		} else {
+			pr_emerg("#####  WIFI: FAIL - NO DEVICE ON bus1  #####\n");
+		}
+		pr_emerg("#####  link LNKSTA=%#06x DLLLA=%u  #####\n",
+			 lnk, !!(lnk & PCI_EXP_LNKSTA_DLLLA));
+		pr_emerg("#####  raw cfg0[0]=%#010x (ffffffff=no answer)  #####\n",
+			 readl(pci->dbi_base));  /* DBI VID/DID on this RC */
+		pr_emerg("############################################\n\n");
+
+		/*
+		 * LAB: hold the banner on the console for 5 s so it can be read
+		 * on the device screen before later boot messages scroll past.
+		 */
+		{
+			int b;
+			for (b = 0; b < 50; b++) {
+				mdelay(100);
+				if (!(b % 10))
+					pr_emerg("#####  [WiFi banner: elapsed %ds/5s: %s]  #####\n",
+						 b / 10,
+						 ep ? "QCA EP PRESENT" :
+						      (found_any ? "no QCA EP"
+								 : "nothing on bus1"));
+			}
+		}
+
+		/* LAB testR20: schedule the deferred (cnss-style) re-enumeration. */
+		INIT_DELAYED_WORK(&pcie->reenum_work, qcom_pcie_reenum_work);
+		schedule_delayed_work(&pcie->reenum_work, msecs_to_jiffies(2500));
+
+		(void)found_id;
+	}
+}
+
 
 static int qcom_pcie_get_resources_2_4_0(struct qcom_pcie *pcie)
 {
@@ -1325,6 +2093,14 @@ static int qcom_pcie_post_init_2_9_0(struct qcom_pcie *pcie)
 	return 0;
 }
 
+/*
+ * LAB testQY: msm8994 has no dw_pcie_ops.link_up, so this is the generic
+ * qcom link-up used for it. The vendor's authoritative link-up check is
+ * ELBI XMLH_LINK_UP (ELBI_SYS_STTS BIT(10)) - working ELBI=0x00011401 - in
+ * ADDITION to the DWC DLLLA. Log both and require both (only when ELBI is
+ * mapped): a DWC-up-but-ELBI-not-up state would explain config reads returning
+ * all-1s while mainline believes the link is fine.
+ */
 static bool qcom_pcie_link_up(struct dw_pcie *pci)
 {
 	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
@@ -1382,11 +2158,33 @@ static void qcom_pcie_configure_ports(struct qcom_pcie *pcie)
 		dw_pcie_program_t_power_on(pcie->pci, port->l1ss_t_power_on);
 }
 
+/*
+ * LAB: delay between PERST# deassert (link up) and the first config scan.
+ * The working vendor leaves ~600 ms after releasing PERST before it first
+ * reads the EP (which then answers immediately); mainline scans at once. If
+ * the QCA6174 needs settle/CRS time after link-up this closes it.
+ * Set via cmdline: qcom_pcie.ep_settle_ms=NNN  (default 0 = unchanged).
+ */
+static unsigned int ep_settle_ms;
+module_param(ep_settle_ms, uint, 0644);
+MODULE_PARM_DESC(ep_settle_ms, "ms to wait after PERST# deassert before config scan");
+
 static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
 	int ret;
+
+	/*
+	 * msm8994: power the endpoint rail before the RC asserts PERST#, so the
+	 * QCA6174 is up when the reset is released (3.10 cnss powers WLAN_EN
+	 * before msm_pcie_enumerate()).
+	 */
+	if (pcie->cfg->ops->pre_init) {
+		ret = pcie->cfg->ops->pre_init(pcie);
+		if (ret)
+			return ret;
+	}
 
 	qcom_pcie_perst_assert(pcie);
 
@@ -1428,6 +2226,12 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
 		ret = pcie->cfg->ops->config_sid(pcie);
 		if (ret)
 			goto err_assert_reset;
+	}
+
+	if (ep_settle_ms) {
+		dev_info(pci->dev, "LAB: waiting %u ms after PERST# before config scan\n",
+			 ep_settle_ms);
+		msleep(ep_settle_ms);
 	}
 
 	pp->bridge->reset_root_port = qcom_pcie_reset_root_port;
@@ -1534,6 +2338,17 @@ static const struct qcom_pcie_ops ops_2_3_2 = {
 	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
 };
 
+/* MSM8994: 2.3.2 PARF, endpoint rail powered on the second bring-up pass */
+static const struct qcom_pcie_ops ops_msm8994 = {
+	.get_resources = qcom_pcie_get_resources_msm8994,
+	.pre_init = qcom_pcie_pre_init_msm8994,
+	.init = qcom_pcie_init_msm8994,
+	.post_init = qcom_pcie_post_init_msm8994,
+	.deinit = qcom_pcie_deinit_msm8994,
+	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
+	.host_post_init = qcom_pcie_host_post_msm8994,
+};
+
 /* Qcom IP rev.: 2.4.0	Synopsys IP rev.: 4.20a */
 static const struct qcom_pcie_ops ops_2_4_0 = {
 	.get_resources = qcom_pcie_get_resources_2_4_0,
@@ -1612,6 +2427,10 @@ static const struct qcom_pcie_cfg cfg_2_1_0 = {
 static const struct qcom_pcie_cfg cfg_2_3_2 = {
 	.ops = &ops_2_3_2,
 	.no_l0s = true,
+};
+
+static const struct qcom_pcie_cfg cfg_msm8994 = {
+	.ops = &ops_msm8994,
 };
 
 static const struct qcom_pcie_cfg cfg_2_3_3 = {
@@ -2202,6 +3021,17 @@ static int qcom_pcie_probe(struct platform_device *pdev)
 		goto err_pm_runtime_put;
 	}
 
+	/*
+	 * The DWC ATU 'TD' bit in outbound Control Register 1 is an override for
+	 * the TLP Digest (ECRC) setting: for cores older than 5.10A the core
+	 * appends a TLP Digest to *every* TLP whose address is translated by the
+	 * ATU. The vendor 3.10 stack never sets it (msm_pcie_iatu_config() writes
+	 * only the transaction type, PCIE20_CTRL1_TYPE_CFG0 = 0x4), so we are
+	 * forcing a TLP Digest onto the QCA6174 that stock firmware never sees.
+	 * Let the DT turn that override off.
+	 */
+	pci->no_ecrc = of_property_read_bool(dev->of_node, "qcom,no-ecrc");
+
 	INIT_LIST_HEAD(&pcie->ports);
 
 	pci->dev = dev;
@@ -2474,6 +3304,7 @@ static const struct of_device_id qcom_pcie_match[] = {
 	{ .compatible = "qcom,pcie-ipq8074", .data = &cfg_2_3_3 },
 	{ .compatible = "qcom,pcie-ipq8074-gen3", .data = &cfg_2_9_0 },
 	{ .compatible = "qcom,pcie-ipq9574", .data = &cfg_2_9_0 },
+	{ .compatible = "qcom,pcie-msm8994", .data = &cfg_msm8994 },
 	{ .compatible = "qcom,pcie-msm8996", .data = &cfg_2_3_2 },
 	{ .compatible = "qcom,pcie-qcs404", .data = &cfg_2_4_0 },
 	{ .compatible = "qcom,pcie-sa8255p", .data = &cfg_fw_managed },

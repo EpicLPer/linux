@@ -87,6 +87,15 @@ config PHY_QCOM_QMP_PCIE_MULTIPHY
 	  multi-lane QMP block that can be configured either as one wide
 	  link or as multiple narrower independent links (bifurcation).
 
+config PHY_QCOM_QMP_PCIE_8994
+	tristate "Qualcomm QMP PCIe 8994 PHY Driver"
+	depends on PCI || COMPILE_TEST
+	select GENERIC_PHY
+	default PHY_QCOM_QMP
+	help
+	  Enable this to support the per-port 20nm QMP PCIe PHY on
+	  Qualcomm MSM8994 / MSM8992.
+
 config PHY_QCOM_QMP_PCIE_8996
 	tristate "Qualcomm QMP PCIe 8996 PHY Driver"
 	depends on PCI || COMPILE_TEST

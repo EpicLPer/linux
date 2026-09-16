@@ -965,8 +965,179 @@
 			#power-domain-cells = <1>;
 			reg = <0xfc400000 0x2000>;
 
-			clock-names = "xo", "sleep";
-			clocks = <&xo_board>, <&sleep_clk>;
+			clock-names = "xo", "sleep", "pcie_0_pipe", "pcie_1_pipe";
+			clocks = <&xo_board>, <&sleep_clk>, <&pciephy0>, <&pciephy1>;
+		};
+
+		pciephy0: phy@fc526000 {
+			compatible = "qcom,msm8994-qmp-pcie-phy";
+			reg = <0xfc526000 0x1000>;
+			clocks = <&rpmcc RPM_SMD_LN_BB_CLK>,
+				 <&gcc PCIE_0_PHY_LDO>,
+				 <&gcc GCC_PCIE_0_PIPE_CLK>;
+			clock-names = "ref", "ldo", "pipe";
+			resets = <&gcc PCIE_PHY_0_RESET>;
+			reset-names = "phy";
+			#clock-cells = <0>;
+			clock-output-names = "pcie_0_pipe";
+			#phy-cells = <0>;
+			status = "disabled";
+		};
+
+		pciephy1: phy@fc52e000 {
+			compatible = "qcom,msm8994-qmp-pcie-phy";
+			reg = <0xfc52e000 0x1000>;
+			clocks = <&rpmcc RPM_SMD_LN_BB_CLK>,
+				 <&gcc PCIE_1_PHY_LDO>,
+				 <&gcc GCC_PCIE_1_PIPE_CLK>;
+			clock-names = "ref", "ldo", "pipe";
+			resets = <&gcc PCIE_PHY_1_RESET>;
+			reset-names = "phy";
+			#clock-cells = <0>;
+			clock-output-names = "pcie_1_pipe";
+			#phy-cells = <0>;
+			status = "disabled";
+		};
+
+		pcie0: pcie@fc520000 {
+			compatible = "qcom,pcie-msm8994";
+			status = "disabled";
+			reg = <0xfc520000 0x2000>,
+			      <0xff000000 0xf1d>,
+			      <0xff000f20 0xa8>,
+			      <0xff100000 0x100000>;
+			reg-names = "parf", "dbi", "elbi", "config";
+			device_type = "pci";
+			linux,pci-domain = <0>;
+			bus-range = <0x00 0xff>;
+			num-lanes = <1>;
+			/*
+			 * 3.10 caps pcie_0_pipe_clk at 125 MHz, so this RC is
+			 * Gen1 only. Say so: otherwise the DWC advertises Gen2
+			 * in LNKCAP and pci_device_add() tries, and fails, to
+			 * retrain the link up to 5.0 GT/s before the
+			 * downstream bus is scanned.
+			 */
+			max-link-speed = <1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x01000000 0x0 0x0 0xff200000 0x0 0x100000>,
+				 <0x02000000 0x0 0xff300000 0xff300000 0x0 0xd00000>;
+			interrupts = <GIC_SPI 243 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "msi";
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 0x7>;
+			interrupt-map = <0 0 0 1 &intc GIC_SPI 244 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &intc GIC_SPI 245 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &intc GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &intc GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&gcc GCC_PCIE_0_AUX_CLK>,
+				 <&gcc GCC_PCIE_0_CFG_AHB_CLK>,
+				 <&gcc GCC_PCIE_0_MSTR_AXI_CLK>,
+				 <&gcc GCC_PCIE_0_SLV_AXI_CLK>;
+			clock-names = "aux", "cfg", "bus_master", "bus_slave";
+			power-domains = <&gcc PCIE_0_GDSC>;
+			phys = <&pciephy0>;
+			phy-names = "pciephy";
+			qcom,scm-dev-id = <11>;
+
+			pcie@0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				bus-range = <0x01 0xff>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+			};
+		};
+
+		pcie1: pcie@fc528000 {
+			compatible = "qcom,pcie-msm8994";
+			status = "disabled";
+			reg = <0xfc528000 0x2000>,
+			      <0xf8800000 0xf1d>,
+			      <0xf8800f20 0xa8>,
+			      <0xf8801000 0x7f000>;
+			reg-names = "parf", "dbi", "elbi", "config";
+			device_type = "pci";
+			linux,pci-domain = <1>;
+			bus-range = <0x00 0xff>;
+			num-lanes = <1>;
+			/*
+			 * 3.10 caps pcie_1_pipe_clk at 125 MHz, so this RC is
+			 * Gen1 only. Say so: otherwise the DWC advertises Gen2
+			 * in LNKCAP and pci_device_add() tries, and fails, to
+			 * retrain the link up to 5.0 GT/s before the
+			 * downstream bus is scanned.
+			 */
+			max-link-speed = <1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x01000000 0x0 0x0 0xf8880000 0x0 0x80000>,
+				 <0x02000000 0x0 0xf8900000 0xf8900000 0x0 0x700000>;
+			interrupts = <GIC_SPI 271 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "msi";
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 0x7>;
+			interrupt-map = <0 0 0 1 &intc GIC_SPI 272 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 2 &intc GIC_SPI 273 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 3 &intc GIC_SPI 274 IRQ_TYPE_LEVEL_HIGH>,
+					<0 0 0 4 &intc GIC_SPI 275 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&gcc GCC_PCIE_1_AUX_CLK>,
+				 <&gcc GCC_PCIE_1_CFG_AHB_CLK>,
+				 <&gcc GCC_PCIE_1_MSTR_AXI_CLK>,
+				 <&gcc GCC_PCIE_1_SLV_AXI_CLK>;
+			clock-names = "aux", "cfg", "bus_master", "bus_slave";
+			power-domains = <&gcc PCIE_1_GDSC>;
+			/*
+			 * Do NOT add `interconnects` here. Attempted
+			 * 2026-09-13 (testNP): the vendor stack does vote
+			 * these paths (PEP lists ICBID_MASTER_PCIE_1,
+			 * ICBID_SLAVE_PCIE_1, ICBID_SLAVE_PCIE_1_CFG,
+			 * ICBID_SLAVE_PCIE_PARF; 3.10 votes
+			 * MSM_BUS_MASTER_PCIE_1 -> EBI_CH0 500/800 KBps),
+			 * and the ids to use are SNOC_MAS_PCIE_1 +
+			 * BIMC_SLV_EBI_CH0 ("pcie-mem") and
+			 * BIMC_MAS_AMPSS_M0 + CNOC_SLV_PCIE_1_CFG
+			 * ("cpu-pcie") - but wiring them makes the RC never
+			 * probe: the qnoc providers report
+			 * "sync_state() pending due to fc528000.pcie" while
+			 * the PCIe node defers on those same providers, so
+			 * fw_devlink holds it with no `driver` bound and
+			 * nothing in devices_deferred. Revisit only with a
+			 * fw_devlink=permissive style workaround, and only
+			 * once the endpoint actually enumerates - the vote
+			 * is needed for PCIe DMA, not for config access.
+			 *
+			 * 2026-09-16 (testR7): retried with fw_devlink=permissive
+			 * after the Cityman XL DSDT WlanD0ResourceVote confirmed
+			 * Windows DOES vote ICBID_MASTER_APPSS_PROC->
+			 * ICBID_SLAVE_PCIE_1_CFG. Result: it now HANGS (black
+			 * screen, USB up briefly then gone, camera-reboot dead) -
+			 * the WIP msm8994 icc driver can't handle the
+			 * BIMC->CNOC cross-provider path. And the link already
+			 * trains without it, so config TLPs are already issued:
+			 * this vote is bandwidth/DMA, not the enumeration gate.
+			 */
+			qcom,scm-dev-id = <12>;
+
+			/*
+			 * Endpoint properties belong on the port node, not the
+			 * Root Complex: qcom_pcie_parse_port() reads `phys` and
+			 * `reset-gpios` from here and qcom_pcie_parse_perst()
+			 * warns "Reusing PERST# from Root Complex node. DT needs
+			 * to be fixed!" if they sit on the host (Snaccy: pcie1
+			 * "has an endpoint property that it NEEDS downstream").
+			 */
+			pcie@0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				bus-range = <0x01 0xff>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				phys = <&pciephy1>;
+			};
 		};
 
 		gpu: gpu@fdb00000 {
@@ -1418,6 +1589,79 @@
 				pins = "sdc2_data";
 				bias-pull-up;
 				drive-strength = <2>;
+			};
+
+			pcie0_default: pcie0-default-state {
+				perst-pins {
+					pins = "gpio53";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+
+				clkreq-pins {
+					pins = "gpio54";
+					function = "pci_e0";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				wake-pins {
+					pins = "gpio55";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+			};
+
+			pcie1_default: pcie1-default-state {
+				perst-pins {
+					pins = "gpio35";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+
+				clkreq-pins {
+					pins = "gpio36";
+					function = "pci_e1";
+					drive-strength = <2>;
+					bias-pull-up;
+				};
+
+				wake-pins {
+					pins = "gpio37";
+					function = "gpio";
+					drive-strength = <2>;
+					bias-pull-down;
+				};
+			};
+
+			wlan_en_default: wlan-en-default-state {
+				pins = "gpio113";
+				function = "gpio";
+				drive-strength = <16>;
+				bias-pull-down;
+			};
+
+			/*
+			 * 3.10 CNSS `wlan-bootstrap-gpio` (TLMM 112). The
+			 * downstream 8994 boards carry it in msm8994-v2.dtsi:
+			 *   &cnss { wlan-bootstrap-gpio = <&msm_gpio 112 0>;
+			 *           pinctrl-0 = <&cnss_default &cnss_lpass_default>; }
+			 * and cnss_pci.c drives it high in
+			 * cnss_wlan_bootstrap_gpio_init() - with
+			 * WLAN_BOOTSTRAP_DELAY (10 ms) - *before* WLAN_EN
+			 * (TLMM 113) is raised and before msm_pcie_enumerate().
+			 * Pin 112 is only used by CNSS in the downstream tree
+			 * (`cnss_lpass`, drive-strength 16, pull-down).
+			 */
+			wlan_bootstrap_default: wlan-bootstrap-default-state {
+				pins = "gpio112";
+				function = "gpio";
+				drive-strength = <16>;
+				bias-pull-down;
+				output-high;
 			};
 		};
 

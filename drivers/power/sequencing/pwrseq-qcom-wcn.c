@@ -336,6 +336,14 @@ static const char *const pwrseq_wcn3990_vregs[] = {
 static int pwrseq_qcom_wcn3990_match(struct pwrseq_device *pwrseq,
 				     struct device *dev);
 
+/* LAB testR6: match the discrete QCA6174 PCIe consumer (our pcie1 node). */
+static int pwrseq_qca6174_match(struct pwrseq_device *pwrseq, struct device *dev)
+{
+	if (of_property_present(dev->of_node, "vddpe-3v3-supply"))
+		return PWRSEQ_MATCH_OK;
+	return PWRSEQ_NO_MATCH;
+}
+
 static const struct pwrseq_qcom_wcn_pdata pwrseq_wcn3990_of_data = {
 	.vregs = pwrseq_wcn3990_vregs,
 	.num_vregs = ARRAY_SIZE(pwrseq_wcn3990_vregs),
@@ -382,6 +390,28 @@ static const struct pwrseq_qcom_wcn_pdata pwrseq_wcn6855_of_data = {
 	.pwup_delay_ms = 50,
 	.gpio_enable_delay_ms = 5,
 	.targets = pwrseq_qcom_wcn6855_targets,
+};
+
+/*
+ * LAB testR6: QCA6174 (discrete "Rome") over PCIe, per Val Packett's suggestion
+ * to model it as a PMU here. The discrete chip has no PMU host interface: it is
+ * powered by the discrete rails + the module enable line, and clocked by the
+ * 32.768 kHz sleep clock (divclk4) sourced from the PMIC. The vregs are looked
+ * up on the provider node, so they are the module lines (vddpe-3v3 = the enable
+ * line; vdda = the PCIe PHY rail).
+ */
+static const char *const pwrseq_qca6174_vregs[] = {
+	"vdda",		/* PM8994 L28 (0.925/1.0V) - PHY analog */
+	"vddpe-3v3",	/* module/endpoint enable (our wlan_en) */
+};
+
+static const struct pwrseq_qcom_wcn_pdata pwrseq_qca6174_of_data = {
+	.vregs = pwrseq_qca6174_vregs,
+	.num_vregs = ARRAY_SIZE(pwrseq_qca6174_vregs),
+	.pwup_delay_ms = 70,
+	.gpio_enable_delay_ms = 10,
+	.targets = pwrseq_qcom_wcn_targets,
+	.match = pwrseq_qca6174_match,
 };
 
 static const char *const pwrseq_wcn7850_vregs[] = {
@@ -555,6 +585,10 @@ static const struct of_device_id pwrseq_qcom_wcn_of_match[] = {
 	{
 		.compatible = "qcom,wcn3990-pmu",
 		.data = &pwrseq_wcn3990_of_data,
+	},
+	{
+		.compatible = "qcom,qca6174-pmu",
+		.data = &pwrseq_qca6174_of_data,
 	},
 	{
 		.compatible = "qcom,wcn3991-pmu",

@@ -81,8 +81,13 @@ int qca_read_soc_version(struct hci_dev *hdev, struct qca_btsoc_version *ver,
 
 out:
 	kfree_skb(skb);
-	if (err)
+	if (err) {
 		bt_dev_err(hdev, "QCA Failed to get version (%d)", err);
+		pr_emerg("\n#####  BT: FAIL - QCA no answer (%d)  #####\n\n", err);
+	} else {
+		pr_emerg("\n#####  BT: SUCCESS - soc=%#x rom=%#x  #####\n\n",
+			 le32_to_cpu(ver->soc_id), le16_to_cpu(ver->rom_ver));
+	}
 
 	return err;
 }

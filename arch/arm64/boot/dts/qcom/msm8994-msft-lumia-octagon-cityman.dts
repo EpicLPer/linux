@@ -345,3 +345,52 @@
 	vcca-supply = <&vreg_l28a_1p0>;
 	qcom,dsi-phy-regulator-ldo-mode;
 };
+
+&pciephy1 {
+	status = "okay";
+	vdda-supply = <&vreg_l12a_1p8>;
+};
+
+&pcie1 {
+	status = "okay";
+	pinctrl-names = "default";
+	/*
+	 * `pcie1_default` also carries the CNSS bootstrap pin (TLMM 112): it is
+	 * applied before ops->init() raises WLAN_EN, so the endpoint sees the
+	 * vendor's order (bootstrap high -> >=10 ms -> WLAN_EN -> RC bring-up).
+	 */
+	pinctrl-0 = <&pcie1_default &wlan_bootstrap_default>;
+	vdda-supply = <&vreg_l28a_1p0>;
+	vddpe-3v3-supply = <&wlan_en>;
+
+	/*
+	 * Do not let the DWC ATU force a TLP Digest (ECRC) onto outgoing TLPs.
+	 * On cores older than 5.10A the ATU 'TD' bit overrides the ECRC setting,
+	 * so mainline appends a TLP Digest to every TLP the ATU translates. The
+	 * vendor 3.10 stack never programs it: its live dump reads
+	 * iATU CTRL1 = 0x00000004 (transaction type only) where mainline reads
+	 * 0x00000104, and on an EP that enumerates the difference is real. 3.10
+	 * has no ECRC/TD handling in its DWC at all.
+	 */
+	qcom,no-ecrc;
+
+	/*
+	 * 3.10 pci-msm has `wake-gpio = <&msm_gpio 37 0>` on this node and
+	 * requests it as a falling-edge IRQ ("msm_pcie_wake"). The Lumia DT
+	 * deletes `qcom,ep-wakeirq` (msm8994-chi.dtsi), so enumeration is not
+	 * gated on it there - but the line is wired and worth watching:
+	 * asserted (low) means the endpoint wants the host's attention.
+	 */
+	wake-gpios = <&tlmm 37 GPIO_ACTIVE_LOW>;
+
+	/*
+	 * PERST# is an endpoint property and belongs on the port node:
+	 * with `perst-gpios` on the Root Complex, qcom_pcie_parse_perst()
+	 * falls back to it and warns "DT needs to be fixed!" instead of
+	 * driving the port's own reset-gpios.
+	 */
+	pcie@0 {
+		reset-gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
+	};
+};
+

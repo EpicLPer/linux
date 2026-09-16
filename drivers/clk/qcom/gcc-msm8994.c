@@ -27,6 +27,7 @@ enum {
 	P_XO,
 	P_GPLL0,
 	P_GPLL4,
+	P_PCIE_PIPE,
 };
 
 static struct clk_alpha_pll gpll0_early = {
@@ -857,10 +858,22 @@ static const struct freq_tbl ftbl_pcie_0_aux_clk_src[] = {
 	{ }
 };
 
+/*
+ * The PCIe aux RCGs are XO-only, so they used to carry no parent_map.
+ * clk_rcg2_determine_rate() -> _freq_tbl_determine_rate() feeds f->src
+ * to qcom_find_src_index(), which walks parent_map[] unconditionally, so
+ * a clk_set_rate() on the aux clock was a NULL-pointer dereference.
+ * Same shape as 8996 gcc_xo_sleep_clk_map (XO at mux 0).
+ */
+static const struct parent_map gcc_pcie_aux_map[] = {
+	{ P_XO, 0 },
+};
+
 static struct clk_rcg2 pcie_0_aux_clk_src = {
 	.cmd_rcgr = 0x1b00,
 	.mnd_width = 8,
 	.hid_width = 5,
+	.parent_map = gcc_pcie_aux_map,
 	.freq_tbl = ftbl_pcie_0_aux_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "pcie_0_aux_clk_src",
@@ -872,21 +885,36 @@ static struct clk_rcg2 pcie_0_aux_clk_src = {
 	},
 };
 
+static const struct parent_map gcc_pcie_0_pipe_map[] = {
+	{ P_PCIE_PIPE, 2 },
+};
+
+static const struct clk_parent_data gcc_pcie_0_pipe[] = {
+	{ .fw_name = "pcie_0_pipe", .name = "pcie_0_pipe" },
+};
+
+static const struct parent_map gcc_pcie_1_pipe_map[] = {
+	{ P_PCIE_PIPE, 2 },
+};
+
+static const struct clk_parent_data gcc_pcie_1_pipe[] = {
+	{ .fw_name = "pcie_1_pipe", .name = "pcie_1_pipe" },
+};
+
 static const struct freq_tbl ftbl_pcie_pipe_clk_src[] = {
-	F(125000000, P_XO, 1, 0, 0),
+	F(125000000, P_PCIE_PIPE, 1, 0, 0),
 	{ }
 };
 
 static struct clk_rcg2 pcie_0_pipe_clk_src = {
 	.cmd_rcgr = 0x1adc,
 	.hid_width = 5,
+	.parent_map = gcc_pcie_0_pipe_map,
 	.freq_tbl = ftbl_pcie_pipe_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "pcie_0_pipe_clk_src",
-		.parent_data = &(const struct clk_parent_data){
-				.fw_name = "xo",
-		},
-		.num_parents = 1,
+		.parent_data = gcc_pcie_0_pipe,
+		.num_parents = ARRAY_SIZE(gcc_pcie_0_pipe),
 		.ops = &clk_rcg2_ops,
 	},
 };
@@ -900,6 +928,7 @@ static struct clk_rcg2 pcie_1_aux_clk_src = {
 	.cmd_rcgr = 0x1b80,
 	.mnd_width = 8,
 	.hid_width = 5,
+	.parent_map = gcc_pcie_aux_map,
 	.freq_tbl = ftbl_pcie_1_aux_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "pcie_1_aux_clk_src",
@@ -914,13 +943,12 @@ static struct clk_rcg2 pcie_1_aux_clk_src = {
 static struct clk_rcg2 pcie_1_pipe_clk_src = {
 	.cmd_rcgr = 0x1b5c,
 	.hid_width = 5,
+	.parent_map = gcc_pcie_1_pipe_map,
 	.freq_tbl = ftbl_pcie_pipe_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "pcie_1_pipe_clk_src",
-		.parent_data = &(const struct clk_parent_data){
-				.fw_name = "xo",
-		},
-		.num_parents = 1,
+		.parent_data = gcc_pcie_1_pipe,
+		.num_parents = ARRAY_SIZE(gcc_pcie_1_pipe),
 		.ops = &clk_rcg2_ops,
 	},
 };
@@ -1829,9 +1857,9 @@ static struct clk_branch gcc_pcie_1_aux_clk = {
 };
 
 static struct clk_branch gcc_pcie_1_cfg_ahb_clk = {
-	.halt_reg = 0x1b54,
+	.halt_reg = 0x1b50,
 	.clkr = {
-		.enable_reg = 0x1b54,
+		.enable_reg = 0x1b50,
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "gcc_pcie_1_cfg_ahb_clk",
@@ -1841,9 +1869,9 @@ static struct clk_branch gcc_pcie_1_cfg_ahb_clk = {
 };
 
 static struct clk_branch gcc_pcie_1_mstr_axi_clk = {
-	.halt_reg = 0x1b50,
+	.halt_reg = 0x1b4c,
 	.clkr = {
-		.enable_reg = 0x1b50,
+		.enable_reg = 0x1b4c,
 		.enable_mask = BIT(0),
 		.hw.init = &(struct clk_init_data){
 			.name = "gcc_pcie_1_mstr_axi_clk",

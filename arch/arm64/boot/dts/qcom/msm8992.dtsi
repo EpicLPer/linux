@@ -106,7 +106,13 @@
 
 &gcc {
 	compatible = "qcom,gcc-msm8992";
+	clock-names = "xo", "sleep", "pcie_0_pipe";
+	clocks = <&xo_board>, <&sleep_clk>, <&pciephy0>;
 };
+
+/* 8992 has no PCIe1. Cityman WiFi is 8994 pcie1. */
+/delete-node/ &pcie1;
+/delete-node/ &pciephy1;
 
 &mmcc {
 	compatible = "qcom,mmcc-msm8992";
