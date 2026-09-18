@@ -1266,6 +1266,59 @@
 			reg = <0xfc428000 0x4000>;
 		};
 
+		mss_pil: remoteproc@fc880000 {
+			compatible = "qcom,msm8994-mss-pil";
+			reg = <0xfc880000 0x100>,
+			      <0xfc820000 0x020>;
+			reg-names = "qdsp6", "rmb";
+
+			interrupts-extended = <&intc GIC_SPI 24 IRQ_TYPE_EDGE_RISING>,
+					      <&modem_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
+					      <&modem_smp2p_in 1 IRQ_TYPE_EDGE_RISING>,
+					      <&modem_smp2p_in 2 IRQ_TYPE_EDGE_RISING>,
+					      <&modem_smp2p_in 3 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "wdog", "fatal", "ready",
+					  "handover", "stop-ack";
+
+			clocks = <&rpmcc RPM_SMD_MSS_CFG_AHB_CLK>,
+				 <&gcc GCC_MSS_Q6_BIMC_AXI_CLK>,
+				 <&gcc GCC_BOOT_ROM_AHB_CLK>,
+				 <&gcc GPLL0_OUT_MSSCC>,
+				 <&xo_board>;
+			clock-names = "iface", "bus", "mem", "gpll0_mss", "xo";
+
+			resets = <&gcc MSS_RESET>;
+			reset-names = "mss_restart";
+
+			qcom,halt-regs = <&tcsr_mutex 0x1180 0x1200 0x1280>;
+
+			power-domains = <&rpmpd MSM8994_VDDCX>,
+					<&rpmpd MSM8994_VDDMX>;
+			power-domain-names = "cx", "mx";
+
+			qcom,smem-states = <&modem_smp2p_out 0>;
+			qcom,smem-state-names = "stop";
+
+			status = "disabled";
+
+			mba {
+				memory-region = <&mba_mem>;
+			};
+
+			mpss {
+				memory-region = <&mpss_mem>;
+			};
+
+			smd-edge {
+				interrupts = <GIC_SPI 25 IRQ_TYPE_EDGE_RISING>;
+
+				qcom,ipc = <&apcs 12>;
+				qcom,smd-edge = <0>;
+
+				label = "modem";
+			};
+		};
+
 		bimc: interconnect@fc380000 {
 			reg = <0xfc380000 0x80000>;
 			compatible = "qcom,msm8994-bimc";
@@ -1325,7 +1378,7 @@
 		};
 
 		tcsr_mutex: hwlock@fd484000 {
-			compatible = "qcom,msm8994-tcsr-mutex", "qcom,tcsr-mutex";
+			compatible = "qcom,msm8994-tcsr-mutex", "qcom,tcsr-mutex", "syscon";
 			reg = <0xfd484000 0x1000>;
 			#hwlock-cells = <1>;
 		};
