@@ -572,25 +572,6 @@ int dw_pcie_prog_outbound_atu(struct dw_pcie *pci,
 		val = dw_pcie_enable_ecrc(val);
 	dw_pcie_writel_atu_ob(pci, atu->index, PCIE_ATU_REGION_CTRL1, val);
 
-	/*
-	 * LAB (temporary): print the whole programmed outbound window using the
-	 * internal accessors (reading the iATU window from the qcom glue faults -
-	 * the dbi reg is only 0xf1d long and the viewport must be selected first).
-	 * The vendor's working dump reads
-	 *   CTRL1=00000004 CTRL2=80000000 LBAR=f8801000 UBAR=00000000
-	 *   LAR=f8801fff LTAR=01000000 UTAR=00000000
-	 * so any difference in the base/limit here would mean mainline is
-	 * translating into a window it does not read back from.
-	 */
-	dev_crit(pci->dev, "LAB ATU[%u] type=%#x CTRL1=%#x TD=%u no_ecrc=%d LBAR=%#010x UBAR=%#010x LAR=%#010x LTAR=%#010x UTAR=%#010x\n",
-		 atu->index, atu->type, val, !!(val & PCIE_ATU_TD),
-		 pci->no_ecrc,
-		 dw_pcie_readl_atu_ob(pci, atu->index, PCIE_ATU_LOWER_BASE),
-		 dw_pcie_readl_atu_ob(pci, atu->index, PCIE_ATU_UPPER_BASE),
-		 dw_pcie_readl_atu_ob(pci, atu->index, PCIE_ATU_LIMIT),
-		 dw_pcie_readl_atu_ob(pci, atu->index, PCIE_ATU_LOWER_TARGET),
-		 dw_pcie_readl_atu_ob(pci, atu->index, PCIE_ATU_UPPER_TARGET));
-
 	val = PCIE_ATU_ENABLE | atu->ctrl2;
 	if (atu->type == PCIE_TLP_TYPE_MSG) {
 		/* The data-less messages only for now */

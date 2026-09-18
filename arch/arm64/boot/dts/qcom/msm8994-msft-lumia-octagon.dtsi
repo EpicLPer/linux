@@ -76,8 +76,8 @@
 	};
 
 	/*
-	 * LAB testR6: QCA6174 as a power-sequencing provider (Val Packett's
-	 * suggestion to model the WLAN PMU via pwrseq-qcom-wcn). The discrete
+	 * QCA6174 as a power-sequencing provider (models the WLAN PMU via
+	 * pwrseq-qcom-wcn). The discrete
 	 * Rome chip is powered by the PCIe PHY rail (vdda), the module enable
 	 * line (vddpe-3v3 = wlan_en), and clocked by the 32.768 kHz sleep clock
 	 * (divclk4). The provider enables them in order before the RC is trained.
@@ -124,7 +124,7 @@
 		enable-active-high;
 		pinctrl-names = "default";
 		pinctrl-0 = <&wlan_en_default>;
-		/* testR4: match working msm8996-xiaomi-common QCA6174a wlan_en delay */
+		/* match the working msm8996-xiaomi-common QCA6174a wlan_en delay */
 		startup-delay-us = <70000>;
 	};
 
@@ -779,7 +779,7 @@
 
 	divclk4_pin_a: divclk4-state {
 		/*
-		 * LAB testR16: replicate the vendor's full GPIO18 (DIVCLK4) config
+		 * Full vendor GPIO18 (DIVCLK4) configuration:
 		 * (mmo/common/gpios.dtsi gpio@d100): mode=digital-out, CMOS,
 		 * invert=0, vin-sel=2 (VIN2), src-sel=3 (FUNC2), out-strength=2
 		 * (medium), master-en=1. Our old state only muxed FUNC2, missing
@@ -954,7 +954,7 @@
 			regulator-max-microvolt = <1300000>;
 			regulator-allow-set-load;
 			regulator-system-load = <300000>;
-			/* testR4: Required by QCA6174a vdd-core (xiaomi) - force on */
+			/* required by QCA6174a vdd-core */
 			regulator-always-on;
 		};
 
