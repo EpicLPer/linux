@@ -1549,7 +1549,7 @@ static void __device_uncache_fw_images(void)
  * then the device driver can load its firmwares easily at
  * time when system is not ready to complete loading firmware.
  */
-static void device_cache_fw_images(void)
+static void __maybe_unused device_cache_fw_images(void)
 {
 	struct firmware_cache *fwc = &fw_cache;
 	DEFINE_WAIT(wait);
@@ -1615,7 +1615,13 @@ static int fw_pm_notify(struct notifier_block *notify_block,
 		 * non-uevent firmware request to avoid stalling suspend.
 		 */
 		kill_pending_fw_fallback_reqs(false);
-		device_cache_fw_images();
+		/*
+		 * Do not call device_cache_fw_images() here. On MSM8994
+		 * (Lumia talkman/octagon) it can hang and the PMIC then
+		 * cuts power, which shows up as a silent reboot on
+		 * lock/screen-off. The cache only optimises firmware
+		 * requests made while userspace is frozen on resume.
+		 */
 		break;
 
 	case PM_POST_SUSPEND:
