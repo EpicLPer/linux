@@ -30,6 +30,13 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
+void qcom_iommu_restore_ctx_after_pc(struct device *master);
+void qcom_iommu_dump_mdp_hang(struct device *master);
+void qcom_iommu_mdp_hold(struct device *master);
+void qcom_iommu_mdp_release(struct device *master);
+void qcom_iommu_mdp_kickoff_attach(struct device *master);
+void qcom_iommu_mdp_kickoff_done(struct device *master);
+
 #include "arm-smmu.h"
 #include <soc/qcom/msm8994-oxili.h>
 
@@ -1241,6 +1248,180 @@ static void qcom_iommu_device_remove(struct platform_device *pdev)
 	iommu_device_unregister(&qcom_iommu->iommu);
 }
 
+/*
+ * 3.10 msm_iommu_attach_dev: halt, __program_context, unhalt.
+ * overlay_start attaches for mdss_hw_init then detaches.
+ * cmd_clocks_enable / overlay_kickoff attach again for the
+ * frame (mdss_iommu_ctrl(1) at mdss_mdp_intf_cmd.c:284).
+ */
+static void qcom_iommu_mdp_reprogram(struct qcom_iommu_dev *qcom_iommu)
+{
+	unsigned int i;
+	int ret;
+
+	if (qcom_iommu->dev->pm_domain && !qcom_iommu->non_secure) {
+		ret = qcom_scm_restore_sec_cfg(qcom_iommu->sec_id, 0);
+		pr_info("talkman-iommu: mdp restore_sec_cfg ret=%d\n", ret);
+	}
+	qcom_iommu_bfb_setup(qcom_iommu);
+	pr_info("talkman-iommu: mdp bfb micro_mmu=%08x\n",
+		readl_relaxed(qcom_iommu->global_base +
+			      QCOM_IOMMU_MICRO_MMU_CTRL));
+
+	for (i = 0; i <= qcom_iommu->max_asid; i++) {
+		struct qcom_iommu_ctx *ctx = qcom_iommu->ctxs[i];
+
+		if (!ctx || !ctx->domain || ctx->secured_ctx)
+			continue;
+		qcom_iommu_program_ctx(qcom_iommu, ctx);
+		iommu_writel(ctx, ARM_SMMU_CB_S1_TLBIALL, 0);
+		pr_info("talkman-iommu: mdp cb%u ttbr0=%llx sctlr=%08x fsr=%08x\n",
+			ctx->asid,
+			iommu_readq(ctx, ARM_SMMU_CB_TTBR0),
+			iommu_readl(ctx, ARM_SMMU_CB_SCTLR),
+			iommu_readl(ctx, ARM_SMMU_CB_FSR));
+	}
+}
+
+/*
+ * 3.10 overlay_start after POWER_OFF: mdss_iommu_ctrl(1) re-attaches
+ * (scm_restore_sec_cfg + __program_context) before mdss_hw_init.
+ * Mainline keeps the domain attached for the DRM lifetime, so a
+ * shared MDSS GDSC collapse can wipe CB0 while RPM still thinks
+ * the SMMU is on. Replay BFB + NS CBs. Do not program mdp_1
+ * (3.10 qcom,secure-context).
+ */
+void qcom_iommu_restore_ctx_after_pc(struct device *master)
+{
+	struct qcom_iommu_dev *qcom_iommu = dev_iommu_priv_get(master);
+	int ret;
+
+	if (!qcom_iommu || !qcom_iommu_mdp_mapafter(qcom_iommu->dev))
+		return;
+
+	ret = pm_runtime_resume_and_get(qcom_iommu->dev);
+	if (ret < 0) {
+		pr_info("talkman-iommu: mdp restore rpm=%d\n", ret);
+		return;
+	}
+
+	qcom_iommu_mdp_reprogram(qcom_iommu);
+	pm_runtime_put(qcom_iommu->dev);
+}
+
+static int qcom_iommu_mdp_hold_count;
+
+/*
+ * 3.10 cmd_clocks_enable holds mdss_iommu_ctrl(1) for the MDP
+ * clock session. restore_ctx_after_pc is get+put, so RPM can
+ * drop the QSMMU before CTL_START.
+ */
+void qcom_iommu_mdp_hold(struct device *master)
+{
+	struct qcom_iommu_dev *qcom_iommu = dev_iommu_priv_get(master);
+	int ret;
+
+	if (!qcom_iommu || !qcom_iommu_mdp_mapafter(qcom_iommu->dev))
+		return;
+
+	ret = pm_runtime_resume_and_get(qcom_iommu->dev);
+	if (ret < 0) {
+		pr_info("talkman-iommu: mdp hold rpm=%d\n", ret);
+		return;
+	}
+	qcom_iommu_mdp_reprogram(qcom_iommu);
+	qcom_iommu_mdp_hold_count++;
+	pr_info("talkman-iommu: mdp hold rpm=%d refs=%d\n",
+		ret, qcom_iommu_mdp_hold_count);
+}
+
+void qcom_iommu_mdp_release(struct device *master)
+{
+	struct qcom_iommu_dev *qcom_iommu = dev_iommu_priv_get(master);
+
+	if (!qcom_iommu || !qcom_iommu_mdp_mapafter(qcom_iommu->dev))
+		return;
+	if (!qcom_iommu_mdp_hold_count)
+		return;
+
+	qcom_iommu_mdp_hold_count--;
+	pm_runtime_put(qcom_iommu->dev);
+	pr_info("talkman-iommu: mdp release refs=%d\n",
+		qcom_iommu_mdp_hold_count);
+}
+
+/*
+ * 3.10 overlay_kickoff: mdss_iommu_ctrl(1) attaches again after
+ * overlay_start detached. Halt + program_context immediately
+ * before CTL_START so the TBU is live for SSPP fetch.
+ */
+static int qcom_iommu_mdp_kickoff_gets;
+
+void qcom_iommu_mdp_kickoff_attach(struct device *master)
+{
+	struct qcom_iommu_dev *qcom_iommu = dev_iommu_priv_get(master);
+	int ret;
+
+	if (!qcom_iommu || !qcom_iommu_mdp_mapafter(qcom_iommu->dev))
+		return;
+
+	ret = pm_runtime_resume_and_get(qcom_iommu->dev);
+	if (ret < 0) {
+		pr_info("talkman-iommu: mdp kickoff rpm=%d\n", ret);
+		return;
+	}
+	qcom_iommu_mdp_reprogram(qcom_iommu);
+	/*
+	 * 3.10 overlay_kickoff: mdss_iommu_ctrl(1) stays up through
+	 * CTL_START (cmd_clocks_enable). Putting here let RPM drop
+	 * the TBU after GDSC before SSPP issued.
+	 */
+	qcom_iommu_mdp_kickoff_gets++;
+}
+
+void qcom_iommu_mdp_kickoff_done(struct device *master)
+{
+	struct qcom_iommu_dev *qcom_iommu = dev_iommu_priv_get(master);
+
+	if (!qcom_iommu || !qcom_iommu_mdp_mapafter(qcom_iommu->dev))
+		return;
+	if (!qcom_iommu_mdp_kickoff_gets)
+		return;
+
+	qcom_iommu_mdp_kickoff_gets--;
+	pm_runtime_put(qcom_iommu->dev);
+}
+
+void qcom_iommu_dump_mdp_hang(struct device *master)
+{
+	struct qcom_iommu_dev *qcom_iommu = dev_iommu_priv_get(master);
+	unsigned int i;
+	int ret;
+
+	if (!qcom_iommu || !qcom_iommu_mdp_mapafter(qcom_iommu->dev))
+		return;
+
+	ret = pm_runtime_resume_and_get(qcom_iommu->dev);
+	if (ret < 0) {
+		pr_info("talkman-iommu: hang rpm=%d\n", ret);
+		return;
+	}
+
+	for (i = 0; i <= qcom_iommu->max_asid; i++) {
+		struct qcom_iommu_ctx *ctx = qcom_iommu->ctxs[i];
+
+		if (!ctx || !ctx->domain || ctx->secured_ctx)
+			continue;
+		pr_info("talkman-iommu: hang cb%u fsr=%08x far=%llx sctlr=%08x\n",
+			ctx->asid,
+			iommu_readl(ctx, ARM_SMMU_CB_FSR),
+			iommu_readq(ctx, ARM_SMMU_CB_FAR),
+			iommu_readl(ctx, ARM_SMMU_CB_SCTLR));
+	}
+
+	pm_runtime_put(qcom_iommu->dev);
+}
+
 static int __maybe_unused qcom_iommu_resume(struct device *dev)
 {
 	struct qcom_iommu_dev *qcom_iommu = dev_get_drvdata(dev);
@@ -1295,6 +1476,11 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 			if (ctx && ctx->domain && !ctx->secured_ctx)
 				qcom_iommu_program_ctx(qcom_iommu, ctx);
 		}
+		if (qcom_iommu_mdp_mapafter(dev) &&
+		    qcom_iommu->ctxs[0] && qcom_iommu->ctxs[0]->domain)
+			pr_info("talkman-iommu: mdp resume cb0 ttbr0=%llx sctlr=%08x\n",
+				iommu_readq(qcom_iommu->ctxs[0], ARM_SMMU_CB_TTBR0),
+				iommu_readl(qcom_iommu->ctxs[0], ARM_SMMU_CB_SCTLR));
 	}
 
 	/*
@@ -1334,10 +1520,26 @@ static int __maybe_unused qcom_iommu_suspend(struct device *dev)
 	return 0;
 }
 
+static int qcom_iommu_system_suspend(struct device *dev)
+{
+	if (qcom_iommu_is_msm8994_gpu(dev)) {
+		dev_info(dev, "talkman-gpu: skip SMMU s2idle (GX held)\n");
+		return 0;
+	}
+	return pm_runtime_force_suspend(dev);
+}
+
+static int qcom_iommu_system_resume(struct device *dev)
+{
+	if (qcom_iommu_is_msm8994_gpu(dev))
+		return 0;
+	return pm_runtime_force_resume(dev);
+}
+
 static const struct dev_pm_ops qcom_iommu_pm_ops = {
 	SET_RUNTIME_PM_OPS(qcom_iommu_suspend, qcom_iommu_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(qcom_iommu_system_suspend,
+				qcom_iommu_system_resume)
 };
 
 static const struct qcom_iommu_bfb_reg msm8974_gpu_bfb[] = {
@@ -1531,6 +1733,14 @@ static const struct qcom_iommu_cfg msm8992_mdp_cfg = {
  * leaves CONFIG_IOMMU_LPAE off).
  */
 static const struct qcom_iommu_bfb_reg msm8994_mdp_bfb[] = {
+	/*
+	 * 3.10 msm8994-iommu.dtsi first BFB word: impl-def
+	 * 0x2000 = MICRO_MMU_CTRL, data 0x3 (RESERVED bits
+	 * 1:0). Offset conversion dropped that entry.
+	 * halt/unhalt only RMW HALT_REQ, so first boot kept
+	 * lk’s 0x3; GDSC POR leaves 0 and SSPP never fetches.
+	 */
+	{ 0x000, 0x3 },
 	{ 0x04c, 0x007fffff },
 	{ 0x060, 0x00001777 },
 	{ 0x514, 0x00000000 },
