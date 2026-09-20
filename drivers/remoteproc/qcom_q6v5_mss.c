@@ -678,7 +678,86 @@ static int q6v5proc_reset(struct q6v5 *qproc)
 	int ret;
 	int i;
 
-	if (qproc->version == MSS_SDM845) {
+	if (qproc->version == MSS_MSM8994) {
+		/*
+		 * Faithful port of the downstream q6v55 reset
+		 * (drivers/soc/qcom/pil-q6v5.c: __pil_q6v55_reset), which is
+		 * the sequence that boots the modem on this platform. The key
+		 * difference from the q6v56 sequence used for MSM8996/8998 is
+		 * the memory turn-on: it uses QDSP6SS_PWR_CTL bits 8..19
+		 * (0xFFF00) followed by the L2 banks, NOT the
+		 * QDSP6SS_MEM_PWR_CTL register.
+		 */
+
+		/* Override the ACC value if required */
+		writel(QDSP6SS_ACC_OVERRIDE_VAL,
+		       qproc->reg_base + QDSP6SS_STRAP_ACC);
+
+		/* Assert resets, stop core */
+		val = readl(qproc->reg_base + QDSP6SS_RESET_REG);
+		val |= Q6SS_CORE_ARES | Q6SS_BUS_ARES_ENABLE | Q6SS_STOP_CORE;
+		writel(val, qproc->reg_base + QDSP6SS_RESET_REG);
+
+		/*
+		 * The branch head switches require the XO branch clock to be
+		 * running; enable it and wait for it to come out of halt before
+		 * continuing.
+		 */
+		val = readl(qproc->reg_base + QDSP6SS_XO_CBCR);
+		val |= Q6SS_CBCR_CLKEN;
+		writel(val, qproc->reg_base + QDSP6SS_XO_CBCR);
+
+		ret = readl_poll_timeout(qproc->reg_base + QDSP6SS_XO_CBCR,
+					 val, !(val & Q6SS_CBCR_CLKOFF), 1,
+					 Q6SS_CBCR_TIMEOUT_US);
+		if (ret) {
+			dev_err(qproc->dev, "QDSP6SS XO clock timed out\n");
+			return -ETIMEDOUT;
+		}
+
+		/* Enable power block headswitch and wait for it to stabilize */
+		val = readl(qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+		val |= QDSP6v56_BHS_ON;
+		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+		udelay(1);
+		val |= QDSP6v56_LDO_BYP;
+		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+
+		/* Turn on memories */
+		val |= 0xFFF00;
+		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+
+		/* Turn on L2 banks 1 at a time */
+		for (i = 0; i <= 7; i++) {
+			val |= BIT(i);
+			writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+		}
+
+		/* Remove word line clamp */
+		val = readl(qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+		val &= ~QDSP6v56_CLAMP_WL;
+		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+
+		/* Remove IO clamp */
+		val &= ~Q6SS_CLAMP_IO;
+		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+
+		/* Remove QMC_MEM clamp */
+		val &= ~QDSP6v56_CLAMP_QMC_MEM;
+		writel(val, qproc->reg_base + QDSP6SS_PWR_CTL_REG);
+
+		/* Bring core out of reset */
+		val = readl(qproc->reg_base + QDSP6SS_RESET_REG);
+		val &= ~(Q6SS_CORE_ARES | Q6SS_STOP_CORE);
+		writel(val, qproc->reg_base + QDSP6SS_RESET_REG);
+
+		/* Turn on core clock */
+		val = readl(qproc->reg_base + QDSP6SS_GFMUX_CTL_REG);
+		val |= Q6SS_CLK_ENABLE;
+		writel(val, qproc->reg_base + QDSP6SS_GFMUX_CTL_REG);
+
+		goto pbl_wait;
+	} else if (qproc->version == MSS_SDM845) {
 		val = readl(qproc->reg_base + QDSP6SS_SLEEP);
 		val |= Q6SS_CBCR_CLKEN;
 		writel(val, qproc->reg_base + QDSP6SS_SLEEP);
@@ -762,7 +841,6 @@ static int q6v5proc_reset(struct q6v5 *qproc)
 		   qproc->version == MSS_MSM8937 ||
 		   qproc->version == MSS_MSM8940 ||
 		   qproc->version == MSS_MSM8953 ||
-		   qproc->version == MSS_MSM8994 ||
 		   qproc->version == MSS_MSM8996 ||
 		   qproc->version == MSS_MSM8998 ||
 		   qproc->version == MSS_SDM660) {
@@ -2420,13 +2498,6 @@ static const struct rproc_hexagon_res msm8998_mss = {
 
 static const struct rproc_hexagon_res msm8996_mss = {
 	.hexagon_mba_image = "mba.mbn",
-	.proxy_supply = (struct qcom_mss_reg_res[]) {
-		{
-			.supply = "pll",
-			.uA = 100000,
-		},
-		{}
-	},
 	.proxy_clk_names = (char*[]){
 			"xo",
 			"qdss",
@@ -2809,14 +2880,24 @@ static const struct rproc_hexagon_res msm8974_mss = {
 };
 
 static const struct rproc_hexagon_res msm8994_mss = {
-	.hexagon_mba_image = "mba.b00",
-	.proxy_supply = (struct qcom_mss_reg_res[]) {
-		{
-			.supply = "pll",
-			.uA = 100000,
-		},
-		{}
-	},
+	/*
+	 * "mba.mbn" must be the PHONE'S OWN MBA wrapped in the 0x1000-byte
+	 * ELF header the PBL requires:
+	 *     mba.mbn = <4096-byte ELF wrapper> + mba.b00 (this device's raw MBN)
+	 *
+	 * Why both halves matter:
+	 *  - The raw mba.b00 alone is rejected by the Q6 PBL
+	 *    ("PBL returned unexpected status 0xEF0B000B") - the PBL wants the
+	 *    ELF wrapper form (downstream's "qcom,mba-image-is-not-elf" tells
+	 *    the vendor loader to strip the wrapper, which q6v5_load() also does).
+	 *  - The Android repo's qcdsp1v28994.mbn payload is a DIFFERENT MBA build
+	 *    (it differs from this device's MBA in 1440 bytes), and mixing it with
+	 *    this device's modem.mdt is exactly the kind of mismatch that makes
+	 *    the metadata authentication fail (MBA_PIL_INIT_IMAGE_VERIFY_SIG_FAILED).
+	 * So the wrapper comes from the Android image and the payload from the
+	 * device's own dump; see notes/modem-cityman.md.
+	 */
+	.hexagon_mba_image = "mba.mbn",
 	.proxy_clk_names = (char*[]){
 		"xo",
 		NULL
@@ -2834,12 +2915,19 @@ static const struct rproc_hexagon_res msm8994_mss = {
 		NULL
 	},
 	/*
-	 * MSM8994 (q6v55 / MSS_MSM8994). needs the Q6 memory-ownership transfers
-	 * and the PAS mem-setup; the modem paths still need validation on real
-	 * hardware (see the msm8994 bringup notes).
+	 * MSM8994 (q6v55 / MSS_MSM8994).
+	 *
+	 * need_pas_mem_setup stays false: this TZ rejects the PAS mem-setup /
+	 * TZ_PIL_MEM_ID call for the modem with -22, and q6v5_mpss_load()
+	 * treats that error as fatal, so enabling it would abort the boot after
+	 * the metadata has already been accepted. Verified on device: the MBA
+	 * authenticates the metadata without it
+	 * (RMB_MBA_STATUS = MBA_PMI_META_DATA_AUTHENTICATION_SUCCESS).
+	 *
+	 * need_mem_protection stays false as well: the generic assign_mem SHARE
+	 * is rejected (-5) and the MBA reaches the metadata without it.
 	 */
-	.need_mem_protection = true,
-	.need_pas_mem_setup = true,
+	.need_pas_mem_setup = false,
 	.has_alt_reset = false,
 	.has_mba_logs = false,
 	.has_spare_reg = false,
@@ -2849,6 +2937,25 @@ static const struct rproc_hexagon_res msm8994_mss = {
 	.has_vq6 = false,
 	.version = MSS_MSM8994,
 	.ssctl_id = 0x12,
+	/*
+	 * Downstream pil-q6v55-mss drives two rails: the PLL rail
+	 * (vdd_pll = pm8994_l12, 1.8V, always on) and the Q6 core rail
+	 * (vdd_mss = pm8994_s7, 1.0V). This board binds "pll-supply" to
+	 * pm8994_s7, i.e. the Q6 core rail, so unlike msm8996 (where the "pll"
+	 * proxy vote is a separate rail) this supply must stay enabled for as
+	 * long as the modem runs. Dropping it in qcom_msa_handover() - which is
+	 * what a proxy supply would do - stops the modem before it has brought
+	 * up its SMD/QMI stack, and it never raises its doorbell or answers
+	 * rmtfs again. Declaring it as an active supply keeps it enabled for
+	 * the lifetime of the remoteproc.
+	 */
+	.active_supply = (struct qcom_mss_reg_res[]) {
+		{
+			.supply = "pll",
+			.uA = 100000,
+		},
+		{}
+	},
 };
 
 static const struct rproc_hexagon_res msm8226_mss = {
