@@ -1312,8 +1312,25 @@
 			smd-edge {
 				interrupts = <GIC_SPI 25 IRQ_TYPE_EDGE_RISING>;
 
-				qcom,ipc = <&apcs 12>;
+				/*
+				 * Signal the modem through the APCS mailbox, as
+				 * msm8916 and msm8996 do for their modem edge.
+				 * qcom,ipc is the legacy alternative and needs all
+				 * three cells; the driver only falls back to it when
+				 * no mailbox channel is available.
+				 */
+				mboxes = <&apcs 12>;
+				qcom,ipc = <&apcs 0 12>;
 				qcom,smd-edge = <0>;
+
+				/*
+				 * SMEM host id of the modem. Without it the edge
+				 * falls back to QCOM_SMEM_HOST_ANY and cannot
+				 * resolve the modem's SMD allocation table, so the
+				 * modem's channels are never discovered and QMI
+				 * never becomes reachable.
+				 */
+				qcom,remote-pid = <1>;
 
 				label = "modem";
 			};
