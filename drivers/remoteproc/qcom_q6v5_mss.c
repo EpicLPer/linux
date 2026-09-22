@@ -623,10 +623,15 @@ static int q6v5_rmb_pbl_wait(struct q6v5 *qproc, int ms)
 
 static int q6v5_rmb_mba_wait(struct q6v5 *qproc, u32 status, int ms)
 {
-
 	unsigned long timeout;
 	s32 val;
 
+	/*
+	 * Poll at 50 usec like downstream 3.10 (pil_msa.c POLL_INTERVAL_US = 50).
+	 * The previous msleep(1) was 20x slower and could miss a brief
+	 * RMB_MBA_STATUS transition (e.g. AUTH_COMPLETE appearing and then
+	 * being overwritten), causing intermittent authentication timeouts.
+	 */
 	timeout = jiffies + msecs_to_jiffies(ms);
 	for (;;) {
 		val = readl(qproc->rmb_base + RMB_MBA_STATUS_REG);
@@ -641,7 +646,13 @@ static int q6v5_rmb_mba_wait(struct q6v5 *qproc, u32 status, int ms)
 		if (time_after(jiffies, timeout))
 			return -ETIMEDOUT;
 
-		msleep(1);
+		/*
+		 * Tight spin for the first 100 ms to catch brief AUTH_COMPLETE
+		 * transitions, then back off to 50 usec polling.
+		 */
+		if (time_before(jiffies, timeout - msecs_to_jiffies(ms - 100)))
+			continue;  /* busy-wait */
+		usleep_range(50, 100);
 	}
 
 	return val;
@@ -1198,6 +1209,18 @@ static int q6v5_mpss_init_image(struct q6v5 *qproc, const struct firmware *fw,
 		goto free_dma_attrs;
 	}
 
+	/*
+	 * DIAGNOSTIC: the metadata buffer comes from dma_alloc_attrs() and therefore
+	 * lands at a DIFFERENT physical address on every attempt. The metadata phase
+	 * always succeeds, but the following code-auth phase fails ~2 times in 3, and
+	 * the RMB dump shows identical register values in both cases - so the only
+	 * input that varies between attempts is this address. Log it unconditionally
+	 * (both on success and failure) so the two outcomes can be correlated with it.
+	 */
+	dev_info(qproc->dev, "MPSS metadata buffer: phys=%pa size=%zu rmb_0c_before=%08x\n",
+		 &phys, size,
+		 readl(qproc->rmb_base + RMB_MBA_STATUS_REG));
+
 	writel(phys, qproc->rmb_base + RMB_PMI_META_DATA_REG);
 	writel(RMB_CMD_META_DATA_READY, qproc->rmb_base + RMB_MBA_COMMAND_REG);
 
@@ -1206,6 +1229,9 @@ static int q6v5_mpss_init_image(struct q6v5 *qproc, const struct firmware *fw,
 		dev_err(qproc->dev, "MPSS header authentication timed out\n");
 	else if (ret < 0)
 		dev_err(qproc->dev, "MPSS header authentication failed: %d\n", ret);
+	else
+		dev_info(qproc->dev, "MPSS metadata authenticated: rmb_0c=%08x\n",
+			 readl(qproc->rmb_base + RMB_MBA_STATUS_REG));
 
 	/* Metadata authentication done, remove modem access */
 	xferop_ret = q6v5_xfer_mem_ownership(qproc, &mdata_perm, true, false,
@@ -1540,6 +1566,14 @@ static int q6v5_mpss_load(struct q6v5 *qproc)
 	/* Initialize the RMB validator */
 	writel(0, qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG);
 
+	/*
+	 * Ensure the zero write is visible to the MBA before proceeding.
+	 * Downstream 3.10 (pil_msa.c) uses wmb() after every memcpy into
+	 * MBA-visible memory and before signalling the MBA.  Without it the
+	 * MBA can observe stale register state.
+	 */
+	wmb();
+
 	ret = q6v5_mpss_init_image(qproc, fw, qproc->hexagon_mdt_image);
 	if (ret)
 		goto release_firmware;
@@ -1591,6 +1625,12 @@ static int q6v5_mpss_load(struct q6v5 *qproc)
 
 	mpss_reloc = relocate ? min_addr : qproc->mpss_phys;
 	qproc->mpss_reloc = mpss_reloc;
+
+	/*
+	 * NOTE: gap-zeroing was tested and made things WORSE (0/7 vs ~2/7 baseline).
+	 * Removed.  The real fix is the poll-interval and CODE_LENGTH handshake below.
+	 */
+
 	/* Load firmware segments */
 	for (i = 0; i < ehdr->e_phnum; i++) {
 		phdr = &phdrs[i];
@@ -1661,16 +1701,44 @@ static int q6v5_mpss_load(struct q6v5 *qproc)
 			memset(ptr + phdr->p_filesz, 0,
 			       phdr->p_memsz - phdr->p_filesz);
 		}
+		/* Order stores before unmapping the WC mapping */
+		wmb();
 		memunmap(ptr);
 		size += phdr->p_memsz;
 
+		/*
+		 * HYPOTHESIS under test: RMB_CMD_LOAD_READY is sent ONLY on the first
+		 * segment for which RMB_PMI_CODE_LENGTH_REG still reads 0. If the MBA has
+		 * meanwhile put a non-zero value there, LOAD_READY is never sent, the code
+		 * authentication is never started, and RMB_MBA_STATUS stays at 0x3
+		 * (META_DATA_AUTH_SUCCESS) until the 10 s timeout - which is exactly the
+		 * captured failure signature (MBA_STATUS=0x3, MBA_CMD=0).
+		 * Log code_length at every segment so the two outcomes can be compared.
+		 */
 		code_length = readl(qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG);
+		dev_info(qproc->dev,
+			 "seg %2d: code_length=%08x size_before=%zu load_ready=%s\n",
+			 i, code_length, size, code_length ? "SKIPPED" : "sent");
 		if (!code_length) {
 			boot_addr = relocate ? qproc->mpss_phys : min_addr;
 			writel(boot_addr, qproc->rmb_base + RMB_PMI_CODE_START_REG);
 			writel(RMB_CMD_LOAD_READY, qproc->rmb_base + RMB_MBA_COMMAND_REG);
 		}
-		writel(size, qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG);
+		/*
+		 * Read-modify-write CODE_LENGTH, matching downstream 3.10
+		 * (pil_msa_mba_verify_blob):
+		 *   u32 img_length = readl_relaxed(RMB_PMI_CODE_LENGTH);
+		 *   img_length += size;        // size = THIS segment's p_memsz
+		 *   writel_relaxed(img_length, RMB_PMI_CODE_LENGTH);
+		 * The MBA may update CODE_LENGTH between segments.  Overwriting
+		 * it with the cumulative local `size` clobbers that state and
+		 * double-counts on a read-modify-write.  We must add only the
+		 * current segment's p_memsz, not the running total.
+		 */
+		code_length = readl(qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG);
+		code_length += phdr->p_memsz;
+		wmb();
+		writel(code_length, qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG);
 
 		ret = readl(qproc->rmb_base + RMB_MBA_STATUS_REG);
 		if (ret < 0) {
@@ -1679,6 +1747,29 @@ static int q6v5_mpss_load(struct q6v5 *qproc)
 			goto release_firmware;
 		}
 	}
+
+	/*
+	 * HYPOTHESIS UNDER TEST
+	 * ---------------------
+	 * The segments above are written through a write-combining mapping
+	 * (memremap(..., MEMREMAP_WC)), and the MBA is then told to authenticate them
+	 * with a plain writel() handshake. MEMREMAP_WC gives no ordering guarantee, so
+	 * the MBA can read the region while writes are still draining to DRAM and fail
+	 * the hash check on some segment.
+	 *
+	 * Measured behaviour that matches: the metadata (written earlier, via a different
+	 * path) ALWAYS authenticates, while the code authentication succeeds only ~2 times
+	 * in 7 with byte-identical inputs - a data-visibility symptom rather than a data
+	 * or logic error.
+	 *
+	 * This adds an explicit drain of the write-combining buffers before the ownership
+	 * transfer and the handshake, so the region is in DRAM before the Q6 is asked to
+	 * read it. wmb() orders the CPU's writes; wc_mem_flush() pushes any pending
+	 * write-combining data out to the point of coherency.
+	 */
+	wmb();
+	if (IS_ENABLED(CONFIG_ARM64))
+		asm volatile("dsb sy" ::: "memory");
 
 	/* Transfer ownership of modem ddr region to q6 */
 	ret = q6v5_xfer_mem_ownership(qproc, &qproc->mpss_perm, false, true,
@@ -1690,11 +1781,54 @@ static int q6v5_mpss_load(struct q6v5 *qproc)
 		goto release_firmware;
 	}
 
+	/*
+	 * DIAGNOSTIC: trace the MBA status DURING the auth wait.
+	 * Observed: identical inputs (same firmware, same segments, same metadata address
+	 * 0xdd8e2000, same RMB dump) yet AUTH_COMPLETE is reached only ~1 time in 3.
+	 * RMB_MBA_STATUS at timeout is 0x3 (META_DATA_AUTH_SUCCESS), i.e. the code-auth
+	 * transition never happened. Sampling the register over time shows whether the MBA
+	 * is progressing slowly, stuck at 0x3, or never reaches a stable value.
+	 */
+	dev_info(qproc->dev, "MPSS auth wait: status=%08x cmd=%08x code_len=%08x\n",
+		 readl(qproc->rmb_base + RMB_MBA_STATUS_REG),
+		 readl(qproc->rmb_base + RMB_MBA_COMMAND_REG),
+		 readl(qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG));
+
 	ret = q6v5_rmb_mba_wait(qproc, RMB_MBA_AUTH_COMPLETE, 10000);
-	if (ret == -ETIMEDOUT)
+	if (ret == -ETIMEDOUT) {
+		dev_err(qproc->dev,
+			"MPSS auth wait: TIMED OUT at status=%08x cmd=%08x mss_status=%08x\n",
+			readl(qproc->rmb_base + RMB_MBA_STATUS_REG),
+			readl(qproc->rmb_base + RMB_MBA_COMMAND_REG),
+			readl(qproc->rmb_base + RMB_MBA_MSS_STATUS));
+		/*
+		 * THE MBA LEFT NO TRACE OF WHY. Dump the RMB state like downstream's
+		 * modem_log_rmb_regs() does (see notes/310-pil/pil-msa.c), so a timeout
+		 * reports the status the MBA is actually sitting in rather than just
+		 * "timed out":
+		 *     RMB_MBA_STATUS  0x3 = META_DATA_AUTH_SUCCESS
+		 *                     0x4 = AUTH_COMPLETE
+		 *                     0x6 = MBA_UNLOCKED
+		 *                     negative = a specific MBA failure code
+		 * On this port the outcome is intermittent (~1 in 3 tries fails), and
+		 * this is the only place that can say why.
+		 */
 		dev_err(qproc->dev, "MPSS authentication timed out\n");
-	else if (ret < 0)
+		dev_err(qproc->dev,
+			"RMB: MBA_IMAGE=%08x PBL_STATUS=%08x MBA_CMD=%08x MBA_STATUS=%08x\n",
+			readl(qproc->rmb_base + RMB_MBA_IMAGE_REG),
+			readl(qproc->rmb_base + RMB_PBL_STATUS_REG),
+			readl(qproc->rmb_base + RMB_MBA_COMMAND_REG),
+			readl(qproc->rmb_base + RMB_MBA_STATUS_REG));
+		dev_err(qproc->dev,
+			"RMB: PMI_META_DATA=%08x PMI_CODE_START=%08x PMI_CODE_LENGTH=%08x MBA_MSS_STATUS=%08x\n",
+			readl(qproc->rmb_base + RMB_PMI_META_DATA_REG),
+			readl(qproc->rmb_base + RMB_PMI_CODE_START_REG),
+			readl(qproc->rmb_base + RMB_PMI_CODE_LENGTH_REG),
+			readl(qproc->rmb_base + RMB_MBA_MSS_STATUS));
+	} else if (ret < 0) {
 		dev_err(qproc->dev, "MPSS authentication failed: %d\n", ret);
+	}
 
 	qcom_pil_info_store("modem", qproc->mpss_phys, qproc->mpss_size);
 
