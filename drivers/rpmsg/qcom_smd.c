@@ -135,6 +135,8 @@ struct qcom_smd_edge {
 	spinlock_t channels_lock;
 
 	DECLARE_BITMAP(allocated[SMD_ALLOC_TBL_COUNT], SMD_ALLOC_TBL_SIZE);
+	/* DIAGNOSTIC: entries already reported as skipped */
+	DECLARE_BITMAP(reported[SMD_ALLOC_TBL_COUNT], SMD_ALLOC_TBL_SIZE);
 
 	unsigned smem_available;
 
@@ -1229,25 +1231,46 @@ static void qcom_channel_scan_worker(struct work_struct *work)
 			if (test_bit(i, edge->allocated[tbl]))
 				continue;
 
-			if (entry->ref_count == 0)
-				continue;
-
 			if (!entry->name[0])
-				continue;
-
-			if (!(eflags & SMD_CHANNEL_FLAGS_PACKET))
 				continue;
 
 			if ((eflags & SMD_CHANNEL_FLAGS_EDGE_MASK) != edge->edge_id)
 				continue;
 
 			cid = le32_to_cpu(entry->cid);
+
+			/*
+			 * DIAGNOSTIC: report every entry of this edge that is
+			 * not turned into a channel, once.
+			 */
+			if (entry->ref_count == 0 ||
+			    !(eflags & SMD_CHANNEL_FLAGS_PACKET)) {
+				if (!test_and_set_bit(i, edge->reported[tbl]))
+					dev_info(&edge->dev,
+						 "smd-diag: skip tbl%d[%d] '%.20s' cid=%u flags=%#x ref=%u (%s)\n",
+						 tbl, i, entry->name, cid, eflags,
+						 le32_to_cpu(entry->ref_count),
+						 entry->ref_count == 0 ? "unreferenced" : "not a packet channel");
+				continue;
+			}
+
 			info_id = smem_items[tbl].info_base_id + cid;
 			fifo_id = smem_items[tbl].fifo_base_id + cid;
 
 			channel = qcom_smd_create_channel(edge, info_id, fifo_id, entry->name);
-			if (IS_ERR(channel))
+			if (IS_ERR(channel)) {
+				if (!test_and_set_bit(i, edge->reported[tbl]))
+					dev_info(&edge->dev,
+						 "smd-diag: skip tbl%d[%d] '%.20s' cid=%u flags=%#x: create failed %pe (info %u, fifo %u)\n",
+						 tbl, i, entry->name, cid, eflags,
+						 channel, info_id, fifo_id);
 				continue;
+			}
+
+			dev_info(&edge->dev,
+				 "smd-diag: channel tbl%d[%d] '%s' cid=%u flags=%#x remote_state=%u\n",
+				 tbl, i, channel->name, cid, eflags,
+				 GET_RX_CHANNEL_INFO(channel, state));
 
 			spin_lock_irqsave(&edge->channels_lock, flags);
 			list_add(&channel->list, &edge->channels);
