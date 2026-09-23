@@ -3038,6 +3038,24 @@ static const struct rproc_hexagon_res msm8994_mss = {
 	 * device's own dump; see notes/modem-cityman.md.
 	 */
 	.hexagon_mba_image = "mba.mbn",
+	.proxy_supply = (struct qcom_mss_reg_res[]) {
+		{
+			.supply = "pll",
+			.uA = 100000,
+		},
+		{}
+	},
+	/*
+	 * The Q6 core rail (PM8994 S7) is fixed at 1.0 V; no voltage is
+	 * requested so the board constraints alone decide it.
+	 */
+	.active_supply = (struct qcom_mss_reg_res[]) {
+		{
+			.supply = "mss",
+			.uA = 100000,
+		},
+		{}
+	},
 	.proxy_clk_names = (char*[]){
 		"xo",
 		NULL
@@ -3077,25 +3095,6 @@ static const struct rproc_hexagon_res msm8994_mss = {
 	.has_vq6 = false,
 	.version = MSS_MSM8994,
 	.ssctl_id = 0x12,
-	/*
-	 * Downstream pil-q6v55-mss drives two rails: the PLL rail
-	 * (vdd_pll = pm8994_l12, 1.8V, always on) and the Q6 core rail
-	 * (vdd_mss = pm8994_s7, 1.0V). This board binds "pll-supply" to
-	 * pm8994_s7, i.e. the Q6 core rail, so unlike msm8996 (where the "pll"
-	 * proxy vote is a separate rail) this supply must stay enabled for as
-	 * long as the modem runs. Dropping it in qcom_msa_handover() - which is
-	 * what a proxy supply would do - stops the modem before it has brought
-	 * up its SMD/QMI stack, and it never raises its doorbell or answers
-	 * rmtfs again. Declaring it as an active supply keeps it enabled for
-	 * the lifetime of the remoteproc.
-	 */
-	.active_supply = (struct qcom_mss_reg_res[]) {
-		{
-			.supply = "pll",
-			.uA = 100000,
-		},
-		{}
-	},
 };
 
 static const struct rproc_hexagon_res msm8226_mss = {
