@@ -924,11 +924,10 @@ static int q6v5proc_reset(struct q6v5 *qproc)
 			/* Turn on L1, L2, ETB and JU memories 1 at a time */
 			if (qproc->version == MSS_MSM8940 ||
 			    qproc->version == MSS_MSM8953 ||
-			    qproc->version == MSS_MSM8994 ||
 			    qproc->version == MSS_MSM8996) {
-			 mem_pwr_ctl = QDSP6SS_MEM_PWR_CTL;
-			 i = 19;
-			 reverse = 0;
+				mem_pwr_ctl = QDSP6SS_MEM_PWR_CTL;
+				i = 19;
+				reverse = 0;
 			} else if (qproc->version == MSS_MDM9607 ||
 				   qproc->version == MSS_MSM8917 ||
 				   qproc->version == MSS_MSM8937) {
