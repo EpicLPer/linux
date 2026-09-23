@@ -1498,6 +1498,9 @@ static void q6v5_mba_reclaim(struct q6v5 *qproc)
 	WARN_ON(ret);
 
 	ret = qcom_q6v5_unprepare(&qproc->q6v5);
+	if (!ret && qproc->version == MSS_MSM8994)
+		q6v5_pds_disable(qproc, qproc->proxy_pds,
+				 qproc->proxy_pd_count);
 	if (ret) {
 		q6v5_pds_disable(qproc, qproc->proxy_pds,
 				 qproc->proxy_pd_count);
@@ -2010,7 +2013,13 @@ static void qcom_msa_handover(struct qcom_q6v5 *q6v5)
 			       qproc->proxy_reg_count);
 	q6v5_regulator_disable(qproc, qproc->fallback_proxy_regs,
 			       qproc->fallback_proxy_reg_count);
-	q6v5_pds_disable(qproc, qproc->proxy_pds, qproc->proxy_pd_count);
+	/*
+	 * EXPERIMENT: Windows (Lumia DSDT, PEP0 SPCC "\_SB.AMSS" PSTATE 0) keeps
+	 * the CX and MX votes for as long as the modem is active. Hold them past
+	 * handover on MSM8994 and release them in q6v5_mba_reclaim() instead.
+	 */
+	if (qproc->version != MSS_MSM8994)
+		q6v5_pds_disable(qproc, qproc->proxy_pds, qproc->proxy_pd_count);
 }
 
 static int q6v5_init_mem(struct q6v5 *qproc, struct platform_device *pdev)
