@@ -1283,9 +1283,9 @@
 			clocks = <&rpmcc RPM_SMD_MSS_CFG_AHB_CLK>,
 				 <&gcc GCC_MSS_Q6_BIMC_AXI_CLK>,
 				 <&gcc GCC_BOOT_ROM_AHB_CLK>,
-				 <&gcc GPLL0_OUT_MSSCC>,
-				 <&xo_board>;
-			clock-names = "iface", "bus", "mem", "gpll0_mss", "xo";
+				 <&xo_board>,
+				 <&gcc GPLL0_OUT_MSSCC>;
+			clock-names = "iface", "bus", "mem", "xo", "gpll0_mss";
 
 			resets = <&gcc MSS_RESET>;
 			reset-names = "mss_restart";
@@ -1299,28 +1299,14 @@
 			qcom,smem-states = <&modem_smp2p_out 0>;
 			qcom,smem-state-names = "stop";
 
+			memory-region = <&mba_mem>, <&mpss_mem>;
+
 			status = "disabled";
-
-			mba {
-				memory-region = <&mba_mem>;
-			};
-
-			mpss {
-				memory-region = <&mpss_mem>;
-			};
 
 			smd-edge {
 				interrupts = <GIC_SPI 25 IRQ_TYPE_EDGE_RISING>;
 
-				/*
-				 * Signal the modem through the APCS mailbox, as
-				 * msm8916 and msm8996 do for their modem edge.
-				 * qcom,ipc is the legacy alternative and needs all
-				 * three cells; the driver only falls back to it when
-				 * no mailbox channel is available.
-				 */
 				mboxes = <&apcs 12>;
-				qcom,ipc = <&apcs 0 12>;
 				qcom,smd-edge = <0>;
 
 				/*
