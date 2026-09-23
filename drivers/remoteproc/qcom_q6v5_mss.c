@@ -3057,11 +3057,14 @@ static const struct rproc_hexagon_res msm8994_mss = {
 	/*
 	 * The Q6 core rail (PM8994 S7) is fixed at 1.0 V; no voltage is
 	 * requested so the board constraints alone decide it.
+	 *
+	 * EXPERIMENT: 3.31 A is the load Windows votes on S7 while the modem is
+	 * active (Lumia DSDT, PEP0 SPCC "\_SB.AMSS" PSTATE 0).
 	 */
 	.active_supply = (struct qcom_mss_reg_res[]) {
 		{
 			.supply = "mss",
-			.uA = 100000,
+			.uA = 3310000,
 		},
 		{}
 	},

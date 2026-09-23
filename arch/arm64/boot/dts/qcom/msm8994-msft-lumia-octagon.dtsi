@@ -967,6 +967,7 @@
 		vreg_s7a_1p0: s7 {
 			regulator-min-microvolt = <1000000>;
 			regulator-max-microvolt = <1000000>;
+			regulator-allow-set-load;
 		};
 
 		/*
