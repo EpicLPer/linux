@@ -27,6 +27,7 @@ properties:
           - qcom,msm8940-mss-pil
           - qcom,msm8953-mss-pil
           - qcom,msm8974-mss-pil
+          - qcom,msm8994-mss-pil
 
       - const: qcom,q6v5-pil
         description: Deprecated, prefer using qcom,msm8916-mss-pil
@@ -59,18 +60,22 @@ properties:
       - const: stop-ack
 
   clocks:
+    minItems: 4
     items:
       - description: Configuration interface (AXI) clock
       - description: Configuration bus (AHB) clock
       - description: Boot ROM (AHB) clock
       - description: XO proxy clock (control handed over after startup)
+      - description: GPLL0 output to MSS (only valid for qcom,msm8994-mss-pil)
 
   clock-names:
+    minItems: 4
     items:
       - const: iface
       - const: bus
       - const: mem
       - const: xo
+      - const: gpll0_mss
 
   power-domains:
     items:
@@ -241,6 +246,7 @@ allOf:
               - qcom,msm8917-mss-pil
               - qcom,msm8937-mss-pil
               - qcom,msm8940-mss-pil
+              - qcom,msm8994-mss-pil
     then:
       properties:
         power-domains:
@@ -288,12 +294,30 @@ allOf:
               - qcom,msm8937-mss-pil
               - qcom,msm8940-mss-pil
               - qcom,msm8974-mss-pil
+              - qcom,msm8994-mss-pil
     then:
       required:
         - mss-supply
     else:
       properties:
         mss-supply: false
+
+  - if:
+      properties:
+        compatible:
+          const: qcom,msm8994-mss-pil
+    then:
+      properties:
+        clocks:
+          minItems: 5
+        clock-names:
+          minItems: 5
+    else:
+      properties:
+        clocks:
+          maxItems: 4
+        clock-names:
+          maxItems: 4
 
   # Fallbacks for deprecated properties
   - oneOf:
