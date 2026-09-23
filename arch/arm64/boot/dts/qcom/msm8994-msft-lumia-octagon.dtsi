@@ -1486,24 +1486,14 @@
 	vdda-supply = <&vreg_l12a_1p8>;
 };
 
-/* Modem (MSS): vdd_mss = PM8994 S7, vdd_pll = L12 (1.8 V). */
 /*
- * The modem (MSS) remoteproc.
- *
- * No `metadata` child on purpose: the driver then allocates the metadata
+ * No third memory-region on purpose: the driver then allocates the metadata
  * buffer with dma_alloc_attrs(), i.e. ordinary non-secure DRAM, which is what
- * tzbsp_pil_populate_elf_info() requires and what downstream's working
- * self-auth path uses. Placing it in a reserved region instead only adds a
- * memremap() and has to satisfy the same non-secure requirement anyway.
- *
- * "pll-supply" is pm8994_s7 - the Q6 core rail - not the always-on PLL rail
- * of the reference designs (downstream has vdd_mss = pm8994_s7 for the core
- * and vdd_pll = pm8994_l12 for the PLL). It is therefore declared as an
- * *active* supply in the driver, so it stays enabled for as long as the modem
- * runs instead of being dropped when the modem signals handover; the modem
- * only brings up its SMD/QMI stack after that point.
+ * tzbsp_pil_populate_elf_info() requires.
  */
 &mss_pil {
+	mss-supply = <&vreg_s7a_1p0>;
+	pll-supply = <&vreg_l12a_1p8>;
+
 	status = "okay";
-	pll-supply = <&vreg_s7a_1p0>;
 };
