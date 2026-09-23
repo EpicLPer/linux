@@ -24,10 +24,7 @@
 /delete-node/ &audio_mem;
 /delete-node/ &mba_mem;
 /delete-node/ &mpss_mem;
-/*
- * Keep &peripheral_region: the MSS metadata (modem.mdt hash, PH01
- * p_paddr = 0x0ca00000) is placed there so the MBA can authenticate it.
- */
+/delete-node/ &peripheral_region;
 /delete-node/ &res_hyp_mem;
 /delete-node/ &rmtfs_mem;
 /delete-node/ &smem_mem;
