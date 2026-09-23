@@ -135,6 +135,8 @@ struct qcom_smd_edge {
 	spinlock_t channels_lock;
 
 	DECLARE_BITMAP(allocated[SMD_ALLOC_TBL_COUNT], SMD_ALLOC_TBL_SIZE);
+	/* DIAGNOSTIC: entries already reported as skipped */
+	DECLARE_BITMAP(reported[SMD_ALLOC_TBL_COUNT], SMD_ALLOC_TBL_SIZE);
 
 	unsigned smem_available;
 
@@ -436,59 +438,6 @@ static size_t qcom_smd_channel_get_rx_avail(struct qcom_smd_channel *channel)
 }
 
 /*
- * The remote processor publishes its channel state in the shared channel-info
- * item and normally pings us through the edge interrupt. If that interrupt is
- * not delivered (for example the platform's doorbell is not wired up for this
- * edge), the cached remote_state would never change even though the remote has
- * already moved on. Re-read the state from shared memory so the handshake does
- * not depend on the interrupt alone.
- */
-static unsigned int qcom_smd_refresh_remote_state(struct qcom_smd_channel *channel)
-{
-	unsigned int state = GET_RX_CHANNEL_INFO(channel, state);
-
-	if (state != channel->remote_state) {
-		channel->remote_state = state;
-		wake_up_interruptible_all(&channel->state_change_event);
-	}
-
-	return state;
-}
-
-/*
- * Wait for the remote side to reach OPENING (or OPENED), or OPENED if
- * @opened_only, refreshing the cached state from shared memory as we go.
- */
-static int qcom_smd_wait_remote_state(struct qcom_smd_channel *channel,
-				      bool opened_only)
-{
-	unsigned long deadline = jiffies + HZ;
-	unsigned int state;
-	int tries = 0;
-
-	for (;;) {
-		state = qcom_smd_refresh_remote_state(channel);
-		if (state == SMD_CHANNEL_OPENED ||
-		    (!opened_only && state == SMD_CHANNEL_OPENING))
-			return 0;
-
-		if (time_after(jiffies, deadline))
-			return -ETIMEDOUT;
-
-		/*
-		 * The notification is a single, non-latching doorbell write
-		 * that the remote can miss (it may already be in its idle path
-		 * when the pulse arrives). Re-assert it periodically instead of
-		 * relying on the remote catching one pulse.
-		 */
-		if (!(tries++ % 20))
-			qcom_smd_signal_channel(channel);
-
-		usleep_range(1000, 2000);
-	}
-}
-
-/*
  * Set tx channel state and inform the remote processor
  */
 static void qcom_smd_channel_set_state(struct qcom_smd_channel *channel,
@@ -510,18 +459,6 @@ static void qcom_smd_channel_set_state(struct qcom_smd_channel *channel,
 	SET_TX_CHANNEL_FLAG(channel, fSTATE, 1);
 
 	channel->state = state;
-
-	/*
-	 * The channel info lives in write-combining memory (smem is mapped
-	 * with devm_ioremap_wc()), while the notification below is an MMIO
-	 * write to the IPC register. Without this barrier the state update can
-	 * still be sitting in the write-combining buffer when the doorbell
-	 * goes out, so the remote wakes up, reads the stale state and goes
-	 * back to sleep - the handshake then never completes. Every other path
-	 * that signals after updating channel info already has this barrier.
-	 */
-	wmb();
-
 	qcom_smd_signal_channel(channel);
 }
 
@@ -895,13 +832,12 @@ static int qcom_smd_channel_open(struct qcom_smd_channel *channel,
 	qcom_smd_channel_set_callback(channel, cb);
 	qcom_smd_channel_set_state(channel, SMD_CHANNEL_OPENING);
 
-	/*
-	 * The remote may already be OPENING/OPENED before we get here, so
-	 * read the shared state directly instead of relying on the edge
-	 * interrupt to have updated the cached copy.
-	 */
-	ret = qcom_smd_wait_remote_state(channel, false);
-	if (ret) {
+	/* Wait for remote to enter opening or opened */
+	ret = wait_event_interruptible_timeout(channel->state_change_event,
+			channel->remote_state == SMD_CHANNEL_OPENING ||
+			channel->remote_state == SMD_CHANNEL_OPENED,
+			HZ);
+	if (!ret) {
 		dev_err(&edge->dev, "remote side did not enter opening state\n");
 		goto out_close_timeout;
 	}
@@ -909,8 +845,10 @@ static int qcom_smd_channel_open(struct qcom_smd_channel *channel,
 	qcom_smd_channel_set_state(channel, SMD_CHANNEL_OPENED);
 
 	/* Wait for remote to enter opened */
-	ret = qcom_smd_wait_remote_state(channel, true);
-	if (ret) {
+	ret = wait_event_interruptible_timeout(channel->state_change_event,
+			channel->remote_state == SMD_CHANNEL_OPENED,
+			HZ);
+	if (!ret) {
 		dev_err(&edge->dev, "remote side did not enter open state\n");
 		goto out_close_timeout;
 	}
@@ -1293,25 +1231,46 @@ static void qcom_channel_scan_worker(struct work_struct *work)
 			if (test_bit(i, edge->allocated[tbl]))
 				continue;
 
-			if (entry->ref_count == 0)
-				continue;
-
 			if (!entry->name[0])
-				continue;
-
-			if (!(eflags & SMD_CHANNEL_FLAGS_PACKET))
 				continue;
 
 			if ((eflags & SMD_CHANNEL_FLAGS_EDGE_MASK) != edge->edge_id)
 				continue;
 
 			cid = le32_to_cpu(entry->cid);
+
+			/*
+			 * DIAGNOSTIC: report every entry of this edge that is
+			 * not turned into a channel, once.
+			 */
+			if (entry->ref_count == 0 ||
+			    !(eflags & SMD_CHANNEL_FLAGS_PACKET)) {
+				if (!test_and_set_bit(i, edge->reported[tbl]))
+					dev_info(&edge->dev,
+						 "smd-diag: skip tbl%d[%d] '%.20s' cid=%u flags=%#x ref=%u (%s)\n",
+						 tbl, i, entry->name, cid, eflags,
+						 le32_to_cpu(entry->ref_count),
+						 entry->ref_count == 0 ? "unreferenced" : "not a packet channel");
+				continue;
+			}
+
 			info_id = smem_items[tbl].info_base_id + cid;
 			fifo_id = smem_items[tbl].fifo_base_id + cid;
 
 			channel = qcom_smd_create_channel(edge, info_id, fifo_id, entry->name);
-			if (IS_ERR(channel))
+			if (IS_ERR(channel)) {
+				if (!test_and_set_bit(i, edge->reported[tbl]))
+					dev_info(&edge->dev,
+						 "smd-diag: skip tbl%d[%d] '%.20s' cid=%u flags=%#x: create failed %pe (info %u, fifo %u)\n",
+						 tbl, i, entry->name, cid, eflags,
+						 channel, info_id, fifo_id);
 				continue;
+			}
+
+			dev_info(&edge->dev,
+				 "smd-diag: channel tbl%d[%d] '%s' cid=%u flags=%#x remote_state=%u\n",
+				 tbl, i, channel->name, cid, eflags,
+				 GET_RX_CHANNEL_INFO(channel, state));
 
 			spin_lock_irqsave(&edge->channels_lock, flags);
 			list_add(&channel->list, &edge->channels);
