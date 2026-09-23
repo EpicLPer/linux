@@ -353,42 +353,24 @@
 			no-map;
 		};
 
-		/*
-		 * Shared memory rmtfs hands to the modem for its EFS partitions.
-		 *
-		 * The device's ACPI DSDT describes this as 0x10000, but the modem
-		 * asks for a 0x180000 allocation and will not bring up its EFS/QMI
-		 * stack without it ("rmtfs shared memory not large enough for
-		 * allocation request 0x180000 vs 65536"). 0x180000 also matches the
-		 * size the generic msm8994.dtsi gives rmtfs_mem.
-		 *
-		 * It cannot simply be enlarged in place: at 0x06e70000 the region
-		 * abuts mba_mem at 0x06e80000. Place it in the hole between
-		 * venus_mem (ends 0x0e700000) and the end of the reserved PIL area
-		 * (0x0ef00000), where it overlaps nothing.
-		 */
-		rmtfs_mem: memory@e700000 {
+		/* ACPI RFS0: RFMB/RFMS (modem RFSA buffer) */
+		rfsa_mpss_mem: memory@6e70000 {
+			reg = <0 0x06e70000 0 0x10000>;
+			no-map;
+		};
+
+		/* ACPI RFS0 and PILC: RMTB/RMTX (modem EFS buffer) */
+		rmtfs_mem: memory@6e80000 {
 			compatible = "qcom,rmtfs-mem";
-			reg = <0 0x0e700000 0 0x180000>;
+			reg = <0 0x06e80000 0 0x180000>;
 			no-map;
 
 			qcom,client-id = <1>;
 		};
 
 		/*
-		 * Value obtained from the device original ACPI DSDT table
-		 * MPSS_EFS / SBL
-		 *
-		 * Here goes MBA
-		 */
-		mba_mem: memory@6e80000 {
-			reg = <0 0x06e80000 0 0x180000>;
-			no-map;
-		};
-
-		/*
 		 * Peripheral Image loader region begin!
-		 * The region reserved for pil is 0x7000000-0xef00000
+		 * ACPI PILC: PGCM = 0x07000000, size 0x07900000
 		 */
 
 		/* Here goes AMSS */
@@ -406,6 +388,12 @@
 		/* Here goes VSS */
 		venus_mem: memory@e200000 {
 			reg = <0 0x0e200000 0 0x500000>;
+			no-map;
+		};
+
+		/* Here goes MBA */
+		mba_mem: memory@e700000 {
+			reg = <0 0x0e700000 0 0x100000>;
 			no-map;
 		};
 
