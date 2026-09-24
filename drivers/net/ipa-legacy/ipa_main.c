@@ -368,6 +368,14 @@ static void ipa_deconfig(struct ipa *ipa)
 
 static const struct of_device_id ipa_match[] = {
 	{
+		.compatible	= "qcom,msm8994-ipa",
+		.data		= &ipa_data_v2_0,
+	},
+	{
+		.compatible	= "qcom,msm8992-ipa",
+		.data		= &ipa_data_v2_0,
+	},
+	{
 		.compatible	= "qcom,msm8953-ipa",
 		.data		= &ipa_data_v2_6l,
 	},

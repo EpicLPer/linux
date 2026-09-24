@@ -394,3 +394,21 @@
 	};
 };
 
+
+/*
+ * IPA v2.0 brings up the modem data path.  Without it there is no
+ * netdev for the modem, and ModemManager refuses to create a modem
+ * object at all ("Failed to find a net port in the QMI modem"), which
+ * leaves the device with no telephony and no mobile data.
+ *
+ * Enable it once the IPA v2.x driver (drivers/net/ipa-legacy) is
+ * functional; the nodes stay disabled until then so a broken IPA
+ * cannot prevent the rest of the board from booting.
+ */
+&ipa {
+	status = "okay";
+};
+
+&ipa_bam {
+	status = "okay";
+};
