@@ -1,6 +1,7 @@
 config QCOM_IPA_LEGACY
 	tristate "Qualcomm IPA legacy support"
 	depends on NET && QCOM_SMEM
+	depends on !QCOM_IPA
 	depends on ARCH_QCOM || COMPILE_TEST
 	depends on INTERCONNECT
 	depends on QCOM_RPROC_COMMON || (QCOM_RPROC_COMMON=n && COMPILE_TEST)
