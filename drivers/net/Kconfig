@@ -511,6 +511,8 @@ source "drivers/net/fddi/Kconfig"
 
 source "drivers/net/ipa/Kconfig"
 
+source "drivers/net/ipa-legacy/Kconfig"
+
 source "drivers/net/phy/Kconfig"
 
 source "drivers/net/pse-pd/Kconfig"
