@@ -69,6 +69,25 @@ static ssize_t tx_offload_show(struct device *dev,
 
 static DEVICE_ATTR_RO(tx_offload);
 
+static umode_t ipa_feature_attr_is_visible(struct kobject *kobj,
+					   struct attribute *attr, int n)
+{
+	struct ipa *ipa = dev_get_drvdata(kobj_to_dev(kobj));
+	enum ipa_endpoint_name name;
+
+	name = attr == &dev_attr_rx_offload.attr ? IPA_ENDPOINT_AP_MODEM_RX
+						 : IPA_ENDPOINT_AP_MODEM_TX;
+
+	/* The offload attributes describe what the modem endpoints actually
+	 * have configured (per the endpoint data), not a generic capability:
+	 * consumers such as ModemManager use them to decide the rmnet link
+	 * flags, and advertising checksum offload that is not enabled makes
+	 * them add a checksum header the IPA would parse as payload.
+	 */
+	return ipa->name_map[name] && ipa->name_map[name]->config.checksum ?
+	       attr->mode : 0;
+}
+
 static struct attribute *ipa_feature_attrs[] = {
 	&dev_attr_rx_offload.attr,
 	&dev_attr_tx_offload.attr,
@@ -77,6 +96,7 @@ static struct attribute *ipa_feature_attrs[] = {
 
 const struct attribute_group ipa_feature_attribute_group = {
 	.name		= "feature",
+	.is_visible	= ipa_feature_attr_is_visible,
 	.attrs		= ipa_feature_attrs,
 };
 
