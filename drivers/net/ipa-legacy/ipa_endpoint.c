@@ -1289,7 +1289,7 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	if (endpoint_id == command_endpoint->endpoint_id) {
 		complete(&ipa->completion);
 	} else {
-		dev_err(ipa->dev, "unexpected tagged packet from endpoint %u\n",
+		dev_err(&ipa->pdev->dev, "unexpected tagged packet from endpoint %u\n",
 			endpoint_id);
 	}
 
