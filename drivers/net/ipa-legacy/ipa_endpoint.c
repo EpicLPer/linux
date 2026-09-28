@@ -1189,6 +1189,29 @@ static void ipa_endpoint_replenish_work(struct work_struct *work)
 	ipa_endpoint_replenish(endpoint);
 }
 
+
+/* TEMPORARY measurement: count RX deliveries per modem endpoint (removed
+ * after determining whether AP_LAN_RX ever delivers data). */
+static void ipa_endpoint_rx_count(struct ipa_endpoint *endpoint)
+{
+	struct ipa *ipa = endpoint->ipa;
+	static u64 lan_rx;
+	static u64 modem_rx;
+
+	if (endpoint->endpoint_id ==
+	    ipa->name_map[IPA_ENDPOINT_AP_LAN_RX]->endpoint_id)
+		lan_rx++;
+	else if (endpoint->endpoint_id ==
+		 ipa->name_map[IPA_ENDPOINT_AP_MODEM_RX]->endpoint_id)
+		modem_rx++;
+	else
+		return;
+
+	if (((lan_rx + modem_rx) & 0x3ff) == 1)
+		dev_info(&ipa->pdev->dev, "TEMP-RX lan=%llu modem=%llu\n",
+			 lan_rx, modem_rx);
+}
+
 static void ipa_endpoint_skb_copy(struct ipa_endpoint *endpoint,
 				  void *data, u32 len, u32 extra)
 {
@@ -1228,6 +1251,7 @@ static bool ipa_endpoint_skb_build(struct ipa_endpoint *endpoint,
 	}
 
 	/* Receive the buffer (or record drop if unable to build it) */
+	ipa_endpoint_rx_count(endpoint);
 	ipa_modem_skb_rx(endpoint->netdev, skb);
 
 	return skb != NULL;
