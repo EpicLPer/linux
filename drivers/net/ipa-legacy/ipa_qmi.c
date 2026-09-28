@@ -632,23 +632,14 @@ static void ipa_server_install_filter_rule(struct qmi_handle *qmi,
 	ipa_qmi->fltr_installed_notif.install_status = 0;	/* success */
 	ipa_qmi->fltr_installed_notif.filter_index_list_len = count;
 	/* The modem's uplink rule accounting needs the index list and the
-	 * counts to agree with the hardware's numbering.  With only the
-	 * mandatory fields the modem asserts (fltr_rule_idx <
-	 * ipa_ipfltr.fltr.ul.active.num_rules) as soon as it processes an
-	 * uplink frame; the fields below were measured to avoid that.
+	 * counts to agree with the hardware's numbering (set below).  The
+	 * embedded (tethering) pipe/mux fields are left unset: the vendor
+	 * embedded path and the Windows host send neither, the modem accepts
+	 * "both or neither", and a mux number fixed here would conflict with
+	 * any other mux userspace uses.
 	 */
-	ipa_qmi->fltr_installed_notif.embedded_pipe_index_valid = 1;
-	ipa_qmi->fltr_installed_notif.embedded_pipe_index =
-		ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]->endpoint_id;
 	ipa_qmi->fltr_installed_notif.retain_header_valid = 1;
 	ipa_qmi->fltr_installed_notif.retain_header = 1;
-	ipa_qmi->fltr_installed_notif.embedded_call_mux_id_valid = 1;
-	/* The AP's data call is bound with mux id 1 (netmgrd's first link),
-	 * and the uplink frames carry that mux in the QMAP header.  The
-	 * notification must name the same mux or the modem's DS cannot map
-	 * the source pipe's traffic to the call.
-	 */
-	ipa_qmi->fltr_installed_notif.embedded_call_mux_id = 1;
 
 	{
 		u32 num_v4 = 0;
