@@ -312,13 +312,11 @@ int ipa_modem_start(struct ipa *ipa)
 	INIT_WORK(&priv->work, ipa_modem_wake_queue_work);
 	ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]->netdev = netdev;
 	ipa->name_map[IPA_ENDPOINT_AP_MODEM_RX]->netdev = netdev;
-	ipa->name_map[IPA_ENDPOINT_AP_LAN_RX]->netdev = netdev;
 	ipa->modem_netdev = netdev;
 
 	ret = register_netdev(netdev);
 	if (ret) {
 		ipa->modem_netdev = NULL;
-		ipa->name_map[IPA_ENDPOINT_AP_LAN_RX]->netdev = NULL;
 		ipa->name_map[IPA_ENDPOINT_AP_MODEM_RX]->netdev = NULL;
 		ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]->netdev = NULL;
 		free_netdev(netdev);
@@ -361,7 +359,6 @@ int ipa_modem_stop(struct ipa *ipa)
 			(void)ipa_stop(netdev);
 		unregister_netdev(netdev);
 		ipa->modem_netdev = NULL;
-		ipa->name_map[IPA_ENDPOINT_AP_LAN_RX]->netdev = NULL;
 		ipa->name_map[IPA_ENDPOINT_AP_MODEM_RX]->netdev = NULL;
 		ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]->netdev = NULL;
 		free_netdev(netdev);
