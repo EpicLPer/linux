@@ -1276,25 +1276,24 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	u32 endpoint_id;
 
 	status_mask = ipa_status_extract(ipa, data, STATUS_MASK);
-	if (!status_mask)
+	if (!(status_mask & IPA_STATUS_MASK_TAG_VALID))
 		return false;	/* No valid tag */
 
 	/* The status contains a valid tag.  We know the packet was sent to
 	 * this endpoint (already verified by ipa_endpoint_status_skip()).
 	 * If the packet came from the AP->command TX endpoint we know
 	 * this packet was sent as part of the pipeline clear process.
-	 * Tagged packets from any other endpoint are ordinary data on this
-	 * platform (the modem tags its LAN frames), so they are neither
-	 * signalled nor dropped here.
 	 */
 	endpoint_id = ipa_status_extract(ipa, data, STATUS_SRC_ENDPOINT);
 	command_endpoint = ipa->name_map[IPA_ENDPOINT_AP_COMMAND_TX];
 	if (endpoint_id == command_endpoint->endpoint_id) {
 		complete(&ipa->completion);
-		return true;
+	} else {
+		dev_err(&ipa->pdev->dev, "unexpected tagged packet from endpoint %u\n",
+			endpoint_id);
 	}
 
-	return false;
+	return true;
 }
 
 /* Return whether the status indicates the packet should be dropped */
@@ -1305,11 +1304,7 @@ ipa_endpoint_status_drop(struct ipa_endpoint *endpoint, const void *data)
 	struct ipa *ipa = endpoint->ipa;
 	u32 rule;
 
-	/* Drop a tagged pipeline-clear response from the AP command endpoint.
-	 * A valid tag alone does not mean "not data" on this platform: the
-	 * modem tags its ordinary LAN frames, so only the command endpoint's
-	 * tagged packets are dropped here.
-	 */
+	/* If the status indicates a tagged transfer, we'll drop the packet */
 	if (ipa_endpoint_status_tag_valid(endpoint, data))
 		return true;
 

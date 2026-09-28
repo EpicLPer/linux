@@ -1488,7 +1488,7 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	u32 endpoint_id;
 
 	status_mask = ipa_status_extract(ipa, data, STATUS_MASK);
-	if (!status_mask)
+	if (!(status_mask & IPA_STATUS_MASK_TAG_VALID))
 		return false;	/* No valid tag */
 
 	/* The status contains a valid tag.  We know the packet was sent to
