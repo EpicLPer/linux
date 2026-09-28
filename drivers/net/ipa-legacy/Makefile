@@ -2,7 +2,7 @@
 #
 # Makefile for the Qualcomm IPA driver.
 
-IPA_VERSIONS		:=	2.0 2.5 2.6l
+IPA_VERSIONS		:=	2.0
 
 obj-$(CONFIG_QCOM_IPA_LEGACY)	+=	ipa-legacy.o
 

@@ -35,37 +35,52 @@
  * always issued using ipa_dma_trans_commit_wait().
  */
 
-/* Some commands can wait until indicated pipeline stages are clear */
-enum pipeline_clear_options {
-	pipeline_clear_hps		= 0x0,
-	pipeline_clear_src_grp		= 0x1,
-	pipeline_clear_full		= 0x2,
-};
-
 /* IPA_CMD_IP_V{4,6}_{FILTER,ROUTING}_INIT */
 
+/* The IPA v2.x immediate command payload packs the address of the rule
+ * array in system memory, the size of that array, and the destination
+ * address in IPA-local memory into one 64-bit value.  (Later IPA versions
+ * use a wider payload with separate hashed and non-hashed tables.)
+ */
 struct ipa_cmd_hw_ip_fltrt_init {
-	__le64 hash_rules_addr;
 	__le64 flags;
 };
 
 /* Field masks for ipa_cmd_hw_ip_fltrt_init structure fields */
-#define IP_IPV4_FLTRT_FLAGS_SIZE_FMASK		GENMASK_ULL(11, 0)
-#define IP_IPV4_FLTRT_FLAGS_ADDR_FMASK		GENMASK_ULL(27, 12)
-#define IP_IPV6_FLTRT_FLAGS_SIZE_FMASK		GENMASK_ULL(15, 0)
-#define IP_IPV6_FLTRT_FLAGS_ADDR_FMASK		GENMASK_ULL(31, 16)
+#define IP_IPV4_FLTRT_FLAGS_RULES_ADDR_FMASK	GENMASK_ULL(31, 0)
+#define IP_IPV4_FLTRT_FLAGS_RULES_SIZE_FMASK	GENMASK_ULL(43, 32)
+#define IP_IPV4_FLTRT_FLAGS_IPA_ADDR_FMASK	GENMASK_ULL(59, 44)
+#define IP_IPV6_FLTRT_FLAGS_RULES_ADDR_FMASK	GENMASK_ULL(31, 0)
+#define IP_IPV6_FLTRT_FLAGS_RULES_SIZE_FMASK	GENMASK_ULL(47, 32)
+#define IP_IPV6_FLTRT_FLAGS_IPA_ADDR_FMASK	GENMASK_ULL(63, 48)
 
 
 /* IPA_CMD_HDR_INIT_LOCAL */
 
+/* Like the table initialisation commands, the IPA v2.x header memory
+ * initialisation payload packs the source address, the source size and
+ * the destination address in IPA-local memory into one 64-bit value.
+ */
 struct ipa_cmd_hw_hdr_init_local {
-	__le64 hdr_table_addr;
-	__le32 flags;
+	__le64 flags;
 };
 
 /* Field masks for ipa_cmd_hw_hdr_init_local structure fields */
-#define HDR_INIT_LOCAL_FLAGS_TABLE_SIZE_FMASK		GENMASK(11, 0)
-#define HDR_INIT_LOCAL_FLAGS_HDR_ADDR_FMASK		GENMASK(27, 12)
+#define HDR_INIT_LOCAL_FLAGS_SRC_ADDR_FMASK		GENMASK_ULL(31, 0)
+#define HDR_INIT_LOCAL_FLAGS_TABLE_SIZE_FMASK		GENMASK_ULL(43, 32)
+#define HDR_INIT_LOCAL_FLAGS_DST_ADDR_FMASK		GENMASK_ULL(59, 44)
+
+/* IPA_CMD_HDR_INIT_SYSTEM */
+
+/* The IPA v2.x header table can also live in system memory; the command
+ * just records the address the hardware reads it from.
+ */
+struct ipa_cmd_hw_hdr_init_system {
+	__le64 flags;
+};
+
+/* Field masks for ipa_cmd_hw_hdr_init_system structure fields */
+#define HDR_INIT_SYSTEM_FLAGS_ADDR_FMASK		GENMASK_ULL(31, 0)
 
 /* IPA_CMD_REGISTER_WRITE */
 
@@ -74,21 +89,14 @@ struct ipa_cmd_hw_hdr_init_local {
 #define REGISTER_WRITE_OPCODE_CLEAR_OPTION_FMASK	GENMASK(10, 9)
 
 struct ipa_cmd_register_write {
-	__le16 flags;		/* Unused/reserved prior to IPA v4.0 */
+	__le16 flags;		/* bit 15: skip_pipeline_clear */
 	__le16 offset;
 	__le32 value;
 	__le32 value_mask;
-	__le32 clear_options;	/* Unused/reserved for IPA v4.0+ */
 };
 
 /* Field masks for ipa_cmd_register_write structure fields */
-/* The next field is present for IPA v4.0+ */
-#define REGISTER_WRITE_FLAGS_OFFSET_HIGH_FMASK		GENMASK(14, 11)
-/* The next field is not present for IPA v4.0+ */
 #define REGISTER_WRITE_FLAGS_SKIP_CLEAR_FMASK		GENMASK(15, 15)
-
-/* The next field and its values are not present for IPA v4.0+ */
-#define REGISTER_WRITE_CLEAR_OPTIONS_FMASK		GENMASK(1, 0)
 
 /* IPA_CMD_IP_PACKET_INIT */
 
@@ -137,6 +145,7 @@ struct ipa_cmd_ip_packet_tag_status {
 union ipa_cmd_payload {
 	struct ipa_cmd_hw_ip_fltrt_init table_init;
 	struct ipa_cmd_hw_hdr_init_local hdr_init_local;
+	struct ipa_cmd_hw_hdr_init_system hdr_init_system;
 	struct ipa_cmd_register_write register_write;
 	struct ipa_cmd_ip_packet_init ip_packet_init;
 	struct ipa_cmd_hw_dma_mem_mem dma_shared_mem;
@@ -160,8 +169,8 @@ static bool ipa_cmd_header_init_local_valid(struct ipa *ipa)
 {
 	struct device *dev = &ipa->pdev->dev;
 	const struct ipa_mem *mem;
-	u32 offset_max;
-	u32 size_max;
+	u64 offset_max;
+	u64 size_max;
 	u32 offset;
 	u32 size;
 
@@ -170,7 +179,7 @@ static bool ipa_cmd_header_init_local_valid(struct ipa *ipa)
 	 * the offset and size fit in the fields that need to hold them, and
 	 * that the entire range is within the overall IPA memory range.
 	 */
-	offset_max = field_max(HDR_INIT_LOCAL_FLAGS_HDR_ADDR_FMASK);
+	offset_max = field_max(HDR_INIT_LOCAL_FLAGS_DST_ADDR_FMASK);
 	size_max = field_max(HDR_INIT_LOCAL_FLAGS_TABLE_SIZE_FMASK);
 
 	/* The header memory area contains both the modem and AP header
@@ -184,7 +193,7 @@ static bool ipa_cmd_header_init_local_valid(struct ipa *ipa)
 	if (offset > offset_max || ipa->mem_offset > offset_max - offset) {
 		dev_err(dev, "header table region offset too large\n");
 		dev_err(dev, "    (0x%04x + 0x%04x > 0x%04x)\n",
-			ipa->mem_offset, offset, offset_max);
+			ipa->mem_offset, offset, (u32)offset_max);
 
 		return false;
 	}
@@ -197,7 +206,7 @@ static bool ipa_cmd_header_init_local_valid(struct ipa *ipa)
 	/* Make sure the combined size fits in the IPA command */
 	if (size > size_max) {
 		dev_err(dev, "header table region size too large\n");
-		dev_err(dev, "    (0x%04x > 0x%08x)\n", size, size_max);
+		dev_err(dev, "    (0x%04x > 0x%08x)\n", size, (u32)size_max);
 
 		return false;
 	}
@@ -304,22 +313,31 @@ void ipa_cmd_table_init_add(struct ipa_dma_trans *trans,
 	dma_addr_t payload_addr;
 	u64 val;
 
-	/* Record the non-hash table offset and size */
+	/* The table is written from the rule array in system memory to the
+	 * IPA-local memory region for the table. */
 	offset += ipa->mem_offset;
 	if (opcode == IPA_CMD_IP_V4_FILTER_INIT ||
 		   opcode == IPA_CMD_IP_V4_ROUTING_INIT) {
-		val = u64_encode_bits(offset, IP_IPV4_FLTRT_FLAGS_ADDR_FMASK);
-		val |= u64_encode_bits(size, IP_IPV4_FLTRT_FLAGS_SIZE_FMASK);
+		val = u64_encode_bits(addr,
+				IP_IPV4_FLTRT_FLAGS_RULES_ADDR_FMASK);
+		val |= u64_encode_bits(size,
+				IP_IPV4_FLTRT_FLAGS_RULES_SIZE_FMASK);
+		val |= u64_encode_bits(offset,
+				IP_IPV4_FLTRT_FLAGS_IPA_ADDR_FMASK);
 	} else { /* IPA <= v2.6L IPv6 */
-		val = u64_encode_bits(offset, IP_IPV6_FLTRT_FLAGS_ADDR_FMASK);
-		val |= u64_encode_bits(size, IP_IPV6_FLTRT_FLAGS_SIZE_FMASK);
+		val = u64_encode_bits(addr,
+				IP_IPV6_FLTRT_FLAGS_RULES_ADDR_FMASK);
+		val |= u64_encode_bits(size,
+				IP_IPV6_FLTRT_FLAGS_RULES_SIZE_FMASK);
+		val |= u64_encode_bits(offset,
+				IP_IPV6_FLTRT_FLAGS_IPA_ADDR_FMASK);
 	}
 
 	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
 	payload = &cmd_payload->table_init;
 
-	/* Fill in all offsets and sizes */
-	payload->flags = cpu_to_le32(val);
+	/* Fill in all addresses and sizes */
+	payload->flags = cpu_to_le64(val);
 
 	ipa_dma_trans_cmd_add(trans, payload, sizeof(*payload), payload_addr,
 			  opcode);
@@ -334,7 +352,7 @@ void ipa_cmd_hdr_init_local_add(struct ipa_dma_trans *trans, u32 offset, u16 siz
 	struct ipa_cmd_hw_hdr_init_local *payload;
 	union ipa_cmd_payload *cmd_payload;
 	dma_addr_t payload_addr;
-	u32 flags;
+	u64 val;
 
 	offset += ipa->mem_offset;
 
@@ -346,10 +364,29 @@ void ipa_cmd_hdr_init_local_add(struct ipa_dma_trans *trans, u32 offset, u16 siz
 	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
 	payload = &cmd_payload->hdr_init_local;
 
-	payload->hdr_table_addr = cpu_to_le32(addr);
-	flags = u32_encode_bits(size, HDR_INIT_LOCAL_FLAGS_TABLE_SIZE_FMASK);
-	flags |= u32_encode_bits(offset, HDR_INIT_LOCAL_FLAGS_HDR_ADDR_FMASK);
-	payload->flags = cpu_to_le32(flags);
+	val = u64_encode_bits(addr, HDR_INIT_LOCAL_FLAGS_SRC_ADDR_FMASK);
+	val |= u64_encode_bits(size, HDR_INIT_LOCAL_FLAGS_TABLE_SIZE_FMASK);
+	val |= u64_encode_bits(offset, HDR_INIT_LOCAL_FLAGS_DST_ADDR_FMASK);
+	payload->flags = cpu_to_le64(val);
+
+	ipa_dma_trans_cmd_add(trans, payload, sizeof(*payload), payload_addr,
+			  opcode);
+}
+
+void ipa_cmd_hdr_init_system_add(struct ipa_dma_trans *trans, dma_addr_t addr)
+{
+	struct ipa *ipa = container_of(trans->ipa_dma, struct ipa, ipa_dma);
+	enum ipa_cmd_opcode opcode = IPA_CMD_HDR_INIT_SYSTEM;
+	struct ipa_cmd_hw_hdr_init_system *payload;
+	union ipa_cmd_payload *cmd_payload;
+	dma_addr_t payload_addr;
+	u64 val;
+
+	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
+	payload = &cmd_payload->hdr_init_system;
+
+	val = u64_encode_bits(addr, HDR_INIT_SYSTEM_FLAGS_ADDR_FMASK);
+	payload->flags = cpu_to_le64(val);
 
 	ipa_dma_trans_cmd_add(trans, payload, sizeof(*payload), payload_addr,
 			  opcode);
@@ -363,24 +400,19 @@ void ipa_cmd_register_write_add(struct ipa_dma_trans *trans, u32 offset, u32 val
 	union ipa_cmd_payload *cmd_payload;
 	u32 opcode = IPA_CMD_REGISTER_WRITE;
 	dma_addr_t payload_addr;
-	u32 clear_option;
-	u32 options;
-	u16 flags;
 
-	/* pipeline_clear_src_grp is not used */
-	clear_option = clear_full ? pipeline_clear_full : pipeline_clear_hps;
-
-	flags = 0;	/* SKIP_CLEAR flag is always 0 */
-	options = 0;
+	/* There are no pipeline clear options in the IPA v2.x command
+	 * payload; the command always waits for the pipeline to clear.
+	 */
+	(void)clear_full;
 
 	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
 	payload = &cmd_payload->register_write;
 
-	payload->flags = cpu_to_le16(flags);
+	payload->flags = cpu_to_le16(0);
 	payload->offset = cpu_to_le16((u16)offset);
 	payload->value = cpu_to_le32(value);
 	payload->value_mask = cpu_to_le32(mask);
-	payload->clear_options = cpu_to_le32(options);
 
 	ipa_dma_trans_cmd_add(trans, payload, sizeof(*payload), payload_addr,
 			  opcode);

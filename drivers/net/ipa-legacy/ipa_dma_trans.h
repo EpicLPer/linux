@@ -69,9 +69,6 @@ struct ipa_dma_trans {
 
 	refcount_t refcount;
 	struct completion completion;
-
-	u64 byte_count;			/* channel byte_count when committed */
-	u64 trans_count;		/* channel trans_count when committed */
 };
 
 /**
@@ -193,26 +190,5 @@ int ipa_dma_trans_page_add(struct ipa_dma_trans *trans, struct page *page, u32 s
  * Return:	0, or -EMSGSIZE if socket data won't fit in transaction.
  */
 int ipa_dma_trans_skb_add(struct ipa_dma_trans *trans, struct sk_buff *skb);
-
-/**
- * ipa_dma_trans_read_byte() - Issue a single byte read TRE on a channel
- * @ipa_dma:	IPA DMA pointer
- * @channel_id:	Channel on which to read a byte
- * @addr:	DMA address into which to transfer the one byte
- *
- * This is not a transaction operation at all.  It's defined here because
- * it needs to be done in coordination with other transaction activity.
- */
-int ipa_dma_trans_read_byte(struct ipa_dma *ipa_dma, u32 channel_id, dma_addr_t addr);
-
-/**
- * ipa_dma_trans_read_byte_done() - Clean up after a single byte read TRE
- * @ipa_dma:	IPA DMA pointer
- * @channel_id:	Channel on which byte was read
- *
- * This function needs to be called to signal that the work related
- * to reading a byte initiated by ipa_dma_trans_read_byte() is complete.
- */
-void ipa_dma_trans_read_byte_done(struct ipa_dma *ipa_dma, u32 channel_id);
 
 #endif /* _IPA_DMA_TRANS_H_ */

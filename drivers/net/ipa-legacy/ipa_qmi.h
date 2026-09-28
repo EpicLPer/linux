@@ -9,6 +9,8 @@
 #include <linux/types.h>
 #include <linux/soc/qcom/qmi.h>
 
+#include "ipa_qmi_msg.h"
+
 struct ipa;
 
 /**
@@ -31,8 +33,19 @@ struct ipa_qmi {
 	struct sockaddr_qrtr modem_sq;
 	struct work_struct init_driver_work;
 
+	/* Filter rule install notification, sent to the modem after its
+	 * INSTALL_FILTER_RULE request has been acknowledged.  The modem's
+	 * rmnet-meta state machine needs it before it will bring up a call.
+	 */
+	struct ipa_qmi_fltr_installed_notif_req fltr_installed_notif;
+	struct work_struct fltr_installed_notif_work;
+
 	/* Flags used in negotiating readiness */
 	bool initial_boot;
+	bool v4_rule_installed;
+	bool v6_rule_installed;
+	bool v4_dl_installed;
+	bool v6_dl_installed;
 	bool uc_ready;
 	bool modem_ready;
 	bool indication_requested;

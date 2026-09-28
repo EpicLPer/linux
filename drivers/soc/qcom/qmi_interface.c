@@ -404,8 +404,16 @@ static void qmi_invoke_handler(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 			break;
 	}
 
-	if (!handler->fn)
+	if (!handler->fn) {
+		/* DIAG (remove before upstream): log QMI messages with no handler
+		 * so the modem's IPA QMI requests can be identified.
+		 */
+		pr_info("qmi: unhandled message type=%d msg=0x%04x len=%zu\n",
+			hdr->type, le16_to_cpu(hdr->msg_id), len);
+		print_hex_dump(KERN_INFO, "qmi: ", DUMP_PREFIX_OFFSET, 16, 1,
+			       buf, min_t(size_t, len, 128), false);
 		return;
+	}
 
 	dest = kzalloc(handler->decoded_size, GFP_KERNEL);
 	if (!dest)

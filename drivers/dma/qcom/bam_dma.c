@@ -58,7 +58,11 @@ struct bam_desc_hw {
 #define DESC_FLAG_EOT BIT(14)
 #define DESC_FLAG_EOB BIT(13)
 #define DESC_FLAG_NWD BIT(12)
-#define DESC_FLAG_CMD BIT(11)
+/* The descriptor carries an immediate command; the size field holds the
+ * command opcode rather than a buffer size (the address field still
+ * points at the command parameters).
+ */
+#define DESC_FLAG_IMME BIT(8)
 
 struct bam_async_desc {
 	struct virt_dma_desc vd;
@@ -75,7 +79,29 @@ struct bam_async_desc {
 	struct list_head desc_node;
 	enum dma_transfer_direction dir;
 	size_t length;
+
+	/* receive metadata buffer attached by the client */
+	void *metadata;
+	size_t metadata_len;
+	u32 actual_len;
+
 	struct bam_desc_hw desc[] __counted_by(num_desc);
+};
+
+static int bam_attach_metadata(struct dma_async_tx_descriptor *desc,
+			       void *data, size_t len)
+{
+	struct bam_async_desc *async_desc =
+		container_of(desc, struct bam_async_desc, vd.tx);
+
+	async_desc->metadata = data;
+	async_desc->metadata_len = len;
+
+	return 0;
+}
+
+static const struct dma_descriptor_metadata_ops bam_dma_metadata_ops = {
+	.attach = bam_attach_metadata,
 };
 
 enum bam_reg {
@@ -415,6 +441,9 @@ struct bam_device {
 	u32 num_channels;
 	u32 num_ees;
 
+	/* BAM configuration bits, from DT or the driver default */
+	u32 cnfg_bits;
+
 	/* execution environment ID, from DT */
 	u32 ee;
 	bool controlled_remotely;
@@ -474,8 +503,10 @@ static void bam_reset(struct bam_device *bdev)
 	writel_relaxed(DEFAULT_CNT_THRSHLD,
 			bam_addr(bdev, 0, BAM_DESC_CNT_TRSHLD));
 
-	/* Enable default set of h/w workarounds, ie all except BAM_FULL_PIPE */
-	writel_relaxed(BAM_CNFG_BITS_DEFAULT, bam_addr(bdev, 0, BAM_CNFG_BITS));
+	/* Enable the set of h/w workarounds (platform-provided value if one
+	 * was given, otherwise the driver's default)
+	 */
+	writel_relaxed(bdev->cnfg_bits, bam_addr(bdev, 0, BAM_CNFG_BITS));
 
 	/* enable irqs for errors */
 	writel_relaxed(BAM_ERROR_EN | BAM_HRESP_ERR_EN,
@@ -704,6 +735,8 @@ static struct dma_async_tx_descriptor *bam_prep_slave_sg(struct dma_chan *chan,
 	async_desc->num_desc = num_alloc;
 	async_desc->curr_desc = async_desc->desc;
 	async_desc->dir = direction;
+	if (direction == DMA_DEV_TO_MEM)
+		async_desc->vd.tx.metadata_ops = &bam_dma_metadata_ops;
 
 	/* fill in temporary descriptors */
 	desc = async_desc->desc;
@@ -713,7 +746,7 @@ static struct dma_async_tx_descriptor *bam_prep_slave_sg(struct dma_chan *chan,
 
 		do {
 			if (flags & DMA_PREP_CMD)
-				desc->flags |= cpu_to_le16(DESC_FLAG_CMD);
+				desc->flags |= cpu_to_le16(DESC_FLAG_IMME);
 
 			desc->addr = cpu_to_le32(sg_dma_address(sg) +
 						 curr_offset);
@@ -854,9 +887,12 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 
 	for (i = 0; i < bdev->num_channels; i++) {
 		struct bam_chan *bchan = &bdev->channels[i];
+		struct bam_desc_hw *fifo;
 
 		if (!(srcs & BIT(i)))
 			continue;
+
+		fifo = PTR_ALIGN(bchan->fifo_virt, sizeof(*fifo));
 
 		/* clear pipe irq */
 		pipe_stts = readl_relaxed(bam_addr(bdev, i, BAM_P_IRQ_STTS));
@@ -880,6 +916,26 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 			/* Not enough data to read */
 			if (avail < async_desc->xfer_len)
 				break;
+
+			if (async_desc->dir == DMA_DEV_TO_MEM) {
+				/* On receive, the hardware writes the number of
+				 * bytes it transferred into the FIFO descriptor.
+				 * Sum those up and report the total to a client
+				 * that attached a metadata buffer.
+				 */
+				u32 len = 0;
+				u32 k;
+			
+				for (k = 0; k < async_desc->xfer_len; k++)
+					len += le16_to_cpu(
+						fifo[(bchan->head + k) % MAX_DESCRIPTORS].size);
+			
+				async_desc->actual_len += len;
+				if (async_desc->metadata &&
+				    async_desc->metadata_len >= sizeof(u32))
+					*(u32 *)async_desc->metadata =
+						async_desc->actual_len;
+			}
 
 			/* manage FIFO */
 			bchan->head += async_desc->xfer_len;
@@ -1277,6 +1333,13 @@ static int bam_dma_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	/* The standard hardware workarounds are not right for every BAM; the
+	 * platform may provide the value its firmware expects.
+	 */
+	bdev->cnfg_bits = BAM_CNFG_BITS_DEFAULT;
+	of_property_read_u32(pdev->dev.of_node, "qcom,config-bits",
+			     &bdev->cnfg_bits);
+
 	bdev->controlled_remotely = of_property_read_bool(pdev->dev.of_node,
 						"qcom,controlled-remotely");
 	bdev->powered_remotely = of_property_read_bool(pdev->dev.of_node,
@@ -1350,6 +1413,8 @@ static int bam_dma_probe(struct platform_device *pdev)
 	/* initialize dmaengine apis */
 	bdev->common.directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
 	bdev->common.residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
+	/* Received lengths are reported through a client metadata buffer */
+	bdev->common.desc_metadata_modes = DESC_METADATA_CLIENT;
 	bdev->common.src_addr_widths = DMA_SLAVE_BUSWIDTH_4_BYTES;
 	bdev->common.dst_addr_widths = DMA_SLAVE_BUSWIDTH_4_BYTES;
 	bdev->common.device_alloc_chan_resources = bam_alloc_chan;

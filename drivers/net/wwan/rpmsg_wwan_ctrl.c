@@ -147,6 +147,20 @@ static void rpmsg_wwan_ctrl_remove(struct rpmsg_device *rpdev)
 static const struct rpmsg_device_id rpmsg_wwan_ctrl_id_table[] = {
 	/* RPMSG channels for Qualcomm SoCs with integrated modem */
 	{ .name = "DATA5_CNTL", .driver_data = WWAN_PORT_QMI },
+	/*
+	 * Older SoCs (msm8994 and its contemporaries) name the modem's
+	 * QMUX channel "DS" instead of "DATA5_CNTL".
+	 *
+	 * This is not cosmetic: on such a device the channel carries the
+	 * telephony QMI services (DMS/NAS/UIM/WMS/WDS), and without a binding
+	 * they are simply unreachable - enumerating the QRTR bus then shows
+	 * only the QCS/QCCI services and it looks as though the modem never
+	 * started its telephony personality at all.  Measured on
+	 * msm8994-msft-lumia-octagon (Lumia 950 XL): adding the "DS" channel to
+	 * the SMD stream support made it appear, after which the modem answered
+	 * on it as a QMI port.
+	 */
+	{ .name = "DS", .driver_data = WWAN_PORT_QMI },
 	{ .name = "DATA4", .driver_data = WWAN_PORT_AT },
 	{ .name = "DATA1", .driver_data = WWAN_PORT_AT },
 	{},

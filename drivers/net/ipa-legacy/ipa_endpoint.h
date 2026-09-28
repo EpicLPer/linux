@@ -143,7 +143,6 @@ enum ipa_replenish_flag {
  * @toward_ipa:		Endpoint direction (true = TX, false = RX)
  * @config:		Default endpoint configuration
  * @skb_frag_max:	Maximum allowed number of TX SKB fragments
- * @evt_ring_id:	GSI event ring used by the endpoint
  * @netdev:		Network device pointer, if endpoint uses one
  * @replenish_flags:	Replenishing state flags
  * @replenish_count:	Total number of replenish transactions committed
@@ -158,7 +157,6 @@ struct ipa_endpoint {
 	struct ipa_endpoint_config config;
 
 	u32 skb_frag_max;	/* Used for netdev TX only */
-	u32 evt_ring_id;
 
 	/* Net device this endpoint is associated with, if any */
 	struct net_device *netdev;

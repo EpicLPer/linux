@@ -804,6 +804,15 @@ static void ipa_endpoint_init_hdr_metadata_mask(struct ipa_endpoint *endpoint)
 	iowrite32(val, ipa->reg_virt + offset);
 }
 
+/* Set the mux id the hardware uses as packet metadata for an endpoint.
+ *
+ * The modem's rmnet metadata driver uses this value to select the data call.
+ * For a TX endpoint the hardware takes the value from the endpoint's
+ * metadata register (rather than from the packet) and writes it into the
+ * packet at the endpoint's header metadata offset - the modem wants the mux
+ * id at offset 0 of the uplink packet.
+ */
+
 static void ipa_endpoint_init_mode(struct ipa_endpoint *endpoint)
 {
 	struct ipa *ipa = endpoint->ipa;
@@ -1274,18 +1283,18 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	 * this endpoint (already verified by ipa_endpoint_status_skip()).
 	 * If the packet came from the AP->command TX endpoint we know
 	 * this packet was sent as part of the pipeline clear process.
+	 * Tagged packets from any other endpoint are ordinary data on this
+	 * platform (the modem tags its LAN frames), so they are neither
+	 * signalled nor dropped here.
 	 */
 	endpoint_id = ipa_status_extract(ipa, data, STATUS_SRC_ENDPOINT);
 	command_endpoint = ipa->name_map[IPA_ENDPOINT_AP_COMMAND_TX];
 	if (endpoint_id == command_endpoint->endpoint_id) {
 		complete(&ipa->completion);
-	} else {
-		dev_err(&ipa->pdev->dev,
-			"unexpected tagged packet from endpoint %u\n",
-			endpoint_id);
+		return true;
 	}
 
-	return true;
+	return false;
 }
 
 /* Return whether the status indicates the packet should be dropped */
@@ -1296,7 +1305,11 @@ ipa_endpoint_status_drop(struct ipa_endpoint *endpoint, const void *data)
 	struct ipa *ipa = endpoint->ipa;
 	u32 rule;
 
-	/* If the status indicates a tagged transfer, we'll drop the packet */
+	/* Drop a tagged pipeline-clear response from the AP command endpoint.
+	 * A valid tag alone does not mean "not data" on this platform: the
+	 * modem tags its ordinary LAN frames, so only the command endpoint's
+	 * tagged packets are dropped here.
+	 */
 	if (ipa_endpoint_status_tag_valid(endpoint, data))
 		return true;
 
@@ -1346,7 +1359,11 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		if (endpoint->config.checksum)
 			len += sizeof(struct rmnet_map_dl_csum_trailer);
 
-		/* Skip over status packets that lack packet data */
+		/* Skip over status packets that lack packet data.  This also
+		 * covers the transmit status entries the AP's own TX endpoint
+		 * reports on this endpoint (src = TX, dst = modem) and the
+		 * zero-length aggregation-close entries.
+		 */
 		if (!length || ipa_endpoint_status_skip(endpoint, data)) {
 			data += IPA_STATUS_SIZE;
 			resid -= IPA_STATUS_SIZE;
@@ -1437,124 +1454,16 @@ void ipa_endpoint_default_route_clear(struct ipa *ipa)
 	ipa_endpoint_default_route_set(ipa, 0);
 }
 
-/**
- * ipa_endpoint_reset_rx_aggr() - Reset RX endpoint with aggregation active
- * @endpoint:	Endpoint to be reset
- *
- * If aggregation is active on an RX endpoint when a reset is performed
- * on its underlying GSI channel, a special sequence of actions must be
- * taken to ensure the IPA pipeline is properly cleared.
- *
- * Return:	0 if successful, or a negative error code
- */
-static int ipa_endpoint_reset_rx_aggr(struct ipa_endpoint *endpoint)
-{
-	struct device *dev = &endpoint->ipa->pdev->dev;
-	struct ipa *ipa = endpoint->ipa;
-	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
-	bool suspended = false;
-	dma_addr_t addr;
-	u32 retries;
-	u32 len = 1;
-	void *virt;
-	int ret;
-
-	virt = kzalloc(len, GFP_KERNEL);
-	if (!virt)
-		return -ENOMEM;
-
-	addr = dma_map_single(dev, virt, len, DMA_FROM_DEVICE);
-	if (dma_mapping_error(dev, addr)) {
-		ret = -ENOMEM;
-		goto out_kfree;
-	}
-
-	/* Force close aggregation before issuing the reset */
-	ipa_endpoint_force_close(endpoint);
-
-	/* Reset and reconfigure the channel with the doorbell engine
-	 * disabled.  Then poll until we know aggregation is no longer
-	 * active.  We'll re-enable the doorbell (if appropriate) when
-	 * we reset again below.
-	 */
-	ipa_dma->ops->channel_reset(ipa_dma, endpoint->channel_id, false);
-
-	/* Make sure the channel isn't suspended */
-	suspended = ipa_endpoint_program_suspend(endpoint, false);
-
-	/* Start channel and do a 1 byte read */
-	ret = ipa_dma->ops->channel_start(ipa_dma, endpoint->channel_id);
-	if (ret)
-		goto out_suspend_again;
-
-	ret = ipa_dma_trans_read_byte(ipa_dma, endpoint->channel_id, addr);
-	if (ret)
-		goto err_endpoint_stop;
-
-	/* Wait for aggregation to be closed on the channel */
-	retries = IPA_ENDPOINT_RESET_AGGR_RETRY_MAX;
-	do {
-		if (!ipa_endpoint_aggr_active(endpoint))
-			break;
-		usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
-	} while (retries--);
-
-	/* Check one last time */
-	if (ipa_endpoint_aggr_active(endpoint))
-		dev_err(dev, "endpoint %u still active during reset\n",
-			endpoint->endpoint_id);
-
-	ipa_dma_trans_read_byte_done(ipa_dma, endpoint->channel_id);
-
-	ret = ipa_dma->ops->channel_stop(ipa_dma, endpoint->channel_id);
-	if (ret)
-		goto out_suspend_again;
-
-	/* Finally, reset and reconfigure the channel again (re-enabling
-	 * the doorbell engine if appropriate).  Sleep for 1 millisecond to
-	 * complete the channel reset sequence.  Finish by suspending the
-	 * channel again (if necessary).
-	 */
-	ipa_dma->ops->channel_reset(ipa_dma, endpoint->channel_id, true);
-
-	usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
-
-	goto out_suspend_again;
-
-err_endpoint_stop:
-	(void)ipa_dma->ops->channel_stop(ipa_dma, endpoint->channel_id);
-out_suspend_again:
-	if (suspended)
-		(void)ipa_endpoint_program_suspend(endpoint, true);
-	dma_unmap_single(dev, addr, len, DMA_FROM_DEVICE);
-out_kfree:
-	kfree(virt);
-
-	return ret;
-}
-
 static void ipa_endpoint_reset(struct ipa_endpoint *endpoint)
 {
-	u32 channel_id = endpoint->channel_id;
 	struct ipa *ipa = endpoint->ipa;
-	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
-	bool special;
-	int ret = 0;
 
-	/* On IPA v3.5.1, if an RX endpoint is reset while aggregation
-	 * is active, we need to handle things specially to recover.
-	 * All other cases just need to reset the underlying GSI channel.
+	/* The IPA v3.5.1 "reset with aggregation active" workaround does not
+	 * apply to the IPA versions supported here; a plain channel reset is
+	 * all that is needed.
 	 */
-	special = !endpoint->toward_ipa && endpoint->config.aggregation;
-	if (special && ipa_endpoint_aggr_active(endpoint))
-		ret = ipa_endpoint_reset_rx_aggr(endpoint);
-	else
-		ipa_dma->ops->channel_reset(&ipa->ipa_dma, channel_id, true);
-
-	if (ret)
-		dev_err(&ipa->pdev->dev,
-			"error %d resetting channel %u for endpoint %u\n",
-			ret, endpoint->channel_id, endpoint->endpoint_id);
+	ipa->ipa_dma.ops->channel_reset(&ipa->ipa_dma, endpoint->channel_id,
+					true);
 }
 
 static void ipa_endpoint_program(struct ipa_endpoint *endpoint)

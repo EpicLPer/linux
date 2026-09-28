@@ -244,7 +244,5 @@ struct ipa_data {
 };
 
 extern const struct ipa_data ipa_data_v2_0;
-extern const struct ipa_data ipa_data_v2_5;
-extern const struct ipa_data ipa_data_v2_6l;
 
 #endif /* _IPA_DATA_H_ */

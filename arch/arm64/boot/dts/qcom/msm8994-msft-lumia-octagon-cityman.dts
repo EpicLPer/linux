@@ -401,9 +401,9 @@
  * object at all ("Failed to find a net port in the QMI modem"), which
  * leaves the device with no telephony and no mobile data.
  *
- * Enable it once the IPA v2.x driver (drivers/net/ipa-legacy) is
- * functional; the nodes stay disabled until then so a broken IPA
- * cannot prevent the rest of the board from booting.
+ * The interconnect paths resolve: IPA's "imem" vote targets the SNOC
+ * OCIMEM slave, matching the downstream msm8994 bus vectors.  The BAM
+ * is driven by the mainline bam_dma device (qcom,bam-v1.4.0).
  */
 &ipa {
 	status = "okay";
@@ -412,3 +412,4 @@
 &ipa_bam {
 	status = "okay";
 };
+
