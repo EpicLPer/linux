@@ -144,7 +144,7 @@ static void ipa_table_validate_build(void)
 	BUILD_BUG_ON(IPA_ZERO_RULE_SIZE != sizeof(__le64));
 }
 
-static const struct ipa_mem *
+const struct ipa_mem *
 ipa_table_mem(struct ipa *ipa, bool filter, bool ipv6)
 {
 	enum ipa_mem_id mem_id;
@@ -227,33 +227,52 @@ static int
 ipa_filter_reset_table(struct ipa *ipa, bool ipv6, bool modem)
 {
 	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
+	enum ipa_ee_id ee_id = modem ? IPA_EE_MODEM : IPA_EE_AP;
 	u64 ep_mask = ipa->filtered;
-	struct ipa_dma_trans *trans;
-	enum ipa_ee_id ee_id;
+	u32 endpoint_id;
 
-	trans = ipa_cmd_trans_alloc(ipa, hweight64(ep_mask));
-	if (!trans) {
-		dev_err(&ipa->pdev->dev,
-			"no transaction for %s filter reset\n",
-			modem ? "modem" : "AP");
-		return -EBUSY;
-	}
-
-	ee_id = modem ? IPA_EE_MODEM : IPA_EE_AP;
+	/* Each entry that gets reset needs its own command, and a single
+	 * transaction can hold only a limited number of them.  The IPA v2.x
+	 * hardware supports filtering on enough endpoints to exceed that
+	 * limit, so the endpoints are handled in batches.
+	 */
 	while (ep_mask) {
-		u32 endpoint_id = __ffs(ep_mask);
-		struct ipa_endpoint *endpoint;
+		struct ipa_dma_trans *trans;
+		u32 count = 0;
 
-		ep_mask ^= BIT(endpoint_id);
+		/* Skip over any endpoint not owned by this EE, so the
+		 * transaction that follows has at least one command.
+		 */
+		while (ep_mask) {
+			endpoint_id = __ffs(ep_mask);
+			if (ipa->endpoint[endpoint_id].ee_id == ee_id)
+				break;
+			ep_mask ^= BIT(endpoint_id);
+		}
+		if (!ep_mask)
+			break;
 
-		endpoint = &ipa->endpoint[endpoint_id];
-		if (endpoint->ee_id != ee_id)
-			continue;
+		trans = ipa_cmd_trans_alloc(ipa, IPA_COMMAND_TRANS_TRE_MAX);
+		if (!trans) {
+			dev_err(&ipa->pdev->dev,
+				"no transaction for %s filter reset\n",
+				modem ? "modem" : "AP");
+			return -EBUSY;
+		}
 
-		ipa_table_reset_add(trans, true, ipv6, endpoint_id, 1);
+		while (ep_mask && count < IPA_COMMAND_TRANS_TRE_MAX) {
+			endpoint_id = __ffs(ep_mask);
+			ep_mask ^= BIT(endpoint_id);
+
+			if (ipa->endpoint[endpoint_id].ee_id != ee_id)
+				continue;
+
+			ipa_table_reset_add(trans, true, ipv6, endpoint_id, 1);
+			count++;
+		}
+
+		ipa_dma->ops->trans_commit_wait(trans);
 	}
-
-	ipa_dma->ops->trans_commit_wait(trans);
 
 	return 0;
 }
@@ -310,6 +329,86 @@ static int ipa_route_reset(struct ipa *ipa, bool modem)
 	ipa_dma->ops->trans_commit_wait(trans);
 
 	return 0;
+}
+
+/* Point a filter or route table entry at a rule chain in system memory.
+ *
+ * A filter or route table lives in IPA-resident memory.  Its entries are the
+ * addresses of rule chains in system memory, and they are programmed by
+ * copying the entry from the table image in system memory (see
+ * ipa_table_init()).  So update the image and copy the entry to the IPA.
+ *
+ * The image starts with the zero rule, and the table it represents begins
+ * one entry later (the filter table bitmap).  Filter table entry 0 is the
+ * bitmap, entry 1 the global filter entry, and the entry for endpoint N
+ * follows at index N + 2.
+ */
+static int ipa_table_entry_set(struct ipa *ipa, bool filter, bool ipv6,
+			       u32 index, dma_addr_t rule_addr)
+{
+	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
+	const struct ipa_mem *mem;
+	struct ipa_dma_trans *trans;
+	dma_addr_t entry_addr;
+	__le32 *entry;
+	u32 offset;
+
+	mem = ipa_table_mem(ipa, filter, ipv6);
+	if (!mem || !mem->size)
+		return -EINVAL;
+
+	/* Filter and route table images start with the zero rule */
+	entry = (__le32 *)ipa->table_virt + index + 1;
+
+	offset = mem->offset + index * sizeof(*entry);
+	entry_addr = ipa->table_addr + (index + 1) * sizeof(*entry);
+
+	trans = ipa_cmd_trans_alloc(ipa, 1);
+	if (!trans) {
+		dev_err(&ipa->pdev->dev,
+			"no transaction for table entry set\n");
+		return -EBUSY;
+	}
+
+	*entry = cpu_to_le32((u32)rule_addr);
+	ipa_cmd_dma_shared_mem_add(trans, offset, sizeof(*entry),
+				   entry_addr, true);
+
+	ipa_dma->ops->trans_commit_wait(trans);
+
+	return 0;
+}
+
+/* Point the filter table entry for an endpoint at a rule chain */
+int ipa_table_filter_rule_set(struct ipa *ipa, bool ipv6, u32 endpoint_id,
+			      dma_addr_t rule_addr)
+{
+	/* Filter table entry 0 is the endpoint bitmap, entry 1 the global
+	 * filter entry, and endpoint N's entry follows at index N + 2.
+	 */
+	if (endpoint_id + 2 > ipa->filter_count)
+		return -EINVAL;
+
+	/* The modem owns the filter entries of its own pipes */
+	if (ipa->endpoint[endpoint_id].ee_id == IPA_EE_MODEM)
+		return -EINVAL;
+
+	return ipa_table_entry_set(ipa, true, ipv6, endpoint_id + 2,
+				   rule_addr);
+}
+
+/* Point a route table entry at a rule chain */
+int ipa_table_route_rule_set(struct ipa *ipa, bool ipv6, u32 table_index,
+			     dma_addr_t rule_addr)
+{
+	if (table_index >= ipa->route_count)
+		return -EINVAL;
+
+	/* The modem owns the first entries in a route table */
+	if (table_index < ipa->modem_route_count)
+		return -EINVAL;
+
+	return ipa_table_entry_set(ipa, false, ipv6, table_index, rule_addr);
 }
 
 void ipa_table_reset(struct ipa *ipa, bool modem)
@@ -380,6 +479,37 @@ static void ipa_table_init_add(struct ipa_dma_trans *trans, bool filter, bool ip
 				   ipa->zero_addr, true);
 }
 
+/* The hardware consults a filter table entry for an endpoint only when the
+ * endpoint's bit is set in the table's bitmap word (entry 0), so program
+ * the bitmap from the table image.
+ */
+static int ipa_table_filter_bitmap_set(struct ipa *ipa, bool ipv6)
+{
+	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
+	const struct ipa_mem *mem;
+	struct ipa_dma_trans *trans;
+	__le32 *bitmap;
+	dma_addr_t bitmap_addr;
+
+	mem = ipa_table_mem(ipa, true, ipv6);
+	if (!mem || !mem->size)
+		return -EINVAL;
+
+	/* The bitmap follows the zero rule in the table image */
+	bitmap = ipa->table_virt + 1;
+	bitmap_addr = ipa->table_addr + sizeof(*bitmap);
+
+	trans = ipa_cmd_trans_alloc(ipa, 1);
+	if (!trans)
+		return -EBUSY;
+
+	ipa_cmd_dma_shared_mem_add(trans, mem->offset, sizeof(*bitmap),
+				   bitmap_addr, true);
+	ipa_dma->ops->trans_commit_wait(trans);
+
+	return 0;
+}
+
 int ipa_table_setup(struct ipa *ipa)
 {
 	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
@@ -409,6 +539,31 @@ int ipa_table_setup(struct ipa *ipa)
 	ipa_table_init_add(trans, true, false);
 	ipa_table_init_add(trans, true, true);
 
+	ipa_dma->ops->trans_commit_wait(trans);
+
+	/* Program the filter table bitmaps */
+	ipa_table_filter_bitmap_set(ipa, false);
+	ipa_table_filter_bitmap_set(ipa, true);
+
+	return 0;
+}
+
+/* Tell the hardware where the header table lives.  The hardware inserts
+ * headers from it for packets routed with a header.
+ */
+int ipa_table_header_setup(struct ipa *ipa)
+{
+	struct ipa_dma *ipa_dma = &ipa->ipa_dma;
+	struct ipa_dma_trans *trans;
+
+	trans = ipa_cmd_trans_alloc(ipa, 1);
+	if (!trans) {
+		dev_err(&ipa->pdev->dev,
+			"no transaction for header table setup\n");
+		return -EBUSY;
+	}
+
+	ipa_cmd_hdr_init_system_add(trans, ipa->hdr_addr);
 	ipa_dma->ops->trans_commit_wait(trans);
 
 	return 0;
@@ -526,9 +681,8 @@ int ipa_table_init(struct ipa *ipa)
 	ipa->table_addr = addr;
 
 	/* First slot is the zero rule */
-	ptr = virt;
-	*ptr = 0;
-	virt++;
+	ptr = ipa->table_virt;
+	*ptr++ = 0;
 
 	/* Next is the filter table bitmap.  The "soft" bitmap value might
 	 * need to be converted to the hardware representation by shifting
@@ -537,19 +691,46 @@ int ipa_table_init(struct ipa *ipa)
 	 * that option, so there's no shifting required.
 	 */
 	filtered |= 1;
-	ptr = virt;
-	*ptr = cpu_to_le32(filtered);
-	virt++;
+	*ptr++ = cpu_to_le32(filtered);
 
 	/* All the rest contain the DMA address of the zero rule */
 	le_addr = cpu_to_le32(addr);
-	while (count--) {
-		ptr = virt;
-		*ptr = le_addr;
-		virt++;
-	}
+	while (count--)
+		*ptr++ = le_addr;
+
+	/* Memory for filter rules installed at the modem's request.  The
+	 * rules live in system memory and the filter table refers to them.
+	 */
+	ipa->rule_size = PAGE_SIZE;
+	ipa->rule_virt = dma_alloc_coherent(dev, ipa->rule_size,
+					    &ipa->rule_addr, GFP_KERNEL);
+	if (!ipa->rule_virt)
+		goto err_free_table;
+
+	/* The header table holds the headers the hardware inserts (for
+	 * example the QMAP header of a downlink packet).  It is read from
+	 * system memory; the hardware only needs to be told its address.
+	 */
+	ipa->hdr_size = PAGE_SIZE;
+	ipa->hdr_virt = dma_alloc_coherent(dev, ipa->hdr_size,
+					   &ipa->hdr_addr, GFP_KERNEL);
+	if (!ipa->hdr_virt)
+		goto err_free_rules;
+
+	memset(ipa->hdr_virt, 0, ipa->hdr_size);
 
 	return 0;
+
+err_free_rules:
+	dma_free_coherent(dev, ipa->rule_size, ipa->rule_virt, ipa->rule_addr);
+	ipa->rule_virt = NULL;
+
+err_free_table:
+	dma_free_coherent(dev, size, ipa->table_virt, ipa->table_addr);
+	ipa->table_addr = 0;
+	ipa->table_virt = NULL;
+
+	return -ENOMEM;
 }
 
 void ipa_table_exit(struct ipa *ipa)
@@ -557,6 +738,22 @@ void ipa_table_exit(struct ipa *ipa)
 	u32 count = max_t(u32, 1 + ipa->filter_count, ipa->route_count);
 	struct device *dev = &ipa->pdev->dev;
 	size_t size;
+
+	if (ipa->hdr_virt) {
+		dma_free_coherent(dev, ipa->hdr_size, ipa->hdr_virt,
+				  ipa->hdr_addr);
+		ipa->hdr_virt = NULL;
+		ipa->hdr_addr = 0;
+		ipa->hdr_size = 0;
+	}
+
+	if (ipa->rule_virt) {
+		dma_free_coherent(dev, ipa->rule_size, ipa->rule_virt,
+				  ipa->rule_addr);
+		ipa->rule_virt = NULL;
+		ipa->rule_addr = 0;
+		ipa->rule_size = 0;
+	}
 
 	size = IPA_ZERO_RULE_SIZE + (1 + count) * sizeof(__le32);
 

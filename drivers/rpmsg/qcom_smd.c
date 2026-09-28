@@ -202,6 +202,13 @@ struct qcom_smd_channel {
 	struct qcom_smd_endpoint *qsept;
 	bool registered;
 
+	/*
+	 * Stream channels carry a bare byte stream: no 20-byte packet header
+	 * on TX and no length-based reassembly on RX. Upstream mainline never
+	 * created these, so the modem's QMUX channel ("DS") was invisible.
+	 */
+	bool is_stream;
+
 	char *name;
 	enum smd_channel_state state;
 	enum smd_channel_state remote_state;
@@ -669,19 +676,44 @@ static bool qcom_smd_channel_intr(struct qcom_smd_channel *channel)
 	SET_RX_CHANNEL_FLAG(channel, fHEAD, 0);
 
 	/* Consume data */
-	for (;;) {
-		avail = qcom_smd_channel_get_rx_avail(channel);
+	if (channel->is_stream) {
+		/*
+		 * Stream channels have no framing: hand whatever is queued
+		 * straight to the client. The bounce buffer (used when the data
+		 * wraps) was sized min(fifo_size, SZ_4K) by
+		 * qcom_smd_channel_open(), so a single read must never exceed
+		 * that or we would overflow it.
+		 */
+		size_t max_read = min(channel->fifo_size, SZ_4K);
 
-		if (!channel->pkt_size && avail >= SMD_PACKET_HEADER_LEN) {
-			qcom_smd_channel_peek(channel, &pktlen, sizeof(pktlen));
-			qcom_smd_channel_advance(channel, SMD_PACKET_HEADER_LEN);
-			channel->pkt_size = le32_to_cpu(pktlen);
-		} else if (channel->pkt_size && avail >= channel->pkt_size) {
+		for (;;) {
+			avail = qcom_smd_channel_get_rx_avail(channel);
+			if (!avail)
+				break;
+
+			channel->pkt_size = min_t(int, avail, max_read);
 			ret = qcom_smd_channel_recv_single(channel);
 			if (ret)
 				break;
-		} else {
-			break;
+		}
+	} else {
+		for (;;) {
+			avail = qcom_smd_channel_get_rx_avail(channel);
+
+			if (!channel->pkt_size && avail >= SMD_PACKET_HEADER_LEN) {
+				qcom_smd_channel_peek(channel, &pktlen,
+						      sizeof(pktlen));
+				qcom_smd_channel_advance(channel,
+							 SMD_PACKET_HEADER_LEN);
+				channel->pkt_size = le32_to_cpu(pktlen);
+			} else if (channel->pkt_size &&
+				   avail >= channel->pkt_size) {
+				ret = qcom_smd_channel_recv_single(channel);
+				if (ret)
+					break;
+			} else {
+				break;
+			}
 		}
 	}
 
@@ -809,7 +841,12 @@ static int __qcom_smd_send(struct qcom_smd_channel *channel, const void *data,
 			   int len, bool wait)
 {
 	__le32 hdr[5] = { cpu_to_le32(len), };
-	int tlen = sizeof(hdr) + len;
+	/*
+	 * Stream channels carry a raw byte stream with no packet header; packet
+	 * channels get the 20-byte header (first word = length).
+	 */
+	int hdr_len = channel->is_stream ? 0 : sizeof(hdr);
+	int tlen = hdr_len + len;
 	unsigned long flags;
 	int ret = 0;
 
@@ -858,7 +895,8 @@ static int __qcom_smd_send(struct qcom_smd_channel *channel, const void *data,
 
 	SET_TX_CHANNEL_FLAG(channel, fTAIL, 0);
 
-	qcom_smd_write_fifo(channel, hdr, sizeof(hdr));
+	if (hdr_len)
+		qcom_smd_write_fifo(channel, hdr, hdr_len);
 	qcom_smd_write_fifo(channel, data, len);
 
 	SET_TX_CHANNEL_FLAG(channel, fHEAD, 1);
@@ -1189,6 +1227,7 @@ static int qcom_smd_create_chrdev(struct qcom_smd_edge *edge)
 static struct qcom_smd_channel *qcom_smd_create_channel(struct qcom_smd_edge *edge,
 							unsigned smem_info_item,
 							unsigned smem_fifo_item,
+							unsigned flags,
 							char *name)
 {
 	struct qcom_smd_channel *channel;
@@ -1203,6 +1242,7 @@ static struct qcom_smd_channel *qcom_smd_create_channel(struct qcom_smd_edge *ed
 		return ERR_PTR(-ENOMEM);
 
 	channel->edge = edge;
+	channel->is_stream = !!(flags & SMD_CHANNEL_FLAGS_STREAM);
 	channel->name = kstrdup(name, GFP_KERNEL);
 	if (!channel->name) {
 		ret = -ENOMEM;
@@ -1299,7 +1339,14 @@ static void qcom_channel_scan_worker(struct work_struct *work)
 			if (!entry->name[0])
 				continue;
 
-			if (!(eflags & SMD_CHANNEL_FLAGS_PACKET))
+			/*
+			 * Accept stream channels as well as packet channels.
+			 * Upstream ignored SMD_CHANNEL_FLAGS_STREAM entirely, so
+			 * the modem's QMUX channel ("DS") never got created and
+			 * nothing could talk to the modem's QMI multiplexer.
+			 */
+			if (!(eflags & (SMD_CHANNEL_FLAGS_PACKET |
+					SMD_CHANNEL_FLAGS_STREAM)))
 				continue;
 
 			if ((eflags & SMD_CHANNEL_FLAGS_EDGE_MASK) != edge->edge_id)
@@ -1309,7 +1356,8 @@ static void qcom_channel_scan_worker(struct work_struct *work)
 			info_id = smem_items[tbl].info_base_id + cid;
 			fifo_id = smem_items[tbl].fifo_base_id + cid;
 
-			channel = qcom_smd_create_channel(edge, info_id, fifo_id, entry->name);
+			channel = qcom_smd_create_channel(edge, info_id, fifo_id,
+							  eflags, entry->name);
 			if (IS_ERR(channel))
 				continue;
 
@@ -1357,9 +1405,14 @@ static void qcom_channel_state_worker(struct work_struct *work)
 		/*
 		 * Always open rpm_requests, even when already opened which is
 		 * required on some SoCs like msm8953.
+		 *
+		 * Stream channels (e.g. the modem's "DS"/QMUX channel) must also
+		 * be offered even before the remote moves to OPENING, so that a
+		 * client can be the one to drive the handshake.
 		 */
 		remote_state = GET_RX_CHANNEL_INFO(channel, state);
-		if (remote_state != SMD_CHANNEL_OPENING &&
+		if (!channel->is_stream &&
+		    remote_state != SMD_CHANNEL_OPENING &&
 		    remote_state != SMD_CHANNEL_OPENED &&
 		    strcmp(channel->name, "rpm_requests"))
 			continue;

@@ -90,6 +90,7 @@ enum ipa_reg_id {
 	ENDP_INIT_HDR,
 	ENDP_INIT_HDR_EXT,
 	ENDP_INIT_HDR_METADATA_MASK,	/* RX only */
+	ENDP_INIT_HDR_METADATA,		/* TX only (IPA v2.x) */
 	ENDP_INIT_MODE,			/* TX only */
 	ENDP_INIT_AGGR,
 	ENDP_INIT_HOL_BLOCK_EN,		/* RX only */
@@ -368,6 +369,11 @@ enum ipa_reg_endp_init_hdr_field_id {
 	HDR_OFST_METADATA_MSB,				/* v4.5+ */
 };
 
+/* ENDP_INIT_HDR_METADATA register */
+enum ipa_reg_endp_init_hdr_metadata_field_id {
+	HDR_METADATA_MUX_ID,
+};
+
 /* ENDP_INIT_HDR_EXT register */
 enum ipa_reg_endp_init_hdr_ext_field_id {
 	HDR_ENDIANNESS,
@@ -632,8 +638,6 @@ enum ipa_reg_ipa_irq_uc_field_id {
 };
 
 extern const struct regs ipa_regs_v2_0;
-extern const struct regs ipa_regs_v2_5;
-extern const struct regs ipa_regs_v2_6l;
 
 const struct reg *ipa_reg(struct ipa *ipa, enum ipa_reg_id reg_id);
 

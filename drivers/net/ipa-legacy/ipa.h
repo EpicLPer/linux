@@ -27,6 +27,9 @@ struct ipa_power;
 struct ipa_smp2p;
 struct ipa_interrupt;
 
+/* Bring-up bisect scaffolding; remove before upstream submission */
+bool ipa_bisect_stop(unsigned int stage);
+
 /**
  * struct ipa - IPA information
  * @gsi:		Embedded GSI structure
@@ -39,6 +42,12 @@ struct ipa_interrupt;
  * @power:		IPA power information
  * @table_addr:		DMA address of filter/route table content
  * @table_virt:		Virtual address of filter/route table content
+ * @rule_addr:		DMA address of filter rule memory
+ * @rule_virt:		Virtual address of filter rule memory
+ * @rule_size:		Size (bytes) of filter rule memory
+ * @hdr_addr:		DMA address of the header table
+ * @hdr_virt:		Virtual address of the header table
+ * @hdr_size:		Size (bytes) of the header table
  * @route_count:	Total number of entries in a routing table
  * @modem_route_count:	Number of modem entries in a routing table
  * @filter_count:	Maximum number of entries in a filter table
@@ -88,6 +97,12 @@ struct ipa {
 
 	dma_addr_t table_addr;
 	__le32 *table_virt;
+	dma_addr_t rule_addr;
+	void *rule_virt;
+	size_t rule_size;
+	dma_addr_t hdr_addr;
+	void *hdr_virt;
+	size_t hdr_size;
 	u32 route_count;
 	u32 modem_route_count;
 	u32 filter_count;

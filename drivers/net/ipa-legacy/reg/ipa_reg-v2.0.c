@@ -89,6 +89,15 @@ REG_STRIDE_FIELDS(ENDP_INIT_HDR_EXT, endp_init_hdr_ext, 0x000001c0, 0x0004);
 
 REG_STRIDE(ENDP_INIT_HDR_METADATA_MASK, endp_init_hdr_metadata_mask, 0x00000220, 0x0004);
 
+static const u32 reg_endp_init_hdr_metadata_fmask[] = {
+	[HDR_METADATA_MUX_ID]				= GENMASK(23, 16),
+						/* Bits 0-15, 24-31 reserved */
+};
+
+/* Mux id the hardware uses as packet metadata (IPA v2.x) */
+REG_STRIDE_FIELDS(ENDP_INIT_HDR_METADATA, endp_init_hdr_metadata,
+		  0x00000270, 0x0004);
+
 static const u32 reg_endp_init_mode_fmask[] = {
 	[ENDP_MODE]					= GENMASK(2, 0),
 						/* Bit 3 reserved */
@@ -163,6 +172,7 @@ static const struct reg *reg_array[] = {
 	[ENDP_INIT_HDR]			= &reg_endp_init_hdr,
 	[ENDP_INIT_HDR_EXT]		= &reg_endp_init_hdr_ext,
 	[ENDP_INIT_HDR_METADATA_MASK]	= &reg_endp_init_hdr_metadata_mask,
+	[ENDP_INIT_HDR_METADATA]	= &reg_endp_init_hdr_metadata,
 	[ENDP_INIT_MODE]		= &reg_endp_init_mode,
 	[ENDP_INIT_AGGR]		= &reg_endp_init_aggr,
 	[ENDP_INIT_HOL_BLOCK_EN]	= &reg_endp_init_hol_block_en,

@@ -19,6 +19,15 @@
 #define IPA_QMI_INIT_COMPLETE		0x22	/* AP -> modem indication */
 #define IPA_QMI_DRIVER_INIT_COMPLETE	0x35	/* modem -> AP request */
 
+/*
+ * The IPA v2 era service uses more of the QMI interface than the modern
+ * driver: at boot the modem asks the AP to install its uplink filter rules
+ * and passes its own IPA configuration.
+ */
+#define IPA_QMI_INSTALL_FILTER_RULE	0x23	/* modem -> AP request */
+#define IPA_QMI_FILTER_INSTALLED_NOTIF	0x24	/* modem -> AP request */
+#define IPA_QMI_CONFIG			0x27	/* modem -> AP request */
+
 /* The maximum size required for message types.  These sizes include
  * the message data, along with type (1 byte) and length (2 byte)
  * information for each field.  The qmi_send_*() interfaces require
@@ -31,9 +40,20 @@
 #define IPA_QMI_INIT_COMPLETE_IND_SZ		7	/* <- server handle */
 #define IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ	4	/* -> server handle */
 #define IPA_QMI_DRIVER_INIT_COMPLETE_RSP_SZ	7	/* <- server handle */
+#define IPA_QMI_INSTALL_FILTER_RULE_RSP_SZ	523	/* <- server handle */
+#define IPA_QMI_FILTER_INSTALLED_NOTIF_REQ_SZ	574	/* client handle -> */
+#define IPA_QMI_FILTER_INSTALLED_NOTIF_RSP_SZ	7	/* <- server handle */
+#define IPA_QMI_CONFIG_RSP_SZ			7	/* <- server handle */
 
-/* Maximum size of messages we expect the AP to receive (max of above) */
-#define IPA_QMI_SERVER_MAX_RCV_SZ		8
+/*
+ * Maximum size of messages we expect the AP to receive (max of above).
+ *
+ * The modem's INSTALL_FILTER_RULE request can carry up to 64 rules; the
+ * vendor's QMI_IPA_INSTALL_FILTER_RULE_REQ_MAX_MSG_LEN_V01 is 11293 bytes.
+ * A smaller receive buffer truncates the request and it is then dropped,
+ * which leaves the modem's data path unconfigured.
+ */
+#define IPA_QMI_SERVER_MAX_RCV_SZ		11293
 #define IPA_QMI_CLIENT_MAX_RCV_SZ		25
 
 /* Request message for the IPA_QMI_INDICATION_REGISTER request */
@@ -67,6 +87,118 @@ struct ipa_driver_init_complete_req {
  */
 struct ipa_driver_init_complete_rsp {
 	struct qmi_response_type_v01 rsp;
+};
+
+/* The v2 IPA requests (filter rule install, filter installed notification,
+ * IPA configuration) are acknowledged with a standard QMI response only.
+ */
+struct ipa_qmi_status_rsp {
+	struct qmi_response_type_v01 rsp;
+};
+
+/*
+ * The modem's uplink filter rules.  The driver does not program them into the
+ * hardware yet, but it must answer the install request the way the vendor does:
+ * with one handle per rule.  To keep that answer possible without porting the
+ * (large) filter-rule element structure, each rule record is decoded as an
+ * opaque blob whose size is that of the IPA v2 IDL rule record:
+ *
+ *	filter_spec_identifier	u32	(4 bytes, the first field)
+ *	ip_type			u32
+ *	filter_rule		struct ipa_filter_rule_type_v01
+ *	filter_action		u32
+ *	is_routing_table_index_valid	u8 (+ padding)
+ *	route_table_index	u32
+ *	is_mux_id_valid		u8 (+ padding)
+ *	mux_id			u32
+ *
+ * A 20-rule install request is exactly 20 * 172 + 4 bytes long, which pins the
+ * record size down.  Only the identifier (the first four bytes of a record) is
+ * needed by the driver.
+ */
+/* IPA v2.x filter rule hardware header: the equation bitmap occupies bits
+ * 0-15, the post-match action bits 16-20 and the route table index bits
+ * 21-25 (see struct ipa_flt_rule_hw_hdr in the vendor's ipa_hw_defs.h).
+ */
+#define IPA_FLT_RULE_HDR(en_rule, action, rt_tbl_idx)			\
+	((u32)(en_rule) | ((u32)(action) << 16) | ((u32)(rt_tbl_idx) << 21))
+
+/* Equation bitmap bit for the protocol match (legacy IPA attribute bit):
+ * see include/uapi/linux/msm_ipa.h IPA_FLT_PROTOCOL.
+ */
+#define IPA_FLT_PROTO_EQ			0x0002
+/* retain hdr bit in the filter rule header (vendor sets retain_hdr=true) */
+#define IPA_FLT_RULE_RETAIN_HDR			26
+
+/* IPA v2.x route rule hardware header: the attribute bitmap occupies bits
+ * 0-15, the destination pipe index bits 16-20, the "rule is in system
+ * memory" flag bit 21 and the header table offset bits 22-31 (see struct
+ * ipa_rt_rule_hw_hdr in the vendor's ipa_hw_defs.h).
+ */
+#define IPA_RT_RULE_HDR(en_rule, pipe_idx, system, hdr_ofst)		\
+	((u32)(en_rule) | ((u32)(pipe_idx) << 16) |			\
+	 ((u32)(system) << 21) | ((u32)(hdr_ofst) << 22))
+
+/* The first route table entries belong to the modem; the modem's rules use
+ * its data table, and the AP's tables start at index 5.
+ */
+#define IPA_QMI_MODEM_ROUTE_TABLE_DATA		2
+#define IPA_QMI_AP_ROUTE_TABLE			5
+
+#define IPA_QMI_FILTER_RULE_SIZE		172
+#define IPA_QMI_FILTER_RULE_WORDS		(IPA_QMI_FILTER_RULE_SIZE / sizeof(u32))
+#define IPA_QMI_MAX_FILTERS			64	/* QMI_IPA_MAX_FILTERS_V01 */
+#define IPA_QMI_UL_RULE_HANDLE_START		69	/* vendor UL_FILTER_RULE_HANDLE_START */
+
+struct ipa_qmi_filter_rule {
+	u32 words[IPA_QMI_FILTER_RULE_WORDS];
+};
+
+struct ipa_qmi_install_fltr_rule_req {
+	u8 filter_spec_list_valid;
+	u32 filter_spec_list_len;	/* u32: the QMI encode/decode layer reads and
+					 * writes data-length fields as 32-bit values
+					 */
+	struct ipa_qmi_filter_rule filter_spec_list[IPA_QMI_MAX_FILTERS];
+};
+
+struct ipa_qmi_rule_identifier_to_handle {
+	u32 filter_spec_identifier;
+	u32 filter_handle;
+};
+
+struct ipa_qmi_install_fltr_rule_rsp {
+	struct qmi_response_type_v01 rsp;
+	u8 filter_handle_list_valid;
+	u32 filter_handle_list_len;	/* u32: see filter_spec_list_len */
+	struct ipa_qmi_rule_identifier_to_handle
+		filter_handle_list[IPA_QMI_MAX_FILTERS];
+};
+
+struct ipa_qmi_handle_to_index {
+	u32 filter_handle;
+	u32 filter_index;
+};
+
+struct ipa_qmi_fltr_installed_notif_req {
+	u32 source_pipe_index;
+	u16 install_status;
+	u32 filter_index_list_len;	/* u32: see filter_spec_list_len */
+	struct ipa_qmi_handle_to_index filter_index_list[IPA_QMI_MAX_FILTERS];
+	u8 embedded_pipe_index_valid;
+	u32 embedded_pipe_index;
+	u8 retain_header_valid;
+	u8 retain_header;
+	u8 embedded_call_mux_id_valid;
+	u32 embedded_call_mux_id;
+	u8 num_ipv4_filters_valid;
+	u32 num_ipv4_filters;
+	u8 num_ipv6_filters_valid;
+	u32 num_ipv6_filters;
+	u8 start_ipv4_filter_idx_valid;
+	u32 start_ipv4_filter_idx;
+	u8 start_ipv6_filter_idx_valid;
+	u32 start_ipv6_filter_idx;
 };
 
 /* The message for the IPA_QMI_INIT_COMPLETE_IND indication consists
@@ -169,8 +301,8 @@ struct ipa_init_modem_driver_req {
 	 *
 	 * NOTE: this field is named "is_ssr_bootup" elsewhere.
 	 */
-	u8			skip_uc_load_valid;
-	u8			skip_uc_load;
+	u8			is_ssr_bootup_valid;
+	u8			is_ssr_bootup;
 
 	/* Processing context memory information.  This defines the memory in
 	 * which the modem may insert header processing context table entries.
@@ -251,6 +383,14 @@ extern const struct qmi_elem_info ipa_indication_register_req_ei[];
 extern const struct qmi_elem_info ipa_indication_register_rsp_ei[];
 extern const struct qmi_elem_info ipa_driver_init_complete_req_ei[];
 extern const struct qmi_elem_info ipa_driver_init_complete_rsp_ei[];
+extern const struct qmi_elem_info ipa_qmi_status_rsp_ei[];
+extern const struct qmi_elem_info ipa_qmi_skip_req_ei[];
+extern const struct qmi_elem_info ipa_qmi_filter_rule_ei[];
+extern const struct qmi_elem_info ipa_qmi_install_fltr_rule_req_ei[];
+extern const struct qmi_elem_info ipa_qmi_rule_identifier_to_handle_ei[];
+extern const struct qmi_elem_info ipa_qmi_install_fltr_rule_rsp_ei[];
+extern const struct qmi_elem_info ipa_qmi_handle_to_index_ei[];
+extern const struct qmi_elem_info ipa_qmi_fltr_installed_notif_req_ei[];
 extern const struct qmi_elem_info ipa_init_complete_ind_ei[];
 extern const struct qmi_elem_info ipa_mem_bounds_ei[];
 extern const struct qmi_elem_info ipa_mem_array_ei[];

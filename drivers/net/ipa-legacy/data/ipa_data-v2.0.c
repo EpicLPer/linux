@@ -46,7 +46,7 @@ static const struct ipa_dma_endpoint_data ipa_endpoint_data[] = {
 				.aggregation	= true,
 				.status_enable	= true,
 				.rx = {
-					.buffer_size	= 2048,
+					.buffer_size	= 8192,
 					.pad_align	= ilog2(sizeof(u32)),
 					.aggr_time_limit = 500,
 				},
@@ -91,7 +91,7 @@ static const struct ipa_dma_endpoint_data ipa_endpoint_data[] = {
 				.aggregation	= true,
 				.qmap		= true,
 				.rx = {
-					.buffer_size	= 2048,
+					.buffer_size	= 8192,
 					.aggr_time_limit = 500,
 					.aggr_close_eof	= true,
 				},
@@ -172,23 +172,17 @@ static const struct ipa_mem ipa_mem_local_data[] = {
 		.size		= 0x0048,
 		.canary_count	= 0,
 	},
+	/*
+	 * The Lumia vendor map (mmo_msm8994 ipa_ram_mmap.h) sizes the AP-side
+	 * V4/V6 filter regions at 0, so the bytes up to UC_INFO belong to
+	 * MODEM.  The OnePlus msm8994 map splits them out; that partition does
+	 * not match this firmware.
+	 */
 	{
 		.id		= IPA_MEM_MODEM,
 		.offset		= 0x032c,
-		.size		= 0x0dcc,
+		.size		= 0x1aa8,
 		.canary_count	= 1,
-	},
-	{
-		.id		= IPA_MEM_V4_FILTER_AP,
-		.offset		= 0x10fc,
-		.size		= 0x0780,
-		.canary_count	= 1,
-	},
-	{
-		.id		= IPA_MEM_V6_FILTER_AP,
-		.offset		= 0x187c,
-		.size		= 0x055c,
-		.canary_count	= 0,
 	},
 	{
 		.id		= IPA_MEM_UC_INFO,
@@ -227,7 +221,13 @@ static struct ipa_power_data ipa_power_data = {
 /* Configuration data for IPA v2.0 */
 const struct ipa_data ipa_data_v2_0 = {
 	.version	= IPA_VERSION_2_0,
-	.modem_route_count      = 8,
+	/*
+	 * The Lumia vendor map (mmo_msm8994 ipa_ram_mmap.h) gives the modem
+	 * route entries 0..4 and the AP entries 5..10 (11 entries in total),
+	 * so five entries are reserved for the modem.  The prior art used 8
+	 * because its (OnePlus) memory partition differs from this firmware.
+	 */
+	.modem_route_count      = 5,
 	.endpoint_count	= ARRAY_SIZE(ipa_endpoint_data),
 	.endpoint_data	= ipa_endpoint_data,
 	.mem_data	= &ipa_mem_data,

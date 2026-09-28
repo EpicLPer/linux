@@ -64,26 +64,6 @@
  * required before the transaction is freed.
  */
 
-/* Hardware values representing a transfer element type */
-enum ipa_dma_tre_type {
-	IPA_DMA_RE_XFER		= 0x2,
-	IPA_DMA_RE_IMMD_CMD	= 0x3,
-};
-
-/* An entry in a channel ring */
-struct ipa_dma_tre {
-	__le64 addr;		/* DMA address */
-	__le16 len_opcode;	/* length in bytes or enum IPA_CMD_* */
-	__le16 reserved;
-	__le32 flags;		/* TRE_FLAGS_* */
-};
-
-/* ipa_dma_tre->flags mask values (in CPU byte order) */
-#define TRE_FLAGS_CHAIN_FMASK	GENMASK(0, 0)
-#define TRE_FLAGS_IEOT_FMASK	GENMASK(9, 9)
-#define TRE_FLAGS_BEI_FMASK	GENMASK(10, 10)
-#define TRE_FLAGS_TYPE_FMASK	GENMASK(23, 16)
-
 int ipa_dma_trans_pool_init(struct ipa_dma_trans_pool *pool, size_t size, u32 count,
 			u32 max_alloc)
 {
@@ -213,26 +193,14 @@ void *ipa_dma_trans_pool_alloc_dma(struct ipa_dma_trans_pool *pool, dma_addr_t *
 	return pool->base + offset;
 }
 
-/* Return the transaction mapped to a given ring entry */
-struct ipa_dma_trans *
-ipa_dma_channel_trans_mapped(struct ipa_dma_channel *channel, u32 index)
-{
-	/* Note: index *must* be used modulo the ring count here */
-	return channel->trans_info.map[index % channel->tre_ring.count];
-}
-
 /* Return the oldest completed transaction for a channel (or null) */
 struct ipa_dma_trans *ipa_dma_channel_trans_complete(struct ipa_dma_channel *channel)
 {
-	struct ipa_dma *ipa_dma = channel->ipa_dma;
 	struct ipa_dma_trans_info *trans_info = &channel->trans_info;
 	u16 trans_id = trans_info->completed_id;
 
-	if (trans_id == trans_info->pending_id) {
-		ipa_dma->ops->channel_update(channel);
-		if (trans_id == trans_info->pending_id)
-			return NULL;
-	}
+	if (trans_id == trans_info->pending_id)
+		return NULL;
 
 	return &trans_info->trans[trans_id %= channel->tre_count];
 }
@@ -360,20 +328,16 @@ void ipa_dma_trans_free(struct ipa_dma_trans *trans)
 		return;
 
 	/* Unused transactions are allocated but never committed, pending,
-	 * completed, or polled.
+	 * or completed.
 	 */
 	trans_info = &trans->ipa_dma->channel[trans->channel_id].trans_info;
 	if (!trans->used_count) {
-		trans_info->allocated_id++;
 		trans_info->committed_id++;
 		trans_info->pending_id++;
 		trans_info->completed_id++;
 	} else {
 		ipa_endpoint_trans_release(ipa->channel_map[trans->channel_id], trans);
 	}
-
-	/* This transaction is now free */
-	trans_info->polled_id++;
 
 	/* Releasing the reserved TREs implicitly frees the sgl[] and
 	 * (if present) info[] arrays, plus the transaction itself.
@@ -462,53 +426,6 @@ int ipa_dma_trans_skb_add(struct ipa_dma_trans *trans, struct sk_buff *skb)
 	return 0;
 }
 
-/* Compute the length/opcode value to use for a TRE */
-static __le16 ipa_dma_tre_len_opcode(enum ipa_cmd_opcode opcode, u32 len)
-{
-	return opcode == IPA_CMD_NONE ? cpu_to_le16((u16)len)
-				      : cpu_to_le16((u16)opcode);
-}
-
-/* Compute the flags value to use for a given TRE */
-static __le32 ipa_dma_tre_flags(bool last_tre, bool bei, enum ipa_cmd_opcode opcode)
-{
-	enum ipa_dma_tre_type tre_type;
-	u32 tre_flags;
-
-	tre_type = opcode == IPA_CMD_NONE ? IPA_DMA_RE_XFER : IPA_DMA_RE_IMMD_CMD;
-	tre_flags = u32_encode_bits(tre_type, TRE_FLAGS_TYPE_FMASK);
-
-	/* Last TRE contains interrupt flags */
-	if (last_tre) {
-		/* All transactions end in a transfer completion interrupt */
-		tre_flags |= TRE_FLAGS_IEOT_FMASK;
-		/* Don't interrupt when outbound commands are acknowledged */
-		if (bei)
-			tre_flags |= TRE_FLAGS_BEI_FMASK;
-	} else {	/* All others indicate there's more to come */
-		tre_flags |= TRE_FLAGS_CHAIN_FMASK;
-	}
-
-	return cpu_to_le32(tre_flags);
-}
-
-static void ipa_dma_trans_tre_fill(struct ipa_dma_tre *dest_tre,
-				   dma_addr_t addr, u32 len, bool last_tre,
-				   bool bei, enum ipa_cmd_opcode opcode)
-{
-	struct ipa_dma_tre tre;
-
-	tre.addr = cpu_to_le64(addr);
-	tre.len_opcode = ipa_dma_tre_len_opcode(opcode, len);
-	tre.reserved = 0;
-	tre.flags = ipa_dma_tre_flags(last_tre, bei, opcode);
-
-	/* ARM64 can write 16 bytes as a unit with a single instruction.
-	 * Doing the assignment this way is an attempt to make that happen.
-	 */
-	*dest_tre = tre;
-}
-
 /* Process the completion of a transaction; called while polling */
 void ipa_dma_trans_complete(struct ipa_dma_trans *trans)
 {
@@ -552,39 +469,6 @@ void ipa_dma_channel_trans_cancel_pending(struct ipa_dma_channel *channel)
 	napi_schedule(&channel->napi);
 }
 
-/* Issue a command to read a single byte from a channel */
-int ipa_dma_trans_read_byte(struct ipa_dma *ipa_dma, u32 channel_id, dma_addr_t addr)
-{
-	struct ipa_dma_channel *channel = &ipa_dma->channel[channel_id];
-	struct ipa_dma_ring *tre_ring = &channel->tre_ring;
-	struct ipa_dma_trans_info *trans_info;
-	struct ipa_dma_tre *dest_tre;
-
-	trans_info = &channel->trans_info;
-
-	/* First reserve the TRE, if possible */
-	if (!ipa_dma_trans_tre_reserve(trans_info, 1))
-		return -EBUSY;
-
-	/* Now fill the reserved TRE and tell the hardware */
-
-	dest_tre = ipa_dma->ops->ring_virt(tre_ring, tre_ring->index);
-	ipa_dma_trans_tre_fill(dest_tre, addr, 1, true, false, IPA_CMD_NONE);
-
-	tre_ring->index++;
-	ipa_dma->ops->channel_doorbell(channel);
-
-	return 0;
-}
-
-/* Mark a ipa_dma_trans_read_byte() request done */
-void ipa_dma_trans_read_byte_done(struct ipa_dma *ipa_dma, u32 channel_id)
-{
-	struct ipa_dma_channel *channel = &ipa_dma->channel[channel_id];
-
-	ipa_dma_trans_tre_release(&channel->trans_info, 1);
-}
-
 /* Initialize a channel's DMA transaction info */
 int ipa_dma_channel_trans_init(struct ipa_dma *ipa_dma, u32 channel_id)
 {
@@ -593,9 +477,6 @@ int ipa_dma_channel_trans_init(struct ipa_dma *ipa_dma, u32 channel_id)
 	struct ipa_dma_trans_info *trans_info;
 	u32 tre_max;
 	int ret;
-
-	/* Ensure the size of a channel element is what's expected */
-	BUILD_BUG_ON(sizeof(struct ipa_dma_tre) != GSI_RING_ELEMENT_SIZE);
 
 	trans_info = &channel->trans_info;
 
@@ -620,23 +501,9 @@ int ipa_dma_channel_trans_init(struct ipa_dma *ipa_dma, u32 channel_id)
 	if (!trans_info->trans)
 		return -ENOMEM;
 	trans_info->free_id = 0;	/* all modulo channel->tre_count */
-	trans_info->allocated_id = 0;
 	trans_info->committed_id = 0;
 	trans_info->pending_id = 0;
 	trans_info->completed_id = 0;
-	trans_info->polled_id = 0;
-
-	/* A completion event contains a pointer to the TRE that caused
-	 * the event (which will be the last one used by the transaction).
-	 * Each entry in this map records the transaction associated
-	 * with a corresponding completed TRE.
-	 */
-	trans_info->map = kcalloc(tre_count, sizeof(*trans_info->map),
-				  GFP_KERNEL);
-	if (!trans_info->map) {
-		ret = -ENOMEM;
-		goto err_trans_free;
-	}
 
 	/* A transaction uses a scatterlist array to represent the data
 	 * transfers implemented by the transaction.  Each scatterlist
@@ -648,13 +515,10 @@ int ipa_dma_channel_trans_init(struct ipa_dma *ipa_dma, u32 channel_id)
 				  sizeof(struct scatterlist),
 				  tre_max, channel->trans_tre_max);
 	if (ret)
-		goto err_map_free;
-
+		goto err_trans_free;
 
 	return 0;
 
-err_map_free:
-	kfree(trans_info->map);
 err_trans_free:
 	kfree(trans_info->trans);
 
@@ -671,5 +535,4 @@ void ipa_dma_channel_trans_exit(struct ipa_dma_channel *channel)
 
 	ipa_dma_trans_pool_exit(&trans_info->sg_pool);
 	kfree(trans_info->trans);
-	kfree(trans_info->map);
 }

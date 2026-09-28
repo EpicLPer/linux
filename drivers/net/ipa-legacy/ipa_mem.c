@@ -306,11 +306,13 @@ int ipa_mem_config(struct ipa *ipa)
 	reg = ipa_reg(ipa, SHARED_MEM_SIZE);
 	val = ioread32(ipa->reg_virt + reg_offset(reg));
 
-	/* The fields in the register are in 8 byte units */
-	ipa->mem_offset = 8 * reg_decode(reg, MEM_BADDR, val);
+	/* The fields hold byte values (v2.x register; the 8-byte units apply
+	 * to IPA v3.0 and later)
+	 */
+	ipa->mem_offset = reg_decode(reg, MEM_BADDR, val);
 
 	/* Make sure the end is within the region's mapped space */
-	mem_size = 8 * reg_decode(reg, MEM_SIZE, val);
+	mem_size = reg_decode(reg, MEM_SIZE, val);
 
 	/* If the sizes don't match, issue a warning */
 	if (ipa->mem_offset + mem_size < ipa->mem_size) {
@@ -321,6 +323,11 @@ int ipa_mem_config(struct ipa *ipa)
 		dev_dbg(dev, "ignoring larger reported memory size: 0x%08x\n",
 			mem_size);
 	}
+
+	dev_info(dev, "SHARED_MEM_SIZE raw=0x%08x offset=0x%x size=0x%x mapped=0x%x\n",
+		 val, ipa->mem_offset, mem_size, ipa->mem_size);
+	if (ipa_bisect_stop(13))
+		return -ENODEV;
 
 	/* We know our memory size; make sure regions are all in range */
 	if (!ipa_mem_size_valid(ipa))

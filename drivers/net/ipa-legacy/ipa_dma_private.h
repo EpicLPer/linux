@@ -11,10 +11,7 @@
 #include <linux/types.h>
 
 struct ipa_dma_trans;
-struct ipa_dma_ring;
 struct ipa_dma_channel;
-
-#define GSI_RING_ELEMENT_SIZE	16	/* bytes; must be a power of 2 */
 
 /**
  * ipa_dma_trans_move_pending() - Mark a DMA transaction pending
@@ -41,16 +38,6 @@ void ipa_dma_trans_move_polled(struct ipa_dma_trans *trans);
  * Marks a transaction complete (including freeing it).
  */
 void ipa_dma_trans_complete(struct ipa_dma_trans *trans);
-
-/**
- * ipa_dma_channel_trans_mapped() - Return a transaction mapped to a TRE index
- * @channel:	Channel associated with the transaction
- * @index:	Index of the TRE having a transaction
- *
- * Return:	The DMA transaction pointer associated with the TRE index
- */
-struct ipa_dma_trans *ipa_dma_channel_trans_mapped(struct ipa_dma_channel *channel,
-						   u32 index);
 
 /**
  * ipa_dma_channel_trans_complete() - Return a channel's next completed transaction

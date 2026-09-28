@@ -45,6 +45,7 @@ static bool ipa_reg_id_valid(struct ipa *ipa, enum ipa_reg_id reg_id)
 	case ENDP_INIT_HDR:
 	case ENDP_INIT_HDR_EXT:
 	case ENDP_INIT_HDR_METADATA_MASK:
+	case ENDP_INIT_HDR_METADATA:
 	case ENDP_INIT_MODE:
 	case ENDP_INIT_AGGR:
 	case ENDP_INIT_HOL_BLOCK_EN:
@@ -75,10 +76,6 @@ static const struct regs *ipa_regs(enum ipa_version version)
 	switch (version) {
 	case IPA_VERSION_2_0:
 		return &ipa_regs_v2_0;
-	case IPA_VERSION_2_5:
-		return &ipa_regs_v2_5;
-	case IPA_VERSION_2_6L:
-		return &ipa_regs_v2_6l;
 	default:
 		return NULL;
 	}

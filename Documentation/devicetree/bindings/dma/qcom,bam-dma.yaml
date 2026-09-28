@@ -81,6 +81,14 @@ properties:
       Indicates that the bam is powered up by a remote processor but must be
       initialized by the local processor.
 
+  qcom,config-bits:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Overrides the value written to the BAM_CNFG_BITS register.  Some
+      platforms need a BAM configuration that differs from the driver's
+      standard value because a remote processor (the modem) depends on it,
+      e.g. the IPA's BAM on MSM8994.
+
   reg:
     maxItems: 1
 

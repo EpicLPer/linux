@@ -34,6 +34,15 @@
 #include "ipa_dma_trans.h"
 #include "ipa_sysfs.h"
 
+/*
+ * Bring-up bisect scaffolding; remove before upstream submission.
+ * ipa_bisect_stop() is defined further down; the prototype is in "ipa.h".
+ */
+#define IPA_BISECT(n) do {						\
+		if (ipa_bisect_stop(n))					\
+			return -ENODEV;					\
+	} while (0)
+
 /**
  * DOC: The IP Accelerator
  *
@@ -116,14 +125,22 @@ int ipa_setup(struct ipa *ipa)
 	ret = ipa_endpoint_enable_one(command_endpoint);
 	if (ret)
 		goto err_endpoint_teardown;
+	IPA_BISECT(14);
 
 	ret = ipa_mem_setup(ipa);	/* No matching teardown required */
 	if (ret)
 		goto err_command_disable;
+	IPA_BISECT(15);
 
 	ret = ipa_table_setup(ipa);	/* No matching teardown required */
 	if (ret)
 		goto err_command_disable;
+	IPA_BISECT(16);
+
+	ret = ipa_table_header_setup(ipa);
+	if (ret)
+		goto err_command_disable;
+	IPA_BISECT(18);
 
 	/* Enable the exception handling endpoint, and tell the hardware
 	 * to use it by default.
@@ -139,6 +156,7 @@ int ipa_setup(struct ipa *ipa)
 	ret = ipa_qmi_setup(ipa);
 	if (ret)
 		goto err_default_route_clear;
+	IPA_BISECT(17);
 
 	ipa->setup_complete = true;
 
@@ -283,7 +301,9 @@ static void ipa_hardware_config(struct ipa *ipa, const struct ipa_data *data)
 	// ipa_hardware_config_tx(ipa);
 	// ipa_hardware_config_clkon(ipa);
 	ipa_hardware_config_comp(ipa);
-	ipa_hardware_config_timing(ipa);
+	/* COUNTER_CFG is not present before IPA v2.5 */
+	if (ipa->version >= IPA_VERSION_2_5)
+		ipa_hardware_config_timing(ipa);
 	// ipa_hardware_config_hashing(ipa);
 	// ipa_hardware_dcd_config(ipa);
 }
@@ -301,6 +321,24 @@ static void ipa_hardware_deconfig(struct ipa *ipa)
 	/* NOOP */
 }
 
+/* Bring-up bisect stop point; 5 = no stop. */
+static unsigned int ipa_bisect = 5;
+
+/*
+ * Staged stop for bring-up only.  The stop must FAIL the probe, never report
+ * success: -ENODEV leaves the device unbound, while success would leave the
+ * driver "bound but uninitialised" - worse than no driver, because nothing
+ * else claims the hardware.
+ */
+bool ipa_bisect_stop(unsigned int stage)
+{
+	if (ipa_bisect != stage)
+		return false;
+
+	pr_info("IPA bring-up bisect: stop at %u\n", stage);
+	return true;
+}
+
 /**
  * ipa_config() - Configure IPA hardware
  * @ipa:	IPA pointer
@@ -313,10 +351,12 @@ static int ipa_config(struct ipa *ipa, const struct ipa_data *data)
 	int ret;
 
 	ipa_hardware_config(ipa, data);
+	IPA_BISECT(8);
 
 	ret = ipa_mem_config(ipa);
 	if (ret)
 		goto err_hardware_deconfig;
+	IPA_BISECT(9);
 
 	ipa->interrupt = ipa_interrupt_config(ipa);
 	if (IS_ERR(ipa->interrupt)) {
@@ -324,16 +364,19 @@ static int ipa_config(struct ipa *ipa, const struct ipa_data *data)
 		ipa->interrupt = NULL;
 		goto err_mem_deconfig;
 	}
+	IPA_BISECT(10);
 
 	ipa_uc_config(ipa);
 
 	ret = ipa_endpoint_config(ipa);
 	if (ret)
 		goto err_uc_deconfig;
+	IPA_BISECT(11);
 
 	ret = ipa_modem_config(ipa);
 	if (ret)
 		goto err_endpoint_deconfig;
+	IPA_BISECT(12);
 
 	return 0;
 
@@ -371,14 +414,6 @@ static const struct of_device_id ipa_match[] = {
 		.compatible	= "qcom,msm8994-ipa",
 		.data		= &ipa_data_v2_0,
 	},
-	{
-		.compatible	= "qcom,msm8992-ipa",
-		.data		= &ipa_data_v2_0,
-	},
-	{
-		.compatible	= "qcom,msm8953-ipa",
-		.data		= &ipa_data_v2_6l,
-	},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, ipa_match);
@@ -401,13 +436,11 @@ static void ipa_validate_build(void)
 	/* Code assumes the EE ID for the AP is 0 (zeroed structure field) */
 	BUILD_BUG_ON(IPA_EE_AP != 0);
 
-	/* There's no point if we have no channels or event rings */
+	/* There's no point if we have no channels */
 	BUILD_BUG_ON(!GSI_CHANNEL_COUNT_MAX);
-	BUILD_BUG_ON(!IPA_DMA_EVT_RING_COUNT_MAX);
 
 	/* GSI hardware design limits */
 	BUILD_BUG_ON(GSI_CHANNEL_COUNT_MAX > 32);
-	BUILD_BUG_ON(IPA_DMA_EVT_RING_COUNT_MAX > 31);
 
 	/* The number of TREs in a transaction is limited by the channel's
 	 * TLV FIFO size.  A transaction structure uses 8-bit fields
@@ -473,12 +506,27 @@ static int ipa_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	/* Bring-up bisect gate, stage 0.
+	 *
+	 * Until this point ipa_probe() has only inspected the device and its match
+	 * data, so stopping here means the driver's mere binding is harmless and
+	 * anything that follows is the suspect.
+	 */
+	{
+		u32 bisect = 5;
+
+		of_property_read_u32(dev->of_node, "ipa,bisect", &bisect);
+		ipa_bisect = bisect;
+	}
+	IPA_BISECT(0);
+
 	/* The clock and interconnects might not be ready when we're
 	 * probed, so might return -EPROBE_DEFER.
 	 */
 	power = ipa_power_init(dev, data->power_data);
 	if (IS_ERR(power))
 		return PTR_ERR(power);
+	IPA_BISECT(1);
 
 	/* No more EPROBE_DEFER.  Allocate and initialize the IPA structure */
 	ipa = kzalloc(sizeof(*ipa), GFP_KERNEL);
@@ -494,13 +542,16 @@ static int ipa_probe(struct platform_device *pdev)
 	ipa->modem_route_count = data->modem_route_count;
 	init_completion(&ipa->completion);
 
+	/* Bisect stops 0..7; the gate itself is defined earlier in ipa_probe(). */
 	ret = ipa_reg_init(ipa);
 	if (ret)
 		goto err_kfree_ipa;
+	IPA_BISECT(2);
 
 	ret = ipa_mem_init(ipa, data->mem_data);
 	if (ret)
 		goto err_reg_exit;
+	IPA_BISECT(3);
 
 	ipa->ipa_dma.ops = &bam_ops;
 	ipa_dma = &ipa->ipa_dma;
@@ -508,6 +559,7 @@ static int ipa_probe(struct platform_device *pdev)
 		       data->endpoint_data);
 	if (ret)
 		goto err_mem_exit;
+	IPA_BISECT(6);
 
 	/* Result is a non-zero mask of endpoints that support filtering */
 	ret = ipa_endpoint_init(ipa, data->endpoint_count, data->endpoint_data);
@@ -517,11 +569,13 @@ static int ipa_probe(struct platform_device *pdev)
 	ret = ipa_table_init(ipa);
 	if (ret)
 		goto err_endpoint_exit;
+	IPA_BISECT(4);
 
 	/* Power needs to be active for config and setup */
 	ret = pm_runtime_get_sync(dev);
 	if (WARN_ON(ret < 0))
 		goto err_power_put;
+	IPA_BISECT(7);
 
 	ret = ipa_config(ipa, data);
 	if (ret)

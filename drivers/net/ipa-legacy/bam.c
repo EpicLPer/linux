@@ -36,16 +36,13 @@
  */
 
 /* Get and configure the BAM DMA channel */
-int bam_channel_init_one(struct ipa_dma *ipa_dma,
+static int bam_channel_init_one(struct ipa_dma *ipa_dma,
 			 const struct ipa_dma_endpoint_data *data, bool command)
 {
 	struct dma_slave_config bam_config;
 	u32 channel_id = data->channel_id;
 	struct ipa_dma_channel *channel = &ipa_dma->channel[channel_id];
 	int ret;
-
-	/*TODO: if (!bam_channel_data_valid(ipa_dma, data))
-		return -EINVAL;*/
 
 	channel->ipa_dma = ipa_dma;
 	channel->dma_chan = dma_request_chan(ipa_dma->dev, data->channel_name);
@@ -96,7 +93,7 @@ static void bam_channel_exit_one(struct ipa_dma_channel *channel)
 }
 
 /* Get channels from BAM_DMA */
-int bam_channel_init(struct ipa_dma *ipa_dma, u32 count,
+static int bam_channel_init(struct ipa_dma *ipa_dma, u32 count,
 		const struct ipa_dma_endpoint_data *data)
 {
 	int ret = 0;
@@ -126,7 +123,7 @@ err_unwind:
 }
 
 /* Inverse of bam_channel_init() */
-void bam_channel_exit(struct ipa_dma *ipa_dma)
+static void bam_channel_exit(struct ipa_dma *ipa_dma)
 {
 	u32 channel_id = BAM_CHANNEL_COUNT_MAX - 1;
 
@@ -142,95 +139,16 @@ static void bam_exit(struct ipa_dma *ipa_dma)
 	bam_channel_exit(ipa_dma);
 }
 
-/* Return the channel id associated with a given channel */
-static u32 bam_channel_id(struct ipa_dma_channel *channel)
-{
-	return channel - &channel->ipa_dma->channel[0];
-}
-
-static void
-bam_channel_tx_update(struct ipa_dma_channel *channel, struct ipa_dma_trans *trans)
-{
-	struct ipa *ipa = container_of(channel->ipa_dma, struct ipa, ipa_dma);
-	struct ipa_endpoint *endpoint;
-
-	u64 byte_count = trans->byte_count + trans->len;
-	u64 trans_count = trans->trans_count + 1;
-
-	byte_count -= channel->compl_byte_count;
-	channel->compl_byte_count += byte_count;
-	trans_count -= channel->compl_trans_count;
-	channel->compl_trans_count += trans_count;
-
-	endpoint = ipa->channel_map[bam_channel_id(channel)];
-	if (endpoint->netdev)
-		netdev_completed_queue(endpoint->netdev, trans_count, byte_count);
-}
-
-static void
-bam_channel_rx_update(struct ipa_dma_channel *channel, struct ipa_dma_trans *trans)
-{
-	/* FIXME */
-	u64 byte_count = trans->byte_count + trans->len;
-
-	channel->byte_count += byte_count;
-	channel->trans_count++;
-}
-
-/* Consult hardware, move any newly completed transactions to completed list */
-static void bam_channel_update(struct ipa_dma_channel *channel)
-{
-	struct ipa_dma_trans *trans;
-	enum dma_status trans_status;
-	size_t index;
-
-	for (index = channel->trans_info.pending_id;
-	     index < channel->trans_info.completed_id; ++index) {
-		trans = &channel->trans_info.trans[index];
-
-		trans_status = dma_async_is_tx_complete(channel->dma_chan,
-							trans->cookie, NULL,
-							NULL);
-		if (trans_status == DMA_COMPLETE)
-			break;
-	}
-
-	if (trans_status != DMA_COMPLETE)
-		/* No new completed transactions. Nothing to do. */
-		return;
-
-	/* Get the transaction for the latest completed event.  Take a
-	 * reference to keep it from completing before we give the events
-	 * for this and previous transactions back to the hardware.
-	 */
-	refcount_inc(&trans->refcount);
-
-	/* For RX channels, update each completed transaction with the number
-	 * of bytes that were actually received.  For TX channels, report
-	 * the number of transactions and bytes this completion represents
-	 * up the network stack.
-	 */
-	if (channel->toward_ipa)
-		bam_channel_tx_update(channel, trans);
-	else
-		bam_channel_rx_update(channel, trans);
-
-	ipa_dma_trans_move_complete(trans);
-
-	ipa_dma_trans_free(trans);
-}
-
 /**
  * bam_channel_poll_one() - Return a single completed transaction on a channel
  * @channel:	Channel to be polled
  *
  * Return:	Transaction pointer, or null if none are available
  *
- * This function returns the first entry on a channel's completed transaction
- * list.  If that list is empty, the hardware is consulted to determine
- * whether any new transactions have completed.  If so, they're moved to the
- * completed list and the new first entry is returned.  If there are no more
- * completed transactions, a null pointer is returned.
+ * This function returns the first of a channel's completed transactions,
+ * or a null pointer if there are none.  Transactions are moved to the
+ * completed state by the DMA completion callback, which also schedules
+ * NAPI polling.
  */
 static struct ipa_dma_trans *bam_channel_poll_one(struct ipa_dma_channel *channel)
 {
@@ -238,11 +156,6 @@ static struct ipa_dma_trans *bam_channel_poll_one(struct ipa_dma_channel *channe
 
 	/* Get the first transaction from the completed list */
 	trans = ipa_dma_channel_trans_complete(channel);
-	if (!trans) {
-		bam_channel_update(channel);
-		trans = ipa_dma_channel_trans_complete(channel);
-	}
-
 	if (trans)
 		ipa_dma_trans_move_polled(trans);
 
@@ -388,7 +301,15 @@ static int bam_channel_stop(struct ipa_dma *ipa_dma, u32 channel_id)
 
 static void bam_channel_reset(struct ipa_dma *ipa_dma, u32 channel_id, bool doorbell)
 {
+	struct ipa_dma_channel *channel = &ipa_dma->channel[channel_id];
+
 	bam_channel_stop(ipa_dma, channel_id);
+
+	/* The dmaengine frees the descriptors it terminates without
+	 * completing them; hand the affected transactions back to NAPI so
+	 * their buffers and transaction resources are released.
+	 */
+	ipa_dma_channel_trans_cancel_pending(channel);
 }
 
 static int bam_channel_suspend(struct ipa_dma *ipa_dma, u32 channel_id)
@@ -415,9 +336,19 @@ static void bam_resume(struct ipa_dma *ipa_dma)
 	/* No-op for now */
 }
 
+/* DMA completion callback.  It runs in the vchan tasklet, so it only records
+ * the completion and schedules NAPI; delivery (handing buffers to the endpoint
+ * and the network stack, then freeing the transaction) happens in NAPI, once,
+ * via ipa_dma_trans_complete().
+ */
 static void bam_trans_callback(void *arg)
 {
-	ipa_dma_trans_complete(arg);
+	struct ipa_dma_trans *trans = arg;
+	struct ipa_dma_channel *channel;
+
+	channel = &trans->ipa_dma->channel[trans->channel_id];
+	ipa_dma_trans_move_complete(trans);
+	napi_schedule(&channel->napi);
 }
 
 static void bam_trans_commit(struct ipa_dma_trans *trans, bool unused)
@@ -425,7 +356,6 @@ static void bam_trans_commit(struct ipa_dma_trans *trans, bool unused)
 	struct ipa_dma_channel *channel = &trans->ipa_dma->channel[trans->channel_id];
 	enum ipa_cmd_opcode opcode = IPA_CMD_NONE;
 	struct scatterlist *sg;
-	u32 byte_count = 0;
 	u8 *cmd_opcode;
 	u32 i;
 	enum dma_transfer_direction direction;
@@ -445,15 +375,19 @@ static void bam_trans_commit(struct ipa_dma_trans *trans, bool unused)
 		u32 dma_flags = 0;
 		struct dma_async_tx_descriptor *desc;
 
-		byte_count += len;
+		/* Only command channel transactions carry opcodes; an entry
+		 * with no opcode is a plain data transfer on that channel
+		 * (used by the pipeline clear).
+		 */
 		if (cmd_opcode)
 			opcode = *cmd_opcode++;
 
 		if (opcode != IPA_CMD_NONE) {
+			/* The size field of an immediate command descriptor
+			 * holds the command opcode, not a data length.
+			 */
 			len = opcode;
 			dma_flags |= DMA_PREP_CMD;
-		} else {
-			continue;
 		}
 
 		if (last_tre)
@@ -476,15 +410,6 @@ static void bam_trans_commit(struct ipa_dma_trans *trans, bool unused)
 			dmaengine_desc_attach_metadata(desc, &trans->len, sizeof(trans->len));
 	}
 
-	if (channel->toward_ipa) {
-		/* We record TX bytes when they are sent */
-		trans->len = byte_count;
-		trans->trans_count = channel->trans_count;
-		trans->byte_count = channel->byte_count;
-		channel->trans_count++;
-		channel->byte_count += byte_count;
-	}
-
 	ipa_dma_trans_move_pending(trans);
 
 	dma_async_issue_pending(channel->dma_chan);
@@ -492,15 +417,47 @@ static void bam_trans_commit(struct ipa_dma_trans *trans, bool unused)
 
 static void bam_trans_commit_wait(struct ipa_dma_trans *trans)
 {
+	struct ipa_dma *ipa_dma = trans->ipa_dma;
+	struct ipa_dma_channel *channel = &ipa_dma->channel[trans->channel_id];
+	enum dma_status status;
+
 	bam_trans_commit(trans, false);
 
-	wait_for_completion(&trans->completion);
+	/* Diagnostic timeout: the final code uses an uninterruptible wait */
+	if (wait_for_completion_timeout(&trans->completion, 3 * HZ))
+		return;
+
+	status = dma_async_is_tx_complete(channel->dma_chan, trans->cookie,
+					  NULL, NULL);
+	dev_err(ipa_dma->dev,
+		"bam: tx wait timed out (chan %u cookie %d status %d)\n",
+		trans->channel_id, trans->cookie, status);
+	{
+		void __iomem *bam = ioremap(0xfd4c4000, 0x20000);
+		int n;
+
+		if (!bam)
+			return;
+		dev_err(ipa_dma->dev,
+			"bam: ctrl=%08x irq_stts=%08x srcs0=%08x msk0=%08x\n",
+			readl(bam + 0x0), readl(bam + 0x14),
+			readl(bam + 0x800), readl(bam + 0x804));
+		for (n = 2; n <= 5; n++)
+			dev_err(ipa_dma->dev,
+				"bam p%d: ctrl=%08x irq=%08x en=%08x sw=%08x fifo=%08x\n",
+				n, readl(bam + 0x1000 + 0x1000 * n),
+				readl(bam + 0x1010 + 0x1000 * n),
+				readl(bam + 0x1018 + 0x1000 * n),
+				readl(bam + 0x1800 + 0x1000 * n),
+				readl(bam + 0x1820 + 0x1000 * n));
+		iounmap(bam);
+	}
 }
 
 /* Initialize the BAM DMA channels
  * Actual hw init is handled by the BAM_DMA driver
  */
-int bam_init(struct ipa_dma *ipa_dma, struct platform_device *pdev,
+static int bam_init(struct ipa_dma *ipa_dma, struct platform_device *pdev,
 		enum ipa_version version, u32 count,
 		const struct ipa_dma_endpoint_data *data)
 {
@@ -527,13 +484,6 @@ int bam_init(struct ipa_dma *ipa_dma, struct platform_device *pdev,
 	return 0;
 }
 
-/* Return the virtual address associated with a ring index */
-static void *bam_ring_virt(struct ipa_dma_ring *ring, u32 index)
-{
-	/* Note: index *must* be used modulo the ring count here */
-	return ring->virt + (index % ring->count) * GSI_RING_ELEMENT_SIZE;
-}
-
 struct ipa_dma_ops bam_ops = {
 	.init = bam_init,
 	.exit = bam_exit,
@@ -550,5 +500,4 @@ struct ipa_dma_ops bam_ops = {
 
 	.trans_commit = bam_trans_commit,
 	.trans_commit_wait = bam_trans_commit_wait,
-	.ring_virt = bam_ring_virt
 };

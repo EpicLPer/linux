@@ -1703,7 +1703,8 @@ static struct qcom_icc_node mas_ufs = {
 };
 
 static const u16 mas_ipa_links[] = {
-	MSM8994_SNOC_TO_BIMC
+	MSM8994_SNOC_TO_BIMC,
+	MSM8994_SNOC_SLV_OCIMEM
 };
 
 static struct qcom_icc_node mas_ipa = {
