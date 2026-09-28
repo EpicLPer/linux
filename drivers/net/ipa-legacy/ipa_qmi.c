@@ -853,11 +853,11 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi)
 	static struct ipa_init_modem_driver_req req;
 	const struct ipa_mem *mem;
 
-	/* The driver has no SSR tracking: this is always a cold boot, and
-	 * the vendor leaves the field unset in that case.
-	 */
-	req.is_ssr_bootup_valid = 0;
-	req.is_ssr_bootup = 0;
+	/* Tell the modem whether this is a subsequent (SSR) boot so it keeps
+	 * the state it already has.  The vendor sets both fields to
+	 * is_ssr_bootup after the initial boot (ipa_qmi_service.c). */
+	req.is_ssr_bootup_valid = !ipa_qmi->initial_boot;
+	req.is_ssr_bootup = !ipa_qmi->initial_boot;
 
 	/* We only have to initialize most of it once */
 	if (req.platform_type_valid)
@@ -990,22 +990,12 @@ ipa_client_new_server(struct qmi_handle *qmi, struct qmi_service *svc)
 	ipa_qmi->modem_sq.sq_node = svc->node;
 	ipa_qmi->modem_sq.sq_port = svc->port;
 
-	/*
-	 * The modem loads the IPA microcontroller firmware on its first boot
-	 * and the microcontroller stays ready across modem restarts (the vendor
-	 * documents this explicitly: "The AP may assume the microcontroller is
-	 * ready and remain so (even if the modem reboots)").  Sending
-	 * INIT_DRIVER again on a later boot makes this modem's IPA firmware
-	 * assert (ipa_bam.c:736: IPA Assert:
-	 * ipa_bam_hw_pipe_get_sw_ofst_reg(pipe_num) == 0 failed), so it is only
-	 * sent for the initial boot.
-	 */
-	if (!ipa_qmi->initial_boot) {
-		ipa_qmi->modem_ready = true;
-		ipa_qmi_ready(ipa_qmi);		/* Might not be ready yet */
-		return 0;
-	}
-
+	/* Send INIT_DRIVER on every modem boot, like the vendor does: the
+	 * modem's IPA firmware needs it to (re)initialize its state.  The
+	 * earlier assert on a subsequent INIT_DRIVER (ipa_bam.c:736,
+	 * "pipe_get_sw_ofst_reg(pipe_num) == 0 failed") was caused by the BAM
+	 * CMD-instead-of-IMME bug, fixed separately; without it a modem-only
+	 * restart fails with ipa_sio.c:1869 (init_done) instead. */
 	schedule_work(&ipa_qmi->init_driver_work);
 
 	return 0;
