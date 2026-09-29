@@ -425,6 +425,12 @@ static void a4xx_recover(struct msm_gpu *gpu)
 		       gpu_read(gpu, REG_A4XX_RBBM_CLOCK_STATUS),
 		       gpu_read(gpu, REG_A4XX_RBBM_AHB_STATUS),
 		       gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_HANG_INT_CTL));
+		pr_err("  RRDY0..5=%08x %08x %08x %08x %08x %08x ME_CNTL=0x%08x HANG_MASK4=0x%08x\n",
+		       gpu_read(gpu, 0x19a), gpu_read(gpu, 0x19b),
+		       gpu_read(gpu, 0x19c), gpu_read(gpu, 0x19d),
+		       gpu_read(gpu, 0x19e), gpu_read(gpu, 0x19f),
+		       gpu_read(gpu, REG_A4XX_CP_ME_CNTL),
+		       gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_HANG_MASK_CTL4));
 		for (i = 0; i < 8; i++)
 			pr_err("CP_SCRATCH_REG%d: %u\n", i,
 			       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
