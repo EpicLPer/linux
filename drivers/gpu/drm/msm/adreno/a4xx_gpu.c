@@ -28,21 +28,6 @@ static void a4xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	struct msm_ringbuffer *ring = submit->ring;
 	unsigned int i;
 
-	if (adreno_is_a430(to_adreno_gpu(gpu))) {
-		unsigned int pwr;
-		int err;
-
-		gpu_write(gpu, REG_A4XX_RBBM_POWER_CNTL_IP, 0x778000);
-		err = read_poll_timeout(gpu_read, pwr,
-					pwr & A4XX_RBBM_POWER_CNTL_IP_SP_TP_PWR_ON,
-					5, 100000, false, gpu,
-					REG_A4XX_RBBM_POWER_STATUS);
-		if (err)
-			DRM_DEV_ERROR(gpu->dev->dev,
-				      "A430 SP/TP power-on timeout status=0x%08x\n",
-				      pwr);
-	}
-
 	for (i = 0; i < submit->nr_cmds; i++) {
 		switch (submit->cmd[i].type) {
 		case MSM_SUBMIT_CMD_IB_TARGET_BUF:
