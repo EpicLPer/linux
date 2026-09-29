@@ -389,6 +389,26 @@ static void a4xx_recover(struct msm_gpu *gpu)
 		       gpu_read(gpu, REG_A4XX_RBBM_INT_0_STATUS),
 		       gpu_read(gpu, REG_A4XX_CP_RB_RPTR),
 		       get_wptr(gpu->rb[0]));
+		pr_err("  AHB_ERR=0x%08x PWR_STATUS=0x%08x PWR_CNTL=0x%08x GMEM=0x%08x INT_MASK=0x%08x\n",
+		       gpu_read(gpu, REG_A4XX_RBBM_AHB_ERROR_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_POWER_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_POWER_CNTL_IP),
+		       gpu_read(gpu, REG_A4XX_RB_GMEM_BASE_ADDR),
+		       gpu_read(gpu, REG_A4XX_RBBM_INT_0_MASK));
+		pr_err("  IB1=0x%08x/%u IB2=0x%08x/%u RB=0x%08x CNTL=0x%08x RPTR_ADDR=0x%08x\n",
+		       gpu_read(gpu, REG_A4XX_CP_IB1_BASE),
+		       gpu_read(gpu, REG_A4XX_CP_IB1_BUFSZ),
+		       gpu_read(gpu, REG_A4XX_CP_IB2_BASE),
+		       gpu_read(gpu, REG_A4XX_CP_IB2_BUFSZ),
+		       gpu_read(gpu, REG_A4XX_CP_RB_BASE),
+		       gpu_read(gpu, REG_A4XX_CP_RB_CNTL),
+		       gpu_read(gpu, REG_A4XX_CP_RB_RPTR_ADDR));
+		pr_err("  UCHE_TRAP=0x%08x:%08x RBBM_CTL=0x%08x AHB_CTL0=0x%08x RRDY5=0x%08x\n",
+		       gpu_read(gpu, REG_A4XX_UCHE_TRAP_BASE_HI),
+		       gpu_read(gpu, REG_A4XX_UCHE_TRAP_BASE_LO),
+		       gpu_read(gpu, REG_A4XX_RBBM_RBBM_CTL),
+		       gpu_read(gpu, REG_A4XX_RBBM_AHB_CTL0),
+		       gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_RRDY_STATUS5));
 		for (i = 0; i < 8; i++)
 			pr_err("CP_SCRATCH_REG%d: %u\n", i,
 			       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
