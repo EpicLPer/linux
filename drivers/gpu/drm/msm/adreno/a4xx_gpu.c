@@ -3,6 +3,7 @@
  */
 #include "a4xx_gpu.h"
 #include <linux/iopoll.h>
+#include <linux/of.h>
 
 #define A4XX_INT0_MASK \
 	(A4XX_INT0_RBBM_AHB_ERROR |        \
@@ -378,33 +379,31 @@ static void a4xx_recover(struct msm_gpu *gpu)
 {
 	int i;
 
-	if (adreno_is_a430(to_adreno_gpu(gpu))) {
-		/*
-		 * Full register dump and SW_RESET SEA on VMIDMT/XPU
-		 * ranges in a4xx_registers. Print the CP window only.
-		 */
-		pr_err("%s: recover status=0x%08x int0=0x%08x rptr=0x%x wptr=0x%x\n",
-		       gpu->name,
-		       gpu_read(gpu, REG_A4XX_RBBM_STATUS),
-		       gpu_read(gpu, REG_A4XX_RBBM_INT_0_STATUS),
-		       gpu_read(gpu, REG_A4XX_CP_RB_RPTR),
-		       get_wptr(gpu->rb[0]));
-		for (i = 0; i < 8; i++)
-			pr_err("CP_SCRATCH_REG%d: %u\n", i,
-			       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
-		return;
+	pr_err("%s: recover status=0x%08x int0=0x%08x rptr=0x%x wptr=0x%x\n",
+	       gpu->name,
+	       gpu_read(gpu, REG_A4XX_RBBM_STATUS),
+	       gpu_read(gpu, REG_A4XX_RBBM_INT_0_STATUS),
+	       gpu_read(gpu, REG_A4XX_CP_RB_RPTR),
+	       get_wptr(gpu->rb[0]));
+
+	for (i = 0; i < 8; i++)
+		pr_err("CP_SCRATCH_REG%d: %u\n", i,
+		       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
+
+	/*
+	 * a4xx_registers carries VMIDMT/XPU ranges which are TZ-owned on
+	 * MSM8994; reading them raises an SError. Skip the full register
+	 * dump there, but still reset and re-initialise the GPU so a hang
+	 * does not wedge the device until reboot.
+	 */
+	if (!(adreno_is_a430(to_adreno_gpu(gpu)) &&
+	      of_machine_is_compatible("qcom,msm8994"))) {
+		adreno_dump_info(gpu);
+
+		/* dump registers before resetting gpu, if enabled: */
+		if (hang_debug)
+			a4xx_dump(gpu);
 	}
-
-	adreno_dump_info(gpu);
-
-	for (i = 0; i < 8; i++) {
-		printk("CP_SCRATCH_REG%d: %u\n", i,
-			gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
-	}
-
-	/* dump registers before resetting gpu, if enabled: */
-	if (hang_debug)
-		a4xx_dump(gpu);
 
 	gpu_write(gpu, REG_A4XX_RBBM_SW_RESET_CMD, 1);
 	gpu_read(gpu, REG_A4XX_RBBM_SW_RESET_CMD);
