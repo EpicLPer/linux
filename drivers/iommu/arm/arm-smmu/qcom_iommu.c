@@ -775,6 +775,9 @@ static int qcom_iommu_iotlb_sync_map(struct iommu_domain *domain,
 	    !msm8994_oxili_pre_gpu_voted())
 		return 0;
 
+	/* EXPERIMENT: no late-map context TLBI at all */
+	return 0;
+
 	pgtable = container_of(qcom_domain->pgtbl_ops, struct io_pgtable, ops);
 	pm_runtime_get_sync(qcom_domain->iommu->dev);
 	/*
