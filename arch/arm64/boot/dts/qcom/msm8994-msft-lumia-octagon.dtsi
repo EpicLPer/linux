@@ -24,10 +24,7 @@
 /delete-node/ &audio_mem;
 /delete-node/ &mba_mem;
 /delete-node/ &mpss_mem;
-/*
- * Keep &peripheral_region: the MSS metadata (modem.mdt hash, PH01
- * p_paddr = 0x0ca00000) is placed there so the MBA can authenticate it.
- */
+/delete-node/ &peripheral_region;
 /delete-node/ &res_hyp_mem;
 /delete-node/ &rmtfs_mem;
 /delete-node/ &smem_mem;
@@ -356,42 +353,24 @@
 			no-map;
 		};
 
-		/*
-		 * Shared memory rmtfs hands to the modem for its EFS partitions.
-		 *
-		 * The device's ACPI DSDT describes this as 0x10000, but the modem
-		 * asks for a 0x180000 allocation and will not bring up its EFS/QMI
-		 * stack without it ("rmtfs shared memory not large enough for
-		 * allocation request 0x180000 vs 65536"). 0x180000 also matches the
-		 * size the generic msm8994.dtsi gives rmtfs_mem.
-		 *
-		 * It cannot simply be enlarged in place: at 0x06e70000 the region
-		 * abuts mba_mem at 0x06e80000. Place it in the hole between
-		 * venus_mem (ends 0x0e700000) and the end of the reserved PIL area
-		 * (0x0ef00000), where it overlaps nothing.
-		 */
-		rmtfs_mem: memory@e700000 {
+		/* ACPI RFS0: RFMB/RFMS (modem RFSA buffer) */
+		rfsa_mpss_mem: memory@6e70000 {
+			reg = <0 0x06e70000 0 0x10000>;
+			no-map;
+		};
+
+		/* ACPI RFS0 and PILC: RMTB/RMTX (modem EFS buffer) */
+		rmtfs_mem: memory@6e80000 {
 			compatible = "qcom,rmtfs-mem";
-			reg = <0 0x0e700000 0 0x180000>;
+			reg = <0 0x06e80000 0 0x180000>;
 			no-map;
 
 			qcom,client-id = <1>;
 		};
 
 		/*
-		 * Value obtained from the device original ACPI DSDT table
-		 * MPSS_EFS / SBL
-		 *
-		 * Here goes MBA
-		 */
-		mba_mem: memory@6e80000 {
-			reg = <0 0x06e80000 0 0x180000>;
-			no-map;
-		};
-
-		/*
 		 * Peripheral Image loader region begin!
-		 * The region reserved for pil is 0x7000000-0xef00000
+		 * ACPI PILC: PGCM = 0x07000000, size 0x07900000
 		 */
 
 		/* Here goes AMSS */
@@ -409,6 +388,12 @@
 		/* Here goes VSS */
 		venus_mem: memory@e200000 {
 			reg = <0 0x0e200000 0 0x500000>;
+			no-map;
+		};
+
+		/* Here goes MBA */
+		mba_mem: memory@e700000 {
+			reg = <0 0x0e700000 0 0x100000>;
 			no-map;
 		};
 
@@ -1486,24 +1471,14 @@
 	vdda-supply = <&vreg_l12a_1p8>;
 };
 
-/* Modem (MSS): vdd_mss = PM8994 S7, vdd_pll = L12 (1.8 V). */
 /*
- * The modem (MSS) remoteproc.
- *
- * No `metadata` child on purpose: the driver then allocates the metadata
+ * No third memory-region on purpose: the driver then allocates the metadata
  * buffer with dma_alloc_attrs(), i.e. ordinary non-secure DRAM, which is what
- * tzbsp_pil_populate_elf_info() requires and what downstream's working
- * self-auth path uses. Placing it in a reserved region instead only adds a
- * memremap() and has to satisfy the same non-secure requirement anyway.
- *
- * "pll-supply" is pm8994_s7 - the Q6 core rail - not the always-on PLL rail
- * of the reference designs (downstream has vdd_mss = pm8994_s7 for the core
- * and vdd_pll = pm8994_l12 for the PLL). It is therefore declared as an
- * *active* supply in the driver, so it stays enabled for as long as the modem
- * runs instead of being dropped when the modem signals handover; the modem
- * only brings up its SMD/QMI stack after that point.
+ * tzbsp_pil_populate_elf_info() requires.
  */
 &mss_pil {
+	mss-supply = <&vreg_s7a_1p0>;
+	pll-supply = <&vreg_l12a_1p8>;
+
 	status = "okay";
-	pll-supply = <&vreg_s7a_1p0>;
 };
