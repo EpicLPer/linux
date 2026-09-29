@@ -371,6 +371,18 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	if (!a4xx_me_init(gpu))
 		return -EINVAL;
 
+	if (adreno_is_a430(adreno_gpu))
+		pr_info("%s: hw_init baseline status=0x%08x AHB_ERR=0x%08x PWR_STATUS=0x%08x PWR_CNTL=0x%08x RBBM_CTL=0x%08x AHB_CTL0=0x%08x CLOCK_STATUS=0x%08x AHB_STATUS=0x%08x\n",
+			gpu->name,
+			gpu_read(gpu, REG_A4XX_RBBM_STATUS),
+			gpu_read(gpu, REG_A4XX_RBBM_AHB_ERROR_STATUS),
+			gpu_read(gpu, REG_A4XX_RBBM_POWER_STATUS),
+			gpu_read(gpu, REG_A4XX_RBBM_POWER_CNTL_IP),
+			gpu_read(gpu, REG_A4XX_RBBM_RBBM_CTL),
+			gpu_read(gpu, REG_A4XX_RBBM_AHB_CTL0),
+			gpu_read(gpu, REG_A4XX_RBBM_CLOCK_STATUS),
+			gpu_read(gpu, REG_A4XX_RBBM_AHB_STATUS));
+
 	return 0;
 }
 
@@ -409,6 +421,10 @@ static void a4xx_recover(struct msm_gpu *gpu)
 		       gpu_read(gpu, REG_A4XX_RBBM_RBBM_CTL),
 		       gpu_read(gpu, REG_A4XX_RBBM_AHB_CTL0),
 		       gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_RRDY_STATUS5));
+		pr_err("  CLOCK_STATUS=0x%08x AHB_STATUS=0x%08x HANG_INT_CTL=0x%08x\n",
+		       gpu_read(gpu, REG_A4XX_RBBM_CLOCK_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_AHB_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_HANG_INT_CTL));
 		for (i = 0; i < 8; i++)
 			pr_err("CP_SCRATCH_REG%d: %u\n", i,
 			       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
