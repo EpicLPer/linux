@@ -372,6 +372,13 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	if (!a4xx_me_init(gpu))
 		return -EINVAL;
 
+	/*
+	 * EXPERIMENT: 3.10 a4xx_enable_pc() enables SP/TP block power
+	 * collapse with 0x00400010; mainline never programs it.
+	 */
+	if (adreno_is_a430(adreno_gpu))
+		gpu_write(gpu, 0x234, 0x00400010); /* CP_POWER_COLLAPSE_CNTL */
+
 	return 0;
 }
 
