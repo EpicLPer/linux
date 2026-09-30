@@ -1546,6 +1546,9 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 		qcom_iommu_program_ctx(qcom_iommu, priv);
 	}
 
+	if (qcom_iommu_is_msm8994_gpu(dev))
+		qcom_iommu_8994_gpu_dump("resume");
+
 	return ret;
 }
 
