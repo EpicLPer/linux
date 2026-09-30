@@ -304,10 +304,8 @@ static int rmi_i2c_suspend(struct device *dev)
 	 * mem on mainline must do it here. Keep L22 (s2idle is not
 	 * the 3.10 FB power-down path).
 	 */
-	if (of_machine_is_compatible("qcom,msm8994")) {
-		dev_info(dev, "talkman-rmi: F01 sleep, keep L22\n");
+	if (of_machine_is_compatible("qcom,msm8994"))
 		return ret;
-	}
 
 	regulator_bulk_disable(ARRAY_SIZE(rmi_i2c->supplies),
 			       rmi_i2c->supplies);
@@ -321,10 +319,8 @@ static int rmi_i2c_resume(struct device *dev)
 	struct rmi_i2c_xport *rmi_i2c = i2c_get_clientdata(client);
 	int ret;
 
-	if (of_machine_is_compatible("qcom,msm8994")) {
-		dev_info(dev, "talkman-rmi: F01 wake (L22 held)\n");
+	if (of_machine_is_compatible("qcom,msm8994"))
 		goto resume_dev;
-	}
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(rmi_i2c->supplies),
 				    rmi_i2c->supplies);
@@ -337,8 +333,6 @@ resume_dev:
 	ret = rmi_driver_resume(rmi_i2c->xport.rmi_dev, true);
 	if (ret)
 		dev_warn(dev, "Failed to resume device: %d\n", ret);
-	else if (of_machine_is_compatible("qcom,msm8994"))
-		dev_info(dev, "talkman-rmi: resume done\n");
 
 	return ret;
 }

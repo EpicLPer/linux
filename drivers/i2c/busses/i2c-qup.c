@@ -1434,11 +1434,7 @@ qup_i2c_conf_xfer_v2(struct qup_i2c_dev *qup, bool is_rx, bool is_first,
 	if (ret)
 		goto err;
 
-	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: fifo wait\n");
 	ret = qup_i2c_wait_for_complete(qup, msg);
-	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: fifo wait ret=%d\n", ret);
 	if (ret)
 		goto err;
 
@@ -1450,11 +1446,7 @@ qup_i2c_conf_xfer_v2(struct qup_i2c_dev *qup, bool is_rx, bool is_first,
 	}
 
 err:
-	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: fifo disable_irq\n");
 	disable_irq(qup->irq);
-	if (of_machine_is_compatible("qcom,msm8994") && msg->addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: fifo disable_irq done\n");
 	return ret;
 }
 
@@ -1583,17 +1575,7 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	qup->bus_err = 0;
 	qup->qup_err = 0;
 
-	if (of_machine_is_compatible("qcom,msm8994") && num &&
-	    msgs[0].addr == 0x4b)
-		dev_info(qup->dev,
-			 "talkman-qup: xfer 0x4b get_sync rpm_sus=%d\n",
-			 pm_runtime_suspended(qup->dev));
-
 	ret = pm_runtime_get_sync(qup->dev);
-	if (of_machine_is_compatible("qcom,msm8994") && num &&
-	    msgs[0].addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: xfer 0x4b get_sync ret=%d\n",
-			 ret);
 	if (ret < 0)
 		goto out;
 
@@ -1601,16 +1583,8 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	if (ret)
 		goto out;
 
-	if (of_machine_is_compatible("qcom,msm8994") && num &&
-	    msgs[0].addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: xfer 0x4b sw_reset\n");
 	writel(1, qup->base + QUP_SW_RESET);
 	ret = qup_i2c_poll_state(qup, QUP_RESET_STATE);
-	if (of_machine_is_compatible("qcom,msm8994") && num &&
-	    msgs[0].addr == 0x4b)
-		dev_info(qup->dev,
-			 "talkman-qup: xfer 0x4b reset_poll ret=%d dma=%d\n",
-			 ret, qup->use_dma);
 	if (ret)
 		goto out;
 
@@ -1624,16 +1598,9 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	}
 
 	if (qup->use_dma) {
-		if (of_machine_is_compatible("qcom,msm8994") && num &&
-		    msgs[0].addr == 0x4b)
-			dev_info(qup->dev, "talkman-qup: xfer 0x4b bam\n");
 		reinit_completion(&qup->xfer);
 		ret = qup_i2c_bam_xfer(adap, &msgs[0], num);
 		qup->use_dma = false;
-		if (of_machine_is_compatible("qcom,msm8994") && num &&
-		    msgs[0].addr == 0x4b)
-			dev_info(qup->dev, "talkman-qup: xfer 0x4b bam ret=%d\n",
-				 ret);
 	} else {
 		qup_i2c_conf_mode_v2(qup);
 
@@ -1658,9 +1625,6 @@ static int qup_i2c_xfer_v2(struct i2c_adapter *adap,
 	if (ret == 0)
 		ret = num;
 out:
-	if (of_machine_is_compatible("qcom,msm8994") && num &&
-	    msgs[0].addr == 0x4b)
-		dev_info(qup->dev, "talkman-qup: xfer 0x4b done ret=%d\n", ret);
 	pm_runtime_put_autosuspend(qup->dev);
 
 	return ret;
@@ -2078,8 +2042,6 @@ static int qup_i2c_suspend_noirq(struct device *device)
 	if (!of_machine_is_compatible("qcom,msm8994"))
 		return 0;
 
-	dev_info(device, "talkman-qup: noirq sus rpm_sus=%d clk=%d\n",
-		 pm_runtime_suspended(device), qup->clocks_on);
 	if (!pm_runtime_suspended(device)) {
 		/*
 		 * 3.10 i2c-msm-v2: clk drop only if RT_ACTIVE (clocks
@@ -2097,7 +2059,6 @@ static int qup_i2c_suspend_noirq(struct device *device)
 		pm_runtime_set_suspended(device);
 		pm_runtime_enable(device);
 	}
-	dev_info(device, "talkman-qup: noirq sus ok\n");
 	return 0;
 }
 
@@ -2106,7 +2067,6 @@ static int qup_i2c_resume_noirq(struct device *device)
 	if (!of_machine_is_compatible("qcom,msm8994"))
 		return 0;
 
-	dev_info(device, "talkman-qup: noirq res (clocks on next xfer)\n");
 	return 0;
 }
 
