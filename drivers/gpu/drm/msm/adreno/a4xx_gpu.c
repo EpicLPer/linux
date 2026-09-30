@@ -385,23 +385,6 @@ static void a4xx_recover(struct msm_gpu *gpu)
 {
 	int i;
 
-	if (adreno_is_a430(to_adreno_gpu(gpu))) {
-		/*
-		 * Full register dump and SW_RESET SEA on VMIDMT/XPU
-		 * ranges in a4xx_registers. Print the CP window only.
-		 */
-		pr_err("%s: recover status=0x%08x int0=0x%08x rptr=0x%x wptr=0x%x\n",
-		       gpu->name,
-		       gpu_read(gpu, REG_A4XX_RBBM_STATUS),
-		       gpu_read(gpu, REG_A4XX_RBBM_INT_0_STATUS),
-		       gpu_read(gpu, REG_A4XX_CP_RB_RPTR),
-		       get_wptr(gpu->rb[0]));
-		for (i = 0; i < 8; i++)
-			pr_err("CP_SCRATCH_REG%d: %u\n", i,
-			       gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
-		return;
-	}
-
 	adreno_dump_info(gpu);
 
 	for (i = 0; i < 8; i++) {
@@ -409,8 +392,13 @@ static void a4xx_recover(struct msm_gpu *gpu)
 			gpu_read(gpu, REG_AXXX_CP_SCRATCH_REG0 + i));
 	}
 
-	/* dump registers before resetting gpu, if enabled: */
-	if (hang_debug)
+	/*
+	 * a4xx_dump() walks a4xx_registers, which contains the TZ-owned
+	 * VMIDMT/XPU ranges.  Reading those raises an SError on A430, so the
+	 * full dump can not be used there (the crash state snapshot skips
+	 * them as well, see a4xx_gpu_state_get()).
+	 */
+	if (hang_debug && !adreno_is_a430(to_adreno_gpu(gpu)))
 		a4xx_dump(gpu);
 
 	gpu_write(gpu, REG_A4XX_RBBM_SW_RESET_CMD, 1);
