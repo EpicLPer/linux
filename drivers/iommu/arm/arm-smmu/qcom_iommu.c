@@ -295,6 +295,70 @@ static bool qcom_iommu_is_msm8994_gpu(const struct device *dev)
 	       of_device_is_compatible(dev->of_node, "qcom,msm8994-gpu-iommu");
 }
 
+#define GPU_MMU_TRACE_N	256
+struct gpu_mmu_trace {
+	u64 seq;
+	u64 iova;
+	u64 paddr;
+	u64 size;
+	u32 prot;
+	u8 op;			/* 0=map 1=unmap */
+};
+
+static struct gpu_mmu_trace gpu_mmu_trace[GPU_MMU_TRACE_N];
+static unsigned int gpu_mmu_trace_pos;
+static int gpu_mmu_trace_dumps;
+static DEFINE_SPINLOCK(gpu_mmu_trace_lock);
+
+static void gpu_mmu_trace_add(u8 op, unsigned long iova, size_t size,
+			      phys_addr_t paddr, int prot)
+{
+	struct gpu_mmu_trace *t;
+	unsigned long flags;
+
+	spin_lock_irqsave(&gpu_mmu_trace_lock, flags);
+	gpu_mmu_trace_pos++;
+	t = &gpu_mmu_trace[(gpu_mmu_trace_pos - 1) % GPU_MMU_TRACE_N];
+	t->seq = gpu_mmu_trace_pos;
+	t->iova = iova;
+	t->paddr = paddr;
+	t->size = size;
+	t->prot = prot;
+	t->op = op;
+	spin_unlock_irqrestore(&gpu_mmu_trace_lock, flags);
+}
+
+static void gpu_mmu_trace_dump(unsigned long fault_iova)
+{
+	unsigned int i, start, n = min_t(unsigned int, gpu_mmu_trace_pos,
+					 GPU_MMU_TRACE_N);
+	unsigned long flags;
+
+	spin_lock_irqsave(&gpu_mmu_trace_lock, flags);
+	pr_err("iommu-diag trace total=%u (last %u entries)\n",
+	       gpu_mmu_trace_pos, n);
+	for (i = 0; i < n; i++) {
+		struct gpu_mmu_trace *t = &gpu_mmu_trace[i];
+
+		if (!t->seq)
+			continue;
+		if (fault_iova >= t->iova && fault_iova < t->iova + t->size)
+			pr_err("iommu-diag trace MATCH seq=%llu %s iova=%016llx size=%llx paddr=%016llx prot=%x\n",
+			       t->seq, t->op ? "unmap" : "map", t->iova,
+			       t->size, t->paddr, t->prot);
+	}
+	start = (gpu_mmu_trace_pos > n) ? (gpu_mmu_trace_pos - n) : 0;
+	for (i = 0; i < n; i++) {
+		struct gpu_mmu_trace *t =
+			&gpu_mmu_trace[(start + i) % GPU_MMU_TRACE_N];
+
+		pr_err("iommu-diag trace seq=%llu %s iova=%016llx size=%llx paddr=%016llx prot=%x\n",
+		       t->seq, t->op ? "unmap" : "map", t->iova, t->size,
+		       t->paddr, t->prot);
+	}
+	spin_unlock_irqrestore(&gpu_mmu_trace_lock, flags);
+}
+
 static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 {
 	struct qcom_iommu_ctx *ctx = dev;
@@ -326,6 +390,10 @@ static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 		pr_err("iommu-diag fault cb%d fsr=%08x fsynr0=%08x fsynr1=%08x iova=%016llx pa=%pa hw_ttbr0=%016llx sw_ttbr0=%016llx\n",
 		       ctx->asid, fsr, fsynr,
 		       iommu_readl(ctx, ARM_SMMU_CB_FSYNR1), iova, &pa, hw, sw);
+		if (gpu_mmu_trace_dumps < 2) {
+			gpu_mmu_trace_dumps++;
+			gpu_mmu_trace_dump(iova);
+		}
 	}
 
 	if (report_iommu_fault(ctx->domain, ctx->dev, iova, 0)) {
@@ -730,6 +798,9 @@ static int qcom_iommu_map(struct iommu_domain *domain, unsigned long iova,
 	spin_lock_irqsave(&qcom_domain->pgtbl_lock, flags);
 	ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot, GFP_ATOMIC, mapped);
 	spin_unlock_irqrestore(&qcom_domain->pgtbl_lock, flags);
+	if (!ret && qcom_domain->iommu &&
+	    qcom_iommu_is_msm8994_gpu(qcom_domain->iommu->dev))
+		gpu_mmu_trace_add(0, iova, *mapped, paddr, prot);
 	return ret;
 }
 
@@ -754,6 +825,9 @@ static size_t qcom_iommu_unmap(struct iommu_domain *domain, unsigned long iova,
 	spin_lock_irqsave(&qcom_domain->pgtbl_lock, flags);
 	ret = ops->unmap_pages(ops, iova, pgsize, pgcount, gather);
 	spin_unlock_irqrestore(&qcom_domain->pgtbl_lock, flags);
+	if (qcom_domain->iommu &&
+	    qcom_iommu_is_msm8994_gpu(qcom_domain->iommu->dev))
+		gpu_mmu_trace_add(1, iova, ret, 0, 0);
 	pm_runtime_put_sync(qcom_domain->iommu->dev);
 
 	return ret;
