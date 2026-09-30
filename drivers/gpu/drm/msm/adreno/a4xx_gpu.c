@@ -387,9 +387,14 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	return 0;
 }
 
+extern void qcom_iommu_8994_gpu_dump(const char *tag);
+
 static void a4xx_recover(struct msm_gpu *gpu)
 {
 	int i;
+
+	if (adreno_is_a430(to_adreno_gpu(gpu)))
+		qcom_iommu_8994_gpu_dump("gpu-hang");
 
 	pr_err("%s: recover status=0x%08x int0=0x%08x rptr=0x%x wptr=0x%x\n",
 	       gpu->name,

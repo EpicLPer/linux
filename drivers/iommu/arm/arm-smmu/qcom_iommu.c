@@ -100,6 +100,9 @@ struct qcom_iommu_cfg {
 	unsigned int			 num_sids;
 };
 
+/* DIAG (throwaway): pointer to the msm8994 GPU SMMU for hang dumps */
+static struct qcom_iommu_dev *qcom_iommu_8994_gpu;
+
 struct qcom_iommu_dev {
 	/* IOMMU core code handle */
 	struct iommu_device	 iommu;
@@ -1135,6 +1138,8 @@ static int qcom_iommu_device_probe(struct platform_device *pdev)
 	qcom_iommu->max_asid = max_asid;
 	qcom_iommu->dev = dev;
 	qcom_iommu->cfg = of_device_get_match_data(dev);
+	if (of_device_is_compatible(dev->of_node, "qcom,msm8994-gpu-iommu"))
+		qcom_iommu_8994_gpu = qcom_iommu; /* DIAG */
 	if (of_device_is_compatible(dev->of_node, "qcom,msm8992-mdp-iommu"))
 		dev_info(dev, "talkman-iommu: 8992 mdp V7S BFB\n");
 	if (of_device_is_compatible(dev->of_node, "qcom,msm8994-mdp-iommu"))
@@ -1421,6 +1426,39 @@ void qcom_iommu_dump_mdp_hang(struct device *master)
 
 	pm_runtime_put(qcom_iommu->dev);
 }
+
+/* DIAG (throwaway): dump the 8994 GPU SMMU context state at a GPU hang */
+void qcom_iommu_8994_gpu_dump(const char *tag)
+{
+	struct qcom_iommu_dev *qcom_iommu = qcom_iommu_8994_gpu;
+	unsigned int i;
+
+	if (!qcom_iommu)
+		return;
+
+	if (qcom_iommu->global_base)
+		pr_err("iommu-diag %s: micro_mmu_ctrl=%08x\n", tag,
+		       readl_relaxed(qcom_iommu->global_base +
+				     QCOM_IOMMU_MICRO_MMU_CTRL));
+
+	for (i = 0; i <= qcom_iommu->max_asid; i++) {
+		struct qcom_iommu_ctx *ctx = qcom_iommu->ctxs[i];
+
+		if (!ctx || ctx->secured_ctx)
+			continue;
+		pr_err("iommu-diag %s: cb%u fsr=%08x far=%016llx ttbr0=%016llx sctlr=%08x ctxidr=%08x fsynr0=%08x fsynr1=%08x (sw ttbr0=%016llx sctlr=%08x)\n",
+		       tag, ctx->asid,
+		       iommu_readl(ctx, ARM_SMMU_CB_FSR),
+		       iommu_readq(ctx, ARM_SMMU_CB_FAR),
+		       iommu_readq(ctx, ARM_SMMU_CB_TTBR0),
+		       iommu_readl(ctx, ARM_SMMU_CB_SCTLR),
+		       iommu_readl(ctx, ARM_SMMU_CB_CONTEXTIDR),
+		       iommu_readl(ctx, ARM_SMMU_CB_FSYNR0),
+		       iommu_readl(ctx, ARM_SMMU_CB_FSYNR1),
+		       ctx->ttbr0, ctx->sctlr);
+	}
+}
+EXPORT_SYMBOL_GPL(qcom_iommu_8994_gpu_dump);
 
 static int __maybe_unused qcom_iommu_resume(struct device *dev)
 {
