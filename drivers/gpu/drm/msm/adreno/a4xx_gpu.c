@@ -30,6 +30,7 @@ static bool a4xx_idle(struct msm_gpu *gpu);
 struct a4xx_poll_ent {
 	u64 t_ms;
 	u32 status, ctl, ahb_err, clk, pwr, gmem, rptr, wptr, ahb_ctl0;
+	u32 me_split, pfp_split, rrdy5, me_cntl, ib1, ib1sz, ib2, ib2sz, hang_ctl;
 };
 static struct a4xx_poll_ent a4xx_poll_buf[A4XX_POLL_N];
 static unsigned int a4xx_poll_idx;
@@ -55,6 +56,15 @@ static void a4xx_poll_sample(struct work_struct *work)
 	e->rptr = gpu_read(gpu, REG_A4XX_CP_RB_RPTR);
 	e->wptr = get_wptr(gpu->rb[0]);
 	e->ahb_ctl0 = gpu_read(gpu, REG_A4XX_RBBM_AHB_CTL0);
+	e->me_split = gpu_read(gpu, REG_A4XX_RBBM_AHB_ME_SPLIT_STATUS);
+	e->pfp_split = gpu_read(gpu, REG_A4XX_RBBM_AHB_PFP_SPLIT_STATUS);
+	e->rrdy5 = gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_RRDY_STATUS5);
+	e->me_cntl = gpu_read(gpu, REG_A4XX_CP_ME_CNTL);
+	e->ib1 = gpu_read(gpu, REG_A4XX_CP_IB1_BASE);
+	e->ib1sz = gpu_read(gpu, REG_A4XX_CP_IB1_BUFSZ);
+	e->ib2 = gpu_read(gpu, REG_A4XX_CP_IB2_BASE);
+	e->ib2sz = gpu_read(gpu, REG_A4XX_CP_IB2_BUFSZ);
+	e->hang_ctl = gpu_read(gpu, REG_A4XX_RBBM_INTERFACE_HANG_INT_CTL);
 	a4xx_poll_idx++;
 
 	schedule_delayed_work(&a4xx_poll_work, msecs_to_jiffies(50));
@@ -69,9 +79,11 @@ static void a4xx_poll_dump(void)
 	for (i = 0; i < n; i++) {
 		struct a4xx_poll_ent *e = &a4xx_poll_buf[(start + i) % A4XX_POLL_N];
 
-		pr_err("P %llu st=%08x ctl=%08x ahberr=%08x clk=%08x pwr=%08x gmem=%08x rptr=%x wptr=%x ahbctl0=%08x\n",
+		pr_err("P %llu st=%08x ctl=%08x ae=%08x ck=%08x pw=%08x gm=%08x rp=%x wp=%x ac=%08x ms=%08x ps=%08x r5=%08x mc=%08x i1=%08x/%x i2=%08x/%x hc=%08x\n",
 		       e->t_ms, e->status, e->ctl, e->ahb_err, e->clk,
-		       e->pwr, e->gmem, e->rptr, e->wptr, e->ahb_ctl0);
+		       e->pwr, e->gmem, e->rptr, e->wptr, e->ahb_ctl0,
+		       e->me_split, e->pfp_split, e->rrdy5, e->me_cntl,
+		       e->ib1, e->ib1sz, e->ib2, e->ib2sz, e->hang_ctl);
 	}
 }
 
