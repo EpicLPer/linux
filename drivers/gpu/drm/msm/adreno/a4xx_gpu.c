@@ -330,6 +330,18 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	/* VPC registers */
 	gpu_write(gpu, REG_A4XX_CP_PROTECT(10), 0x61003980);
 
+	/*
+	 * A420/A430: accesses to the VBIF/XPU register ranges by the GPU
+	 * raise an XPU violation. 3.10 a4xx_protect_init() protects
+	 * 0x2c00 and 0x3400 with a 2^10 register mask and 0x3300 with 2^8
+	 * (CP_PROTECT value = 0x60000000 | mask_len << 24 | reg << 2).
+	 */
+	if (adreno_is_a430(adreno_gpu) || adreno_is_a420(adreno_gpu)) {
+		gpu_write(gpu, REG_A4XX_CP_PROTECT(12), 0x6a00b000);
+		gpu_write(gpu, REG_A4XX_CP_PROTECT(13), 0x6800cc00);
+		gpu_write(gpu, REG_A4XX_CP_PROTECT(14), 0x6a00d000);
+	}
+
 	/* SMMU registers */
 	gpu_write(gpu, REG_A4XX_CP_PROTECT(11), 0x6e010000);
 
