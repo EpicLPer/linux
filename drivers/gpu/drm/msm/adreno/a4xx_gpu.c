@@ -279,8 +279,12 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	gpu_write(gpu, REG_A4XX_UCHE_TRAP_BASE_LO, lower_32_bits(adreno_gpu->uche_trap_base));
 	gpu_write(gpu, REG_A4XX_UCHE_TRAP_BASE_HI, upper_32_bits(adreno_gpu->uche_trap_base));
 
+	/*
+	 * EXPERIMENT: 3.10 sets the "disable bootstrap speed up" chicken bit
+	 * on every a4xx except a420. Test whether it matters for CP stability.
+	 */
 	gpu_write(gpu, REG_A4XX_CP_DEBUG, (1 << 25) |
-			(adreno_is_a420(adreno_gpu) ? (1 << 29) : 0));
+			(adreno_is_a420(adreno_gpu) ? (1 << 29) : (1 << 14)));
 
 	/* On A430 enable SP regfile sleep for power savings */
 	/* TODO downstream does this for !420, so maybe applies for 405 too? */
