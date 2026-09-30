@@ -3,6 +3,8 @@
  */
 #include "a4xx_gpu.h"
 #include <linux/iopoll.h>
+#include <linux/of.h>
+#include <linux/workqueue.h>
 
 #define A4XX_INT0_MASK \
 	(A4XX_INT0_RBBM_AHB_ERROR |        \
@@ -22,6 +24,66 @@
 extern bool hang_debug;
 static void a4xx_dump(struct msm_gpu *gpu);
 static bool a4xx_idle(struct msm_gpu *gpu);
+
+/* ---- DIAG (throwaway): sample the A430 state every 50 ms ---- */
+#define A4XX_POLL_N 256
+struct a4xx_poll_ent {
+	u64 t_ms;
+	u32 status, ctl, ahb_err, clk, pwr, gmem, rptr, wptr, ahb_ctl0;
+};
+static struct a4xx_poll_ent a4xx_poll_buf[A4XX_POLL_N];
+static unsigned int a4xx_poll_idx;
+static bool a4xx_poll_done;
+static struct delayed_work a4xx_poll_work;
+static struct msm_gpu *a4xx_poll_gpu;
+
+static void a4xx_poll_sample(struct work_struct *work)
+{
+	struct a4xx_poll_ent *e = &a4xx_poll_buf[a4xx_poll_idx % A4XX_POLL_N];
+	struct msm_gpu *gpu = a4xx_poll_gpu;
+
+	if (!gpu || a4xx_poll_done)
+		return;
+
+	e->t_ms = div_u64(ktime_get_ns(), 1000000);
+	e->status = gpu_read(gpu, REG_A4XX_RBBM_STATUS);
+	e->ctl = gpu_read(gpu, REG_A4XX_RBBM_RBBM_CTL);
+	e->ahb_err = gpu_read(gpu, REG_A4XX_RBBM_AHB_ERROR_STATUS);
+	e->clk = gpu_read(gpu, REG_A4XX_RBBM_CLOCK_STATUS);
+	e->pwr = gpu_read(gpu, REG_A4XX_RBBM_POWER_STATUS);
+	e->gmem = gpu_read(gpu, REG_A4XX_RB_GMEM_BASE_ADDR);
+	e->rptr = gpu_read(gpu, REG_A4XX_CP_RB_RPTR);
+	e->wptr = get_wptr(gpu->rb[0]);
+	e->ahb_ctl0 = gpu_read(gpu, REG_A4XX_RBBM_AHB_CTL0);
+	a4xx_poll_idx++;
+
+	schedule_delayed_work(&a4xx_poll_work, msecs_to_jiffies(50));
+}
+
+static void a4xx_poll_dump(void)
+{
+	unsigned int i, n = min(a4xx_poll_idx, (unsigned int)A4XX_POLL_N);
+	unsigned int start = a4xx_poll_idx - n;
+
+	pr_err("A430 poll: %u samples (showing last %u)\n", a4xx_poll_idx, n);
+	for (i = 0; i < n; i++) {
+		struct a4xx_poll_ent *e = &a4xx_poll_buf[(start + i) % A4XX_POLL_N];
+
+		pr_err("P %llu st=%08x ctl=%08x ahberr=%08x clk=%08x pwr=%08x gmem=%08x rptr=%x wptr=%x ahbctl0=%08x\n",
+		       e->t_ms, e->status, e->ctl, e->ahb_err, e->clk,
+		       e->pwr, e->gmem, e->rptr, e->wptr, e->ahb_ctl0);
+	}
+}
+
+static void a4xx_poll_start(struct msm_gpu *gpu)
+{
+	if (a4xx_poll_gpu)
+		return;
+	a4xx_poll_gpu = gpu;
+	INIT_DELAYED_WORK(&a4xx_poll_work, a4xx_poll_sample);
+	schedule_delayed_work(&a4xx_poll_work, msecs_to_jiffies(50));
+}
+/* ---- end DIAG ---- */
 
 static void a4xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 {
@@ -383,6 +445,10 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 			gpu_read(gpu, REG_A4XX_RBBM_CLOCK_STATUS),
 			gpu_read(gpu, REG_A4XX_RBBM_AHB_STATUS));
 
+	if (adreno_is_a430(adreno_gpu) &&
+	    of_machine_is_compatible("qcom,msm8994"))
+		a4xx_poll_start(gpu);
+
 	return 0;
 }
 
@@ -395,6 +461,11 @@ static void a4xx_recover(struct msm_gpu *gpu)
 		 * Full register dump and SW_RESET SEA on VMIDMT/XPU
 		 * ranges in a4xx_registers. Print the CP window only.
 		 */
+		if (!a4xx_poll_done) {
+			a4xx_poll_done = true;
+			cancel_delayed_work_sync(&a4xx_poll_work);
+			a4xx_poll_dump();
+		}
 		pr_err("%s: recover status=0x%08x int0=0x%08x rptr=0x%x wptr=0x%x\n",
 		       gpu->name,
 		       gpu_read(gpu, REG_A4XX_RBBM_STATUS),
