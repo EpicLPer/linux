@@ -332,6 +332,13 @@ static int a4xx_hw_init(struct msm_gpu *gpu)
 	/* SMMU registers */
 	gpu_write(gpu, REG_A4XX_CP_PROTECT(11), 0x6e010000);
 
+	/* XPU/VBIF registers (A420/A430) */
+	if (adreno_is_a420(adreno_gpu) || adreno_is_a430(adreno_gpu)) {
+		gpu_write(gpu, REG_A4XX_CP_PROTECT(12), 0x6a00b000);
+		gpu_write(gpu, REG_A4XX_CP_PROTECT(13), 0x6800cc00);
+		gpu_write(gpu, REG_A4XX_CP_PROTECT(14), 0x6a00d000);
+	}
+
 	gpu_write(gpu, REG_A4XX_RBBM_INT_0_MASK, A4XX_INT0_MASK);
 
 	ret = adreno_hw_init(gpu);
