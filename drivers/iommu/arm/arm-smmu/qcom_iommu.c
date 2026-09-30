@@ -309,6 +309,25 @@ static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 	fsynr = iommu_readl(ctx, ARM_SMMU_CB_FSYNR0);
 	iova = iommu_readq(ctx, ARM_SMMU_CB_FAR);
 
+	if (qcom_iommu_is_msm8994_gpu(ctx->dev)) {
+		struct qcom_iommu_domain *qdom = ctx->domain ?
+			to_qcom_iommu_domain(ctx->domain) : NULL;
+		phys_addr_t pa = 0;
+		u64 hw = iommu_readq(ctx, ARM_SMMU_CB_TTBR0);
+		u64 sw = 0;
+
+		if (qdom && qdom->pgtbl_ops) {
+			struct io_pgtable *pt = container_of(qdom->pgtbl_ops,
+							struct io_pgtable, ops);
+
+			pa = qdom->pgtbl_ops->iova_to_phys(qdom->pgtbl_ops, iova);
+			sw = pt->cfg.arm_v7s_cfg.ttbr;
+		}
+		pr_err("iommu-diag fault cb%d fsr=%08x fsynr0=%08x fsynr1=%08x iova=%016llx pa=%pa hw_ttbr0=%016llx sw_ttbr0=%016llx\n",
+		       ctx->asid, fsr, fsynr,
+		       iommu_readl(ctx, ARM_SMMU_CB_FSYNR1), iova, &pa, hw, sw);
+	}
+
 	if (report_iommu_fault(ctx->domain, ctx->dev, iova, 0)) {
 		dev_err_ratelimited(ctx->dev,
 				    "Unhandled context fault: fsr=0x%x, "
