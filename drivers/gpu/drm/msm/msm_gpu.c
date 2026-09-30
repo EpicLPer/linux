@@ -356,6 +356,10 @@ static void crashstate_get_vm_logs(struct msm_gpu_state *state, struct msm_gem_v
 		int idx = (i + first) & vm_log_mask;
 
 		state->vm_logs[i] = vm->log[idx];
+		pr_err("vm-log: %s:%d: 0x%016llx-0x%016llx\n",
+		       vm->log[idx].op, vm->log[idx].queue_id,
+		       vm->log[idx].iova,
+		       vm->log[idx].iova + vm->log[idx].range);
 	}
 
 	mutex_unlock(&vm->mmu_lock);
