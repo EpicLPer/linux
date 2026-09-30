@@ -461,6 +461,20 @@ static irqreturn_t a4xx_irq(struct msm_gpu *gpu)
 	status = gpu_read(gpu, REG_A4XX_RBBM_INT_0_STATUS);
 	DBG("%s: Int status %08x", gpu->name, status);
 
+	/* DIAG (throwaway): log real error interrupts (not the per-submit ones) */
+	if (status & (A4XX_INT0_RBBM_AHB_ERROR | A4XX_INT0_RBBM_ATB_BUS_OVERFLOW |
+		      A4XX_INT0_CP_T0_PACKET_IN_IB | A4XX_INT0_CP_OPCODE_ERROR |
+		      A4XX_INT0_CP_RESERVED_BIT_ERROR | A4XX_INT0_CP_HW_FAULT |
+		      A4XX_INT0_CP_REG_PROTECT_FAULT | A4XX_INT0_CP_AHB_ERROR_HALT |
+		      A4XX_INT0_UCHE_OOB_ACCESS))
+		pr_err("%s: DIAG irq status=%08x ahb_err=%08x me_split=%08x pfp_split=%08x me_cntl=%08x rbbm=%08x\n",
+		       gpu->name, status,
+		       gpu_read(gpu, REG_A4XX_RBBM_AHB_ERROR_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_AHB_ME_SPLIT_STATUS),
+		       gpu_read(gpu, REG_A4XX_RBBM_AHB_PFP_SPLIT_STATUS),
+		       gpu_read(gpu, REG_A4XX_CP_ME_CNTL),
+		       gpu_read(gpu, REG_A4XX_RBBM_STATUS));
+
 	if (status & A4XX_INT0_CP_REG_PROTECT_FAULT) {
 		uint32_t reg = gpu_read(gpu, REG_A4XX_CP_PROTECT_STATUS);
 		printk("CP | Protected mode error| %s | addr=%x\n",
