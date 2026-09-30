@@ -1,16 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2018, Linaro Limited
 
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/tas2552.h>
+#include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <sound/soc.h>
-#include <sound/soc-dapm.h>
 #include <sound/pcm.h>
+#include <sound/pcm_params.h>
+#include <sound/jack.h>
 #include "common.h"
+#include "qdsp6/q6afe.h"
+#include "../codecs/wcd9330.h"
 
 #define SLIM_MAX_TX_PORTS 16
 #define SLIM_MAX_RX_PORTS 16
 #define WCD9335_DEFAULT_MCLK_RATE	9600000
+#define MI2S_BCLK_RATE			1536000
+#define I2S_PCM_SEL_I2S		0
+#define I2S_PCM_SEL_OFFSET	1
+
+struct apq8096_data {
+	void __iomem *quat_mux;
+	struct snd_soc_jack jack;
+	bool jack_setup;
+};
+
+static struct snd_soc_jack_pin apq8096_jack_pins[] = {
+	{
+		.pin = "Headphone Jack",
+		.mask = SND_JACK_HEADPHONE,
+	},
+};
 
 static int apq8096_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 				      struct snd_pcm_hw_params *params)
@@ -19,9 +42,11 @@ static int apq8096_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 					SNDRV_PCM_HW_PARAM_RATE);
 	struct snd_interval *channels = hw_param_interval(params,
 					SNDRV_PCM_HW_PARAM_CHANNELS);
+	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
 
 	rate->min = rate->max = 48000;
 	channels->min = channels->max = 2;
+	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
 
 	return 0;
 }
@@ -59,13 +84,69 @@ end:
 	return ret;
 }
 
+/*
+ * BE startup may only program clocks and DAI format. q6routing mixers
+ * and codec DAPM muxes are userspace (ALSA UCM); kcontrol put from
+ * here runs under the DPCM mutex and deadlocks in
+ * snd_soc_dpcm_runtime_update (sm8250/sdm845/upstream apq8096).
+ */
+static int apq8096_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct apq8096_data *priv = snd_soc_card_get_drvdata(rtd->card);
+	int ret;
+
+	if (cpu_dai->id != QUATERNARY_MI2S_RX)
+		return 0;
+
+	if (!priv || !priv->quat_mux) {
+		dev_err(rtd->card->dev, "missing lpaif_quat_mode_muxsel\n");
+		return -EINVAL;
+	}
+
+	/* Select I2S on the QUAT LPAIF mux (PCM is the other mode). */
+	iowrite32(I2S_PCM_SEL_I2S << I2S_PCM_SEL_OFFSET, priv->quat_mux);
+
+	ret = snd_soc_dai_set_sysclk(cpu_dai, LPAIF_BIT_CLK,
+				     MI2S_BCLK_RATE, 0);
+	if (ret)
+		return ret;
+
+	snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_BP_FP);
+	if (!snd_soc_dai_is_dummy(codec_dai)) {
+		snd_soc_dai_set_fmt(codec_dai, SND_SOC_DAIFMT_BC_FC |
+					       SND_SOC_DAIFMT_NB_NF |
+					       SND_SOC_DAIFMT_I2S);
+		snd_soc_dai_set_sysclk(codec_dai, TAS2552_PLL_CLKIN_BCLK,
+				       MI2S_BCLK_RATE, SND_SOC_CLOCK_IN);
+	}
+
+	return 0;
+}
+
+static void apq8096_shutdown(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	if (cpu_dai->id == QUATERNARY_MI2S_RX)
+		snd_soc_dai_set_sysclk(cpu_dai, LPAIF_BIT_CLK, 0, 0);
+}
+
 static const struct snd_soc_ops apq8096_ops = {
+	.startup = apq8096_startup,
+	.shutdown = apq8096_shutdown,
 	.hw_params = msm_snd_hw_params,
 };
 
 static int apq8096_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct snd_soc_card *card = rtd->card;
+	struct apq8096_data *priv = snd_soc_card_get_drvdata(card);
 
 	/*
 	 * Codec SLIMBUS configuration
@@ -85,6 +166,45 @@ static int apq8096_init(struct snd_soc_pcm_runtime *rtd)
 	snd_soc_dai_set_sysclk(codec_dai, 0, WCD9335_DEFAULT_MCLK_RATE,
 				SNDRV_PCM_STREAM_PLAYBACK);
 
+	/*
+	 * sdm845 slim BE: machine jack + codec set_jack. qcom_snd_wcd_jack_setup
+	 * only attaches LPI_MI2S / TX_CODEC_DMA, not SLIMBUS_0_RX.
+	 */
+	if (cpu_dai->id == SLIMBUS_0_RX) {
+		int rval;
+
+		if (!priv->jack_setup) {
+			rval = snd_soc_card_jack_new_pins(card, "Headphone Jack",
+							  SND_JACK_HEADPHONE,
+							  &priv->jack,
+							  apq8096_jack_pins,
+							  ARRAY_SIZE(apq8096_jack_pins));
+			if (rval < 0)
+				return rval;
+			priv->jack_setup = true;
+		}
+
+		rval = snd_soc_component_set_jack(codec_dai->component,
+						  &priv->jack, NULL);
+		if (rval != 0 && rval != -ENOTSUPP) {
+			dev_err(card->dev, "Failed to set jack: %d\n", rval);
+			return rval;
+		}
+
+		/*
+		 * 3.10 msm8994.c msm_audrx_init → msm_afe_set_config.
+		 * ADSP needs the tomtom CDC register map and PGD EA
+		 * before SLIMBUS_0_RX start (IFD port enable lives there).
+		 */
+		rval = wcd9330_afe_set_config(codec_dai->component,
+					      cpu_dai->dev);
+		if (rval) {
+			dev_err(card->dev, "Failed to set AFE config %d\n",
+				rval);
+			return rval;
+		}
+	}
+
 	return 0;
 }
 
@@ -93,11 +213,15 @@ static void apq8096_add_be_ops(struct snd_soc_card *card)
 	struct snd_soc_dai_link *link;
 	int i;
 
+	/* Same marker as apq8016 — UCM matches qdsp6 cards this way. */
+	card->components = "qdsp6";
+
 	for_each_card_prelinks(card, i, link) {
 		if (link->no_pcm == 1) {
 			link->be_hw_params_fixup = apq8096_be_hw_params_fixup;
-			link->init = apq8096_init;
 			link->ops = &apq8096_ops;
+			if (link->id != QUATERNARY_MI2S_RX)
+				link->init = apq8096_init;
 		}
 	}
 }
@@ -105,6 +229,8 @@ static void apq8096_add_be_ops(struct snd_soc_card *card)
 static int apq8096_platform_probe(struct platform_device *pdev)
 {
 	struct snd_soc_card *card;
+	struct apq8096_data *priv;
+	struct resource *muxsel;
 	struct device *dev = &pdev->dev;
 	int ret;
 
@@ -112,9 +238,22 @@ static int apq8096_platform_probe(struct platform_device *pdev)
 	if (!card)
 		return -ENOMEM;
 
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	muxsel = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+					      "lpaif_quat_mode_muxsel");
+	if (muxsel) {
+		priv->quat_mux = devm_ioremap_resource(dev, muxsel);
+		if (IS_ERR(priv->quat_mux))
+			return PTR_ERR(priv->quat_mux);
+	}
+
 	card->driver_name = "apq8096";
 	card->dev = dev;
 	card->owner = THIS_MODULE;
+	snd_soc_card_set_drvdata(card, priv);
 	dev_set_drvdata(dev, card);
 	ret = qcom_snd_parse_of(card);
 	if (ret)
