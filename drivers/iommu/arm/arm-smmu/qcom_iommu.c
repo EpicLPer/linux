@@ -309,7 +309,7 @@ static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 	fsynr = iommu_readl(ctx, ARM_SMMU_CB_FSYNR0);
 	iova = iommu_readq(ctx, ARM_SMMU_CB_FAR);
 
-	if (qcom_iommu_is_msm8994_gpu(ctx->dev)) {
+	if (qcom_iommu_is_msm8994_gpu(ctx->dev->parent)) {
 		struct qcom_iommu_domain *qdom = ctx->domain ?
 			to_qcom_iommu_domain(ctx->domain) : NULL;
 		phys_addr_t pa = 0;
