@@ -1474,7 +1474,10 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 	 * fails). After first hw_init, GX+CX before these clocks.
 	 */
 	if (qcom_iommu_is_msm8994_gpu(dev)) {
+		pr_err("iommu-diag resume-enter live=%d voted=%d\n",
+		       msm8994_oxili_gpu_is_live(), msm8994_oxili_pre_gpu_voted());
 		ret = msm8994_oxili_pre_gpu_power_if_live();
+		pr_err("iommu-diag pre-gpu-power ret=%d\n", ret);
 		if (ret)
 			return ret;
 	}
@@ -1492,6 +1495,7 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 	if (qcom_iommu_is_msm8994_gpu(dev) &&
 	    msm8994_oxili_pre_gpu_voted()) {
 		ret = qcom_scm_restore_sec_cfg(18, 0);
+		pr_err("iommu-diag scm18 ret=%d\n", ret);
 		if (ret)
 			return ret;
 	} else if (qcom_iommu->non_secure) {
