@@ -278,10 +278,12 @@ void msm_gem_vma_unmap(struct drm_gpuva *vma, const char *reason)
 		struct drm_gem_object *obj = vma->gem.obj;
 		struct msm_gem_object *msm_obj = to_msm_bo(obj);
 
-		pr_err("msm-unmap: %s: iova=%016llx range=%llx name=%d size=%zu flags=%x imported=%d task=%s:%d\n",
+		pr_err("msm-unmap: %s: iova=%016llx range=%llx name=%d size=%zu flags=%x imported=%d vma_ref=%d pin=%d task=%s:%d\n",
 		       reason ?: "(null)", vma->va.addr, vma->va.range,
 		       obj->name, obj->size, msm_obj->flags,
-		       drm_gem_is_imported(obj), current->comm, current->pid);
+		       drm_gem_is_imported(obj),
+		       atomic_read(&msm_obj->vma_ref), msm_obj->pin_count,
+		       current->comm, current->pid);
 		if (vma->va.range >= SZ_4M)
 			dump_stack();
 	}
