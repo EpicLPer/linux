@@ -274,6 +274,18 @@ void msm_gem_vma_unmap(struct drm_gpuva *vma, const char *reason)
 	if (!msm_vma->mapped)
 		return;
 
+	if (vma->gem.obj) {
+		struct drm_gem_object *obj = vma->gem.obj;
+		struct msm_gem_object *msm_obj = to_msm_bo(obj);
+
+		pr_err("msm-unmap: %s: iova=%016llx range=%llx name=%d size=%zu flags=%x imported=%d task=%s:%d\n",
+		       reason ?: "(null)", vma->va.addr, vma->va.range,
+		       obj->name, obj->size, msm_obj->flags,
+		       drm_gem_is_imported(obj), current->comm, current->pid);
+		if (vma->va.range >= SZ_4M)
+			dump_stack();
+	}
+
 	/*
 	 * The mmu_lock is only needed when preallocation is used.  But
 	 * in that case we don't need to worry about recursion into
