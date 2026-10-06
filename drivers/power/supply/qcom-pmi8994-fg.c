@@ -422,9 +422,10 @@ static int fg_voltage_uv(struct pmi8994_fg *fg, int *uv)
 
 /*
  * QPNP FG_DATA_CURRENT. The sample is the s16 at VOLTAGE_ADDR offset 3
- * (0x5cc, 3). LSB_16B is 152.587 uA, the same weight as voltage, and the
- * value is already signed. PMI8994 sets PATCH_NEG_CURRENT_BIT so discharge
- * stays negative.
+ * (0x5cc, 3). LSB_16B is 152.587 uA, the same weight as voltage. The SRAM
+ * sample and the termination-current encoder treat charge as negative
+ * (PATCH_NEG_CURRENT_BIT keeps that convention), so negate for current_now.
+ * Userspace then sees charging as positive and discharging as negative.
  */
 static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
 {
@@ -436,7 +437,7 @@ static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
 	if (rc)
 		return rc;
 	sraw = (s16)raw;
-	*ua = div_s64((s64)sraw * LSB_16B_NUM, LSB_16B_DEN);
+	*ua = -div_s64((s64)sraw * LSB_16B_NUM, LSB_16B_DEN);
 	return 0;
 }
 
@@ -758,9 +759,8 @@ static int fg_get_property(struct power_supply *psy,
 		if (rc)
 			return rc;
 		/*
-		 * Signed uA, negative for discharge. The SRAM value is an
-		 * s16 and PMI8994 sets PATCH_NEG_CURRENT_BIT so that sign
-		 * is the one the block reports.
+		 * Signed microamps. fg_current_ua() already negated the
+		 * SRAM sample, so charging is positive here.
 		 */
 		val->intval = fg->current_ua;
 		return 0;
