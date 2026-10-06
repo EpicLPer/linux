@@ -420,6 +420,12 @@ static int fg_voltage_uv(struct pmi8994_fg *fg, int *uv)
 	return 0;
 }
 
+/*
+ * QPNP FG_DATA_CURRENT. The sample is the s16 at VOLTAGE_ADDR offset 3
+ * (0x5cc, 3). LSB_16B is 152.587 uA, the same weight as voltage, and the
+ * value is already signed. PMI8994 sets PATCH_NEG_CURRENT_BIT so discharge
+ * stays negative.
+ */
 static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
 {
 	u16 raw;
@@ -751,9 +757,12 @@ static int fg_get_property(struct power_supply *psy,
 		rc = fg_refresh_telem(fg);
 		if (rc)
 			return rc;
-		/* Magnitude: UPower 1.91 treats current_now < 0 as discharge. */
-		val->intval = fg->current_ua < 0 ? -fg->current_ua
-						 : fg->current_ua;
+		/*
+		 * Signed uA, negative for discharge. The SRAM value is an
+		 * s16 and PMI8994 sets PATCH_NEG_CURRENT_BIT so that sign
+		 * is the one the block reports.
+		 */
+		val->intval = fg->current_ua;
 		return 0;
 	case POWER_SUPPLY_PROP_TEMP:
 		rc = fg_refresh_telem(fg);
