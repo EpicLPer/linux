@@ -42,6 +42,8 @@
 #define SMBCHG_USB_CHGPTH_ICL_STS_2		0x309
 #define SMBCHG_USB_CHGPTH_RID_STS		0x30b
 #define SMBCHG_USB_CHGPTH_USBIN_HVDCP_STS	0x30c
+/* USBIN_HVDCP_STS: bit 4 set once the QC handshake sees an HVDCP source. */
+#define USBIN_HVDCP_SEL_BIT		BIT(4)
 #define SMBCHG_USB_CHGPTH_INPUT_STS		0x30d
 #define SMBCHG_USB_CHGPTH_USBID_MSB		0x30e
 #define SMBCHG_USB_CHGPTH_RT_STS		0x310
@@ -259,6 +261,10 @@ struct smbchg_chip {
 	bool usb_present;
 	bool sdp_icl_from_host;
 	unsigned int typec_icl_ua;
+	bool hvdcp_want;
+	bool hvdcp_en;
+	bool gadget_dcp_off;
+	struct delayed_work hvdcp_sts_work;
 
 	const struct smbchg_data *data;
 };

@@ -17,6 +17,8 @@
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/string.h>
+#include <linux/usb/gadget.h>
 #include <linux/workqueue.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
@@ -987,6 +989,148 @@ static int smbchg_apsd_rerun(struct smbchg_chip *chip)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_USB_GADGET)
+static int smbchg_match_dwc3(struct device *dev, const void *data)
+{
+	(void)data;
+	return dev->of_node &&
+		of_device_is_compatible(dev->of_node, "snps,dwc3");
+}
+
+static int smbchg_match_gadget(struct device *dev, const void *data)
+{
+	(void)data;
+	return !strncmp(dev_name(dev), "gadget.", 7);
+}
+
+/* D+ pull-up on the dwc3 gadget. SDP/CDP never call this. */
+static void smbchg_gadget_pullup(struct smbchg_chip *chip, bool on)
+{
+	struct usb_gadget *gadget;
+	struct device *ctrl, *gdev;
+
+	ctrl = bus_find_device(&platform_bus_type, NULL, NULL, smbchg_match_dwc3);
+	if (!ctrl) {
+		dev_info(chip->dev, "no dwc3, D+ pull-up unchanged\n");
+		return;
+	}
+	gdev = device_find_child(ctrl, NULL, smbchg_match_gadget);
+	put_device(ctrl);
+	if (!gdev) {
+		dev_info(chip->dev, "no gadget, D+ pull-up unchanged\n");
+		return;
+	}
+	gadget = container_of(gdev, struct usb_gadget, dev);
+	if (on)
+		usb_gadget_connect(gadget);
+	else
+		usb_gadget_disconnect(gadget);
+	put_device(&gadget->dev);
+}
+#else
+static void smbchg_gadget_pullup(struct smbchg_chip *chip, bool on)
+{
+	(void)on;
+	dev_info(chip->dev, "USB gadget disabled, D+ pull-up unchanged\n");
+}
+#endif
+
+static int smbchg_hvdcp_set(struct smbchg_chip *chip, bool enable)
+{
+	return smbchg_sec_masked_write(chip,
+				       chip->base + SMBCHG_USB_CHGPTH_CFG,
+				       HVDCP_EN_BIT,
+				       enable ? HVDCP_EN_BIT : 0);
+}
+
+static void smbchg_hvdcp_sts_work(struct work_struct *work)
+{
+	struct smbchg_chip *chip = container_of(work, struct smbchg_chip,
+						hvdcp_sts_work.work);
+	unsigned int sts;
+	int ret;
+
+	mutex_lock(&chip->lock);
+	if (!chip->hvdcp_en || !chip->usb_present)
+		goto out;
+	ret = regmap_read(chip->regmap,
+			  chip->base + SMBCHG_USB_CHGPTH_USBIN_HVDCP_STS, &sts);
+	if (ret)
+		dev_err(chip->dev, "HVDCP status read failed: %pe\n",
+			ERR_PTR(ret));
+	else
+		dev_info(chip->dev, "HVDCP status 0x%02x%s\n", sts,
+			 (sts & USBIN_HVDCP_SEL_BIT) ? ", handshake detected" :
+						       "");
+out:
+	mutex_unlock(&chip->lock);
+}
+
+/*
+ * HVDCP_EN only after APSD DCP, and only then is the gadget D+ pull-up
+ * taken down. No CMD_HVDCP write, so this does not force 9 V. SDP/CDP
+ * leave the bit clear and do not touch the gadget.
+ */
+static void smbchg_sync_hvdcp(struct smbchg_chip *chip)
+{
+	bool want, arm = false;
+	int ret;
+
+	mutex_lock(&chip->lock);
+	want = chip->hvdcp_want && chip->usb_present;
+	if (want && chip->hvdcp_en && chip->gadget_dcp_off) {
+		mutex_unlock(&chip->lock);
+		return;
+	}
+	if (!want && !chip->hvdcp_en && !chip->gadget_dcp_off) {
+		mutex_unlock(&chip->lock);
+		return;
+	}
+	mutex_unlock(&chip->lock);
+
+	if (want) {
+		smbchg_gadget_pullup(chip, false);
+		mutex_lock(&chip->lock);
+		if (!chip->hvdcp_want || !chip->usb_present) {
+			mutex_unlock(&chip->lock);
+			smbchg_gadget_pullup(chip, true);
+			return;
+		}
+		chip->gadget_dcp_off = true;
+		if (!chip->hvdcp_en) {
+			ret = smbchg_hvdcp_set(chip, true);
+			if (ret) {
+				dev_err(chip->dev, "HVDCP enable failed: %pe\n",
+					ERR_PTR(ret));
+			} else {
+				chip->hvdcp_en = true;
+				arm = true;
+				dev_info(chip->dev,
+					 "APSD DCP, HVDCP handshake enabled\n");
+				smbchg_apsd_rerun(chip);
+			}
+		}
+		mutex_unlock(&chip->lock);
+		if (arm)
+			mod_delayed_work(system_dfl_wq, &chip->hvdcp_sts_work,
+					 msecs_to_jiffies(1000));
+		return;
+	}
+
+	mutex_lock(&chip->lock);
+	if (chip->hvdcp_en) {
+		smbchg_hvdcp_set(chip, false);
+		chip->hvdcp_en = false;
+		dev_info(chip->dev, "HVDCP off\n");
+	}
+	want = chip->gadget_dcp_off;
+	chip->gadget_dcp_off = false;
+	mutex_unlock(&chip->lock);
+	cancel_delayed_work(&chip->hvdcp_sts_work);
+	if (want)
+		smbchg_gadget_pullup(chip, true);
+}
+
 /*
  * SDP is 100 mA until the USB stack raises INPUT_CURRENT_LIMIT.
  * CDP is 1500 mA. Anything else is 1800 mA AICL (including an SDP
@@ -1000,12 +1144,18 @@ static int smbchg_apply_input_policy(struct smbchg_chip *chip)
 
 	if (!chip->usb_present) {
 		chip->sdp_icl_from_host = false;
+		chip->hvdcp_want = false;
 		return smbchg_usb_enable(chip, false);
 	}
 
 	ret = smbchg_charging_enable(chip, true);
 	if (ret)
 		return ret;
+
+	usb_type = smbchg_usb_get_type(chip);
+	dev_dbg(chip->dev, "USB present, APSD type %d\n", usb_type);
+	/* QC handshake only after DCP. SDP, CDP, and unknown leave it off. */
+	chip->hvdcp_want = (usb_type == POWER_SUPPLY_USB_TYPE_DCP);
 
 	if (chip->typec_icl_ua) {
 		chip->sdp_icl_from_host = false;
@@ -1014,9 +1164,6 @@ static int smbchg_apply_input_policy(struct smbchg_chip *chip)
 			return ret;
 		return smbchg_usb_enable(chip, true);
 	}
-
-	usb_type = smbchg_usb_get_type(chip);
-	dev_dbg(chip->dev, "USB present, APSD type %d\n", usb_type);
 
 	if (usb_type == POWER_SUPPLY_USB_TYPE_SDP ||
 	    usb_type == POWER_SUPPLY_USB_TYPE_UNKNOWN) {
@@ -1073,6 +1220,7 @@ static void smbchg_src_det_work(struct work_struct *work)
 
 	ret = smbchg_apply_input_policy(chip);
 	mutex_unlock(&chip->lock);
+	smbchg_sync_hvdcp(chip);
 
 	if (ret)
 		dev_err(chip->dev, "Failed to apply input policy: %pe\n",
@@ -1445,6 +1593,7 @@ static int smbchg_set_property(struct power_supply *psy,
 		chip->typec_icl_ua = val->intval > 0 ? val->intval : 0;
 		ret = smbchg_apply_input_policy(chip);
 		mutex_unlock(&chip->lock);
+		smbchg_sync_hvdcp(chip);
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		mutex_lock(&chip->lock);
@@ -1615,6 +1764,7 @@ static int smbchg_init(struct smbchg_chip *chip)
 	 * - Set USB charge path control to command
 	 * - Set command polarity to full current mode (i.e. setting
 	 *   USB_CHGPTH_CMD_IL:USB51_MODE_BIT corresponds to full SDP current)
+	 * HVDCP_EN stays clear here. It is set only after APSD reports DCP.
 	 */
 	ret = smbchg_sec_masked_write(chip,
 				      chip->base + SMBCHG_USB_CHGPTH_CFG,
@@ -1657,6 +1807,7 @@ static int smbchg_init(struct smbchg_chip *chip)
 	ret = smbchg_apply_input_policy(chip);
 	if (ret)
 		return ret;
+	smbchg_sync_hvdcp(chip);
 	smbchg_notify(chip);
 
 	return 0;
@@ -1692,6 +1843,7 @@ static int smbchg_probe(struct platform_device *pdev)
 	mutex_init(&chip->lock);
 	INIT_WORK(&chip->otg_reset_work, smbchg_otg_reset_worker);
 	INIT_DELAYED_WORK(&chip->src_det_work, smbchg_src_det_work);
+	INIT_DELAYED_WORK(&chip->hvdcp_sts_work, smbchg_hvdcp_sts_work);
 
 	/* Initialize OTG regulator */
 	chip->otg_rdesc.id = -1;
@@ -1803,6 +1955,11 @@ static int smbchg_probe(struct platform_device *pdev)
 	return 0;
 
 put_batt_info:
+	cancel_delayed_work_sync(&chip->hvdcp_sts_work);
+	if (chip->hvdcp_en)
+		smbchg_hvdcp_set(chip, false);
+	if (chip->gadget_dcp_off)
+		smbchg_gadget_pullup(chip, true);
 	power_supply_put_battery_info(chip->usb_psy, chip->batt_info);
 	return ret;
 }
@@ -1812,6 +1969,11 @@ static void smbchg_remove(struct platform_device *pdev)
 	struct smbchg_chip *chip = platform_get_drvdata(pdev);
 
 	cancel_delayed_work_sync(&chip->src_det_work);
+	cancel_delayed_work_sync(&chip->hvdcp_sts_work);
+	if (chip->hvdcp_en)
+		smbchg_hvdcp_set(chip, false);
+	if (chip->gadget_dcp_off)
+		smbchg_gadget_pullup(chip, true);
 	smbchg_usb_enable(chip, false);
 	smbchg_charging_enable(chip, false);
 	power_supply_put_battery_info(chip->usb_psy, chip->batt_info);
