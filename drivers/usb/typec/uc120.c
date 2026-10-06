@@ -45,6 +45,8 @@
 #define UC120_STATE_AUDIO		6
 #define UC120_STATE_DEBUG		7
 #define UC120_STATE_PWR_ACC		8
+/* CC nibble 15 is the leftover undecodable latch (reg2 0xfc). */
+#define UC120_STATE_UNDECODABLE		15
 
 #define UC120_CUR_USB			1
 #define UC120_CUR_1_5A			2
@@ -64,6 +66,9 @@
 #define UC120_FW_NAME			"lattice/ice5lp_2k_cal.bin"
 #define UC120_SPI_RETRIES		3
 #define UC120_CC_DEBOUNCE_MS		150
+/* Short re-sample only. A standing poll drops a real state-5 latch. */
+#define UC120_CC_RESYNC_MS		200
+#define UC120_CC_RESYNC_TRIES		3
 
 struct uc120 {
 	struct spi_device *spi;
@@ -84,6 +89,8 @@ struct uc120 {
 	struct notifier_block psy_nb;
 	struct delayed_work vbus_off_work;
 	struct delayed_work pd_en_work;
+	struct delayed_work cc_resync_work;
+	unsigned int cc_resync_left;
 };
 
 static int uc120_spi_read(struct uc120 *uc, u8 reg, u8 *val, size_t len)
@@ -408,10 +415,16 @@ static void uc120_apply_current_change(struct uc120 *uc, u8 state, u8 cur_chg)
 	uc120_remember(uc, uc->last_state, cur_chg, uc->last_reverse);
 }
 
+/*
+ * Returns 0 on a consumed sample, a negative errno on SPI failure, or
+ * 1 when the latch is undecodable. That 1 is not ACKed: writing 0xff
+ * over leftover 0xfc clears the follow-up edge before state 1..8 lands.
+ */
 static int uc120_sync(struct uc120 *uc, bool ack)
 {
 	u8 reg2, reg7, ackval = 0xff;
 	u8 state, cur, cur_chg;
+	bool undecodable = false;
 	int ret;
 
 	ret = uc120_read8(uc, UC120_REG_2, &reg2);
@@ -438,11 +451,17 @@ static int uc120_sync(struct uc120 *uc, bool ack)
 			dev_dbg(&uc->spi->dev,
 				"ignored CC state %u reg2=0x%02x\n",
 				state, reg2);
+			if (state >= UC120_STATE_UNDECODABLE)
+				undecodable = true;
 		}
-		uc120_apply_current_change(uc, state, cur_chg);
+		if (!undecodable)
+			uc120_apply_current_change(uc, state, cur_chg);
 	}
 
-	/* Ice5Lp2k ISR always ACKs register 2 with 0xFF after the read. */
+	if (undecodable)
+		return 1;
+
+	/* Ice5Lp2k ISR ACKs register 2 with 0xff after a real sample. */
 	if (ack)
 		return uc120_write8(uc, UC120_REG_2, ackval);
 	return 0;
@@ -462,19 +481,60 @@ static bool uc120_irq_still_low(int irq)
 	return !high;
 }
 
+static void uc120_cc_resync_work(struct work_struct *work)
+{
+	struct uc120 *uc = container_of(work, struct uc120,
+					cc_resync_work.work);
+	int ret;
+
+	mutex_lock(&uc->lock);
+	if (!uc->cc_resync_left)
+		goto out;
+
+	uc->cc_resync_left--;
+	ret = uc120_sync(uc, true);
+	if (ret > 0 && uc->cc_resync_left) {
+		mod_delayed_work(system_dfl_wq, &uc->cc_resync_work,
+				 msecs_to_jiffies(UC120_CC_RESYNC_MS));
+	} else if (ret > 0) {
+		dev_dbg(&uc->spi->dev, "CC re-sync gave up on state 15\n");
+		uc->cc_resync_left = 0;
+	} else {
+		uc->cc_resync_left = 0;
+	}
+out:
+	mutex_unlock(&uc->lock);
+}
+
+/* tries is 1 after IRQ enable, a few from the IRQ thread. */
+static void uc120_arm_cc_resync(struct uc120 *uc, unsigned int tries)
+{
+	uc->cc_resync_left = tries;
+	mod_delayed_work(system_dfl_wq, &uc->cc_resync_work,
+			 msecs_to_jiffies(UC120_CC_RESYNC_MS));
+}
+
 static irqreturn_t uc120_irq_thread(int irq, void *data)
 {
 	struct uc120 *uc = data;
-	int i;
+	int i, ret = 0;
 
 	mutex_lock(&uc->lock);
 	for (i = 0; i < UC120_IRQ_DRAIN; i++) {
-		if (uc120_sync(uc, true)) {
+		ret = uc120_sync(uc, true);
+		if (ret < 0) {
 			dev_err_ratelimited(&uc->spi->dev, "IRQ SPI failed\n");
 			break;
 		}
 		if (!uc120_irq_still_low(irq))
 			break;
+	}
+	if (ret > 0) {
+		dev_dbg(&uc->spi->dev, "undecodable CC latch, delayed re-sync\n");
+		uc120_arm_cc_resync(uc, UC120_CC_RESYNC_TRIES);
+	} else if (!ret) {
+		uc->cc_resync_left = 0;
+		cancel_delayed_work(&uc->cc_resync_work);
 	}
 	mutex_unlock(&uc->lock);
 	return IRQ_HANDLED;
@@ -664,7 +724,17 @@ static int uc120_irq_enable(struct uc120 *uc)
 	if (ret)
 		return ret;
 
-	return uc120_sync(uc, true);
+	ret = uc120_sync(uc, true);
+	if (ret > 0) {
+		/* One retry. The plug can already be in state 15 at probe. */
+		uc120_arm_cc_resync(uc, 1);
+		return 0;
+	}
+	if (!ret) {
+		uc->cc_resync_left = 0;
+		cancel_delayed_work(&uc->cc_resync_work);
+	}
+	return ret;
 }
 
 static int uc120_probe(struct spi_device *spi)
@@ -685,6 +755,7 @@ static int uc120_probe(struct spi_device *spi)
 	mutex_init(&uc->lock);
 	INIT_DELAYED_WORK(&uc->vbus_off_work, uc120_vbus_off_work);
 	INIT_DELAYED_WORK(&uc->pd_en_work, uc120_pd_en_work);
+	INIT_DELAYED_WORK(&uc->cc_resync_work, uc120_cc_resync_work);
 	spi_set_drvdata(spi, uc);
 
 	device_property_read_string(dev, "usb-psy-name", &uc->usb_psy_name);
@@ -752,6 +823,7 @@ static int uc120_probe(struct spi_device *spi)
 	return 0;
 
 err_port:
+	cancel_delayed_work_sync(&uc->cc_resync_work);
 	cancel_delayed_work_sync(&uc->pd_en_work);
 	cancel_delayed_work_sync(&uc->vbus_off_work);
 	typec_unregister_port(uc->port);
@@ -764,6 +836,7 @@ static void uc120_remove(struct spi_device *spi)
 {
 	struct uc120 *uc = spi_get_drvdata(spi);
 
+	cancel_delayed_work_sync(&uc->cc_resync_work);
 	cancel_delayed_work_sync(&uc->pd_en_work);
 	cancel_delayed_work_sync(&uc->vbus_off_work);
 	mutex_lock(&uc->lock);
