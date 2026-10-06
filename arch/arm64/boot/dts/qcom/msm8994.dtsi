@@ -2215,10 +2215,22 @@
 			polling-delay-passive = <250>;
 			thermal-sensors = <&tsens 7>;
 			trips {
+				cpu0_mitigate: cpu0-mitigate {
+					temperature = <95000>;
+					hysteresis = <10000>;
+					type = "passive";
+				};
 				cpu0_crit: cpu0-crit {
 					temperature = <115000>;
 					hysteresis = <2000>;
 					type = "critical";
+				};
+			};
+			cooling-maps {
+				map0 {
+					trip = <&cpu0_mitigate>;
+					/* 9 OPPs; state 4 is 960 MHz. */
+					cooling-device = <&cpu0 4 4>;
 				};
 			};
 		};
@@ -2227,10 +2239,21 @@
 			polling-delay-passive = <250>;
 			thermal-sensors = <&tsens 8>;
 			trips {
+				cpu1_mitigate: cpu1-mitigate {
+					temperature = <95000>;
+					hysteresis = <10000>;
+					type = "passive";
+				};
 				cpu1_crit: cpu1-crit {
 					temperature = <115000>;
 					hysteresis = <2000>;
 					type = "critical";
+				};
+			};
+			cooling-maps {
+				map0 {
+					trip = <&cpu1_mitigate>;
+					cooling-device = <&cpu0 4 4>;
 				};
 			};
 		};
@@ -2239,10 +2262,21 @@
 			polling-delay-passive = <250>;
 			thermal-sensors = <&tsens 9>;
 			trips {
+				cpu2_mitigate: cpu2-mitigate {
+					temperature = <95000>;
+					hysteresis = <10000>;
+					type = "passive";
+				};
 				cpu2_crit: cpu2-crit {
 					temperature = <115000>;
 					hysteresis = <2000>;
 					type = "critical";
+				};
+			};
+			cooling-maps {
+				map0 {
+					trip = <&cpu2_mitigate>;
+					cooling-device = <&cpu0 4 4>;
 				};
 			};
 		};
@@ -2251,10 +2285,21 @@
 			polling-delay-passive = <250>;
 			thermal-sensors = <&tsens 10>;
 			trips {
+				cpu3_mitigate: cpu3-mitigate {
+					temperature = <95000>;
+					hysteresis = <10000>;
+					type = "passive";
+				};
 				cpu3_crit: cpu3-crit {
 					temperature = <115000>;
 					hysteresis = <2000>;
 					type = "critical";
+				};
+			};
+			cooling-maps {
+				map0 {
+					trip = <&cpu3_mitigate>;
+					cooling-device = <&cpu0 4 4>;
 				};
 			};
 		};
